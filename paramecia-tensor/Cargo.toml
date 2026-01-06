@@ -1,0 +1,23 @@
+[package]
+name = "paramecia-tensor"
+version = "0.1.0"
+edition = "2021"
+description = "Tensor ops for Paramecia"
+
+[dependencies]
+paramecia-arrow = { workspace = true }
+paramecia-core = { workspace = true }
+paramecia-nn = { workspace = true }
+glowstick = { workspace = true }
+inception = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+accelerate = ["paramecia-core/accelerate"]
+cuda = ["paramecia-core/cuda"]
+cudnn = ["paramecia-core/cudnn"]
+mkl = ["paramecia-core/mkl"]
+metal = ["paramecia-core/metal"]
+vulkan = ["paramecia-core/vulkan"]

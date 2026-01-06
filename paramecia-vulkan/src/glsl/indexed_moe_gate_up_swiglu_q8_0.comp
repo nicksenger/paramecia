@@ -1,0 +1,245 @@
+// Indexed MoE Gate+Up+SwiGLU Fused - Q8_0 with DP4A optimization
+//
+// Computes: output[batch, topk, n] = silu(gate[expert, n, k] @ x) * (up[expert, n, k] @ x)
+// Where expert_id = ids[batch, topk]
+//
+// Fuses gate projection, up projection, and SwiGLU into a single dispatch.
+// Uses DP4A-style packed 4xi8 loads: 8 lanes per column, 4 columns per warp.
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#define QK8_0 32
+#define QK8_0_BYTES 34
+
+#define WARP_SIZE 32
+#define NWARPS 4
+#define COLS_PER_WARP 4
+
+layout(local_size_x = WARP_SIZE, local_size_y = NWARPS, local_size_z = 1) in;
+
+// Parameters via push constants (48 bytes = 12 x u32)
+layout(push_constant) uniform PushConstants {
+    uint params[12];
+    // [0]: n_ff (out_dim)
+    // [1]: k (in_dim)
+    // [2]: batch
+    // [3]: topk
+    // [4]: x_inner_dim
+    // [5]: gate_expert_stride (u32 words per expert)
+    // [6]: up_expert_stride (u32 words per expert)
+    // [7]: x_stride_batch
+    // [8]: x_stride_inner
+    // [9-11]: unused
+};
+
+#define op_n                  params[0]
+#define op_k                  params[1]
+#define op_batch              params[2]
+#define op_topk               params[3]
+#define op_x_inner_dim        params[4]
+#define op_gate_expert_stride params[5]
+#define op_up_expert_stride   params[6]
+#define op_x_stride_batch     params[7]
+#define op_x_stride_inner     params[8]
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputX {
+    float v_input_x[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer GateWeightsBuf {
+    uint v_gate_weights[];
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer UpWeightsBuf {
+    uint v_up_weights[];
+};
+
+layout(set = 0, binding = 4, std430) readonly buffer IdsBuf {
+    uint v_ids[];
+};
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+float half_to_float_lo(uint packed) {
+    return unpackHalf2x16(packed).x;
+}
+
+// Gate weight helpers
+float gate_load_scale(uint block_byte) {
+    uint word_idx = block_byte / 4;
+    uint byte_in_word = block_byte % 4;
+    uint word = v_gate_weights[word_idx];
+
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return half_to_float_lo(word >> 16);
+    } else {
+        uint word2 = v_gate_weights[word_idx + 1];
+        uint h;
+        if (byte_in_word == 1) {
+            h = (word >> 8) | (word2 << 24);
+        } else {
+            h = (word >> 24) | (word2 << 8);
+        }
+        return half_to_float_lo(h);
+    }
+}
+
+uint gate_load_packed4(uint block_byte, uint qs_idx) {
+    uint byte_offset = block_byte + 2 + qs_idx;
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+
+    if (byte_in_word == 0) {
+        return v_gate_weights[word_idx];
+    } else {
+        uint w0 = v_gate_weights[word_idx];
+        uint w1 = v_gate_weights[word_idx + 1];
+        return (w0 >> (byte_in_word * 8)) | (w1 << ((4 - byte_in_word) * 8));
+    }
+}
+
+// Up weight helpers
+float up_load_scale(uint block_byte) {
+    uint word_idx = block_byte / 4;
+    uint byte_in_word = block_byte % 4;
+    uint word = v_up_weights[word_idx];
+
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return half_to_float_lo(word >> 16);
+    } else {
+        uint word2 = v_up_weights[word_idx + 1];
+        uint h;
+        if (byte_in_word == 1) {
+            h = (word >> 8) | (word2 << 24);
+        } else {
+            h = (word >> 24) | (word2 << 8);
+        }
+        return half_to_float_lo(h);
+    }
+}
+
+uint up_load_packed4(uint block_byte, uint qs_idx) {
+    uint byte_offset = block_byte + 2 + qs_idx;
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+
+    if (byte_in_word == 0) {
+        return v_up_weights[word_idx];
+    } else {
+        uint w0 = v_up_weights[word_idx];
+        uint w1 = v_up_weights[word_idx + 1];
+        return (w0 >> (byte_in_word * 8)) | (w1 << ((4 - byte_in_word) * 8));
+    }
+}
+
+// ============================================================================
+// Main kernel
+// ============================================================================
+// Dispatch: (ceil(n/16), batch, topk) — 16 cols per WG (4 warps * 4 cols/warp)
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint warp = gl_LocalInvocationID.y;
+    uint wg_x = gl_WorkGroupID.x;
+    uint batch_idx = gl_WorkGroupID.y;
+    uint topk_idx = gl_WorkGroupID.z;
+
+    uint col_in_warp = lane / 8;
+    uint lane_in_col = lane % 8;
+    uint out_col = wg_x * (NWARPS * COLS_PER_WARP) + warp * COLS_PER_WARP + col_in_warp;
+
+    if (out_col >= op_n || batch_idx >= op_batch || topk_idx >= op_topk) {
+        return;
+    }
+
+    // Expert indirection
+    uint expert_id = v_ids[batch_idx * op_topk + topk_idx];
+    uint num_blocks = op_k / QK8_0;
+    uint row_bytes = num_blocks * QK8_0_BYTES;
+    uint gate_byte_offset = expert_id * op_gate_expert_stride * 4 + out_col * row_bytes;
+    uint up_byte_offset = expert_id * op_up_expert_stride * 4 + out_col * row_bytes;
+
+    // Input X pointer
+    uint x_inner_idx = min(topk_idx, op_x_inner_dim - 1);
+    uint x_offset = batch_idx * op_x_stride_batch + x_inner_idx * op_x_stride_inner;
+
+    float gate_acc = 0.0;
+    float up_acc = 0.0;
+
+    for (uint blk = 0; blk < num_blocks; blk++) {
+        uint gate_block_byte = gate_byte_offset + blk * QK8_0_BYTES;
+        uint up_block_byte = up_byte_offset + blk * QK8_0_BYTES;
+
+        // Load scales — lane 0 of each column team loads, then broadcast
+        float gate_scale, up_scale;
+        if (lane_in_col == 0) {
+            gate_scale = gate_load_scale(gate_block_byte);
+            up_scale = up_load_scale(up_block_byte);
+        }
+        gate_scale = subgroupShuffle(gate_scale, col_in_warp * 8);
+        up_scale = subgroupShuffle(up_scale, col_in_warp * 8);
+
+        // Each lane processes 4 consecutive elements
+        uint qs_base = lane_in_col * 4;
+        uint k_base = blk * QK8_0 + qs_base;
+
+        // Load packed 4xi8 from both weight buffers
+        uint gate_packed = gate_load_packed4(gate_block_byte, qs_base);
+        uint up_packed = up_load_packed4(up_block_byte, qs_base);
+
+        // Load 4 activation values (shared between gate and up)
+        float a0 = v_input_x[x_offset + k_base + 0];
+        float a1 = v_input_x[x_offset + k_base + 1];
+        float a2 = v_input_x[x_offset + k_base + 2];
+        float a3 = v_input_x[x_offset + k_base + 3];
+
+        // Unpack gate i8 values
+        int gq0 = int(gate_packed << 24) >> 24;
+        int gq1 = int(gate_packed << 16) >> 24;
+        int gq2 = int(gate_packed << 8) >> 24;
+        int gq3 = int(gate_packed) >> 24;
+
+        // Unpack up i8 values
+        int uq0 = int(up_packed << 24) >> 24;
+        int uq1 = int(up_packed << 16) >> 24;
+        int uq2 = int(up_packed << 8) >> 24;
+        int uq3 = int(up_packed) >> 24;
+
+        // Accumulate both projections using shared activations
+        gate_acc += gate_scale * (a0 * float(gq0) + a1 * float(gq1) + a2 * float(gq2) + a3 * float(gq3));
+        up_acc += up_scale * (a0 * float(uq0) + a1 * float(uq1) + a2 * float(uq2) + a3 * float(uq3));
+    }
+
+    // 8-lane reduction (within each column team)
+    gate_acc += subgroupShuffleXor(gate_acc, 4);
+    gate_acc += subgroupShuffleXor(gate_acc, 2);
+    gate_acc += subgroupShuffleXor(gate_acc, 1);
+
+    up_acc += subgroupShuffleXor(up_acc, 4);
+    up_acc += subgroupShuffleXor(up_acc, 2);
+    up_acc += subgroupShuffleXor(up_acc, 1);
+
+    // Lane 0 of each column team applies SwiGLU and writes result
+    if (lane_in_col == 0) {
+        float silu_gate = gate_acc / (1.0 + exp(-gate_acc));
+        uint out_idx = batch_idx * op_topk * op_n + topk_idx * op_n + out_col;
+        v_dest[out_idx] = silu_gate * up_acc;
+    }
+}

@@ -1,0 +1,239 @@
+// Q2_K Quantized Matrix Multiplication - GLSL/SPIR-V version
+//
+// Computes: C[m,n] = A[m,k] * B[n,k]^T
+// Where B is Q2_K quantized (256 elements per block, 84 bytes)
+//
+// Q2_K block structure (84 bytes total):
+// - Bytes 0-15: u8 scales[16] (packed scale/min for 16 groups)
+// - Bytes 16-79: u8 qs[64] (packed 2-bit quantized values)
+// - Bytes 80-81: f16 d (scale)
+// - Bytes 82-83: f16 dmin (minimum scale)
+//
+// Q2_K packing:
+// - 256 elements organized as 8 groups of 32
+// - Within each byte: 4 2-bit values accessed via shift (0,2,4,6)
+// - qs[0-31] and qs[32-63] each cover 128 elements with different shifts
+//
+// Optimizations:
+// - Warp-level reductions using subgroupAdd
+// - Cooperative scale extraction via subgroup shuffles
+// - Register-based accumulation
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Q2_K constants
+#define QK2_K 256       // Elements per Q2_K block
+#define QK2_K_BYTES 84  // Bytes per block
+#define SCALES_OFFSET 0
+#define QS_OFFSET 16
+#define D_OFFSET 80
+#define DMIN_OFFSET 82
+
+// Workgroup: 32 threads x 4 warps = 128 threads
+#define WARP_SIZE 32
+#define NWARPS 4
+
+layout(local_size_x = WARP_SIZE, local_size_y = NWARPS, local_size_z = 1) in;
+
+// Parameters via push constants (32 bytes)
+layout(push_constant) uniform PushConstants {
+    uint params[8];
+    // [0]: m (rows of output)
+    // [1]: k (reduction dimension)
+    // [2]: n (columns of output)
+    // [3]: a_stride_batch
+    // [4]: a_offset
+    // [5]: a_stride_k
+    // [6]: a_stride_m
+    // [7]: unused
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+// Output buffer (f32)
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+// Input A buffer (f32) - activations
+layout(set = 0, binding = 1, std430) readonly buffer InputA {
+    float v_input_a[];
+};
+
+// Input B buffer (Q2_K) - quantized weights
+layout(set = 0, binding = 2, std430) readonly buffer InputB {
+    uint v_input_b[];
+};
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+float half_to_float_lo(uint packed) {
+    return unpackHalf2x16(packed).x;
+}
+
+float half_to_float_hi(uint packed) {
+    return unpackHalf2x16(packed).y;
+}
+
+// Load a byte from the buffer given byte offset
+uint load_byte(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = v_input_b[word_idx];
+    return (word >> (byte_in_word * 8)) & 0xFF;
+}
+
+// Load u32 from byte offset
+uint load_u32(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+
+    if (byte_in_word == 0) {
+        return v_input_b[word_idx];
+    } else {
+        uint w0 = v_input_b[word_idx];
+        uint w1 = v_input_b[word_idx + 1];
+        return (w0 >> (byte_in_word * 8)) | (w1 << ((4 - byte_in_word) * 8));
+    }
+}
+
+// Load f16 from byte offset (D_OFFSET is always word-aligned at offset 80)
+float load_d_dmin(uint block_byte) {
+    // d and dmin are packed in a single u32 at offset 80
+    uint word = load_u32(block_byte + D_OFFSET);
+    return half_to_float_lo(word);  // d is in low 16 bits
+}
+
+float load_dmin(uint block_byte) {
+    uint word = load_u32(block_byte + D_OFFSET);
+    return half_to_float_hi(word);  // dmin is in high 16 bits
+}
+
+// Warp-level sum reduction
+float warp_reduce_sum(float v) {
+    v += subgroupShuffleXor(v, 16);
+    v += subgroupShuffleXor(v, 8);
+    v += subgroupShuffleXor(v, 4);
+    v += subgroupShuffleXor(v, 2);
+    v += subgroupShuffleXor(v, 1);
+    return v;
+}
+
+// ============================================================================
+// Main kernel
+// ============================================================================
+// Dispatch: (ceil(n/NWARPS), m, batch)
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint warp = gl_LocalInvocationID.y;
+    uint wg_x = gl_WorkGroupID.x;
+    uint wg_y = gl_WorkGroupID.y;
+    uint batch = gl_WorkGroupID.z;
+
+    // Output column for this warp
+    uint out_n = wg_x * NWARPS + warp;
+    uint out_m = wg_y;
+
+    // Early exit if out of bounds
+    if (out_n >= op_n || out_m >= op_m) {
+        return;
+    }
+
+    // Input A pointer
+    uint a_offset = op_a_offset + batch * op_a_stride_b + out_m * op_a_stride_m;
+
+    // Input B (Q2_K) pointer
+    uint num_blocks = op_k / QK2_K;
+    uint b_row_bytes = num_blocks * QK2_K_BYTES;
+    uint b_byte_offset = out_n * b_row_bytes;
+
+    // Accumulator
+    float acc = 0.0;
+
+    // Process all Q2_K blocks
+    for (uint blk = 0; blk < num_blocks; blk++) {
+        uint block_byte = b_byte_offset + blk * QK2_K_BYTES;
+        uint k_base = blk * QK2_K;
+
+        // Load d and dmin for this block
+        float d = load_d_dmin(block_byte);
+        float dmin = load_dmin(block_byte);
+
+        // Q2_K dequantization:
+        // - 256 elements organized as outer loop over qs_index (0, 32)
+        // - Inner loop over shift (0, 2, 4, 6)
+        // - Two groups of 16 elements per shift
+        // - scales[is] packed: low 4 bits = scale, high 4 bits = min
+
+        uint y_block_index = 0;
+        uint is = 0;
+
+        // Outer loop: qs bytes 0-31, then 32-63
+        for (uint qs_index = 0; qs_index < 64; qs_index += 32) {
+            uint qs_byte_base = block_byte + QS_OFFSET + qs_index;
+
+            // Inner loop: shift from 0 to 6 by 2
+            for (uint shift = 0; shift < 8; shift += 2) {
+                // First group of 16 elements
+                uint sc = load_byte(block_byte + SCALES_OFFSET + is);
+                is++;
+                float dl = d * float(sc & 0xF);
+                float ml = dmin * float(sc >> 4);
+
+                // Process 16 elements (4 at a time with 32 lanes)
+                // With 32 lanes, each lane handles part of the 16 elements
+                // Spread 16 elements across 32 lanes: lanes 0-15 process, lanes 16-31 idle
+                if (lane < 16) {
+                    uint qs_byte = load_byte(qs_byte_base + lane);
+                    uint q = (qs_byte >> shift) & 3;
+                    float v = dl * float(q) - ml;
+                    uint k_idx = k_base + y_block_index + lane;
+                    float a = v_input_a[a_offset + k_idx * op_a_stride_k];
+                    acc += a * v;
+                }
+                y_block_index += 16;
+
+                // Second group of 16 elements
+                sc = load_byte(block_byte + SCALES_OFFSET + is);
+                is++;
+                dl = d * float(sc & 0xF);
+                ml = dmin * float(sc >> 4);
+
+                if (lane < 16) {
+                    uint qs_byte = load_byte(qs_byte_base + 16 + lane);
+                    uint q = (qs_byte >> shift) & 3;
+                    float v = dl * float(q) - ml;
+                    uint k_idx = k_base + y_block_index + lane;
+                    float a = v_input_a[a_offset + k_idx * op_a_stride_k];
+                    acc += a * v;
+                }
+                y_block_index += 16;
+            }
+        }
+    }
+
+    // Warp-level reduction
+    float sum = warp_reduce_sum(acc);
+
+    // Lane 0 writes result
+    if (lane == 0) {
+        uint out_idx = batch * op_m * op_n + out_m * op_n + out_n;
+        v_dest[out_idx] = sum;
+    }
+}

@@ -1,0 +1,190 @@
+// Fused Q2_K Matmul + Perturbation - GLSL/SPIR-V version
+//
+// Computes: C[m,n] = A[m,k] * (B_dequant[n,k] + epsilon * z[n,k])^T
+// Where B is Q2_K quantized and z is generated on-the-fly via Philox RNG.
+//
+// Based on matmul_q2_k.comp with fused perturbation during dequantization.
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "philox.comp"
+
+// Q2_K constants
+#define QK2_K 256
+#define QK2_K_BYTES 84
+#define SCALES_OFFSET 0
+#define QS_OFFSET 16
+#define D_OFFSET 80
+#define DMIN_OFFSET 82
+
+#define WARP_SIZE 32
+#define NWARPS 4
+
+layout(local_size_x = WARP_SIZE, local_size_y = NWARPS, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint params[12];
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+#define op_seed_lo    params[7]
+#define op_seed_hi    params[8]
+#define op_epsilon_bits params[9]
+#define op_tid_lo     params[10]
+#define op_tid_hi     params[11]
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputA {
+    float v_input_a[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer InputB {
+    uint v_input_b[];
+};
+
+float half_to_float_lo(uint packed) {
+    return unpackHalf2x16(packed).x;
+}
+
+float half_to_float_hi(uint packed) {
+    return unpackHalf2x16(packed).y;
+}
+
+uint load_byte(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = v_input_b[word_idx];
+    return (word >> (byte_in_word * 8)) & 0xFF;
+}
+
+uint load_u32(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    if (byte_in_word == 0) {
+        return v_input_b[word_idx];
+    } else {
+        uint w0 = v_input_b[word_idx];
+        uint w1 = v_input_b[word_idx + 1];
+        return (w0 >> (byte_in_word * 8)) | (w1 << ((4 - byte_in_word) * 8));
+    }
+}
+
+float load_d_dmin(uint block_byte) {
+    uint word = load_u32(block_byte + D_OFFSET);
+    return half_to_float_lo(word);
+}
+
+float load_dmin(uint block_byte) {
+    uint word = load_u32(block_byte + D_OFFSET);
+    return half_to_float_hi(word);
+}
+
+float warp_reduce_sum(float v) {
+    v += subgroupShuffleXor(v, 16);
+    v += subgroupShuffleXor(v, 8);
+    v += subgroupShuffleXor(v, 4);
+    v += subgroupShuffleXor(v, 2);
+    v += subgroupShuffleXor(v, 1);
+    return v;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint warp = gl_LocalInvocationID.y;
+    uint wg_x = gl_WorkGroupID.x;
+    uint wg_y = gl_WorkGroupID.y;
+    uint batch = gl_WorkGroupID.z;
+
+    uint out_n = wg_x * NWARPS + warp;
+    uint out_m = wg_y;
+
+    if (out_n >= op_n || out_m >= op_m) return;
+
+    uint a_offset = op_a_offset + batch * op_a_stride_b + out_m * op_a_stride_m;
+
+    uint num_blocks = op_k / QK2_K;
+    uint b_row_bytes = num_blocks * QK2_K_BYTES;
+    uint b_byte_offset = out_n * b_row_bytes;
+
+    uvec2 effective_seed = uvec2(op_seed_lo ^ op_tid_lo, op_seed_hi ^ op_tid_hi);
+    float epsilon = uintBitsToFloat(op_epsilon_bits);
+
+    float acc = 0.0;
+
+    for (uint blk = 0; blk < num_blocks; blk++) {
+        uint block_byte = b_byte_offset + blk * QK2_K_BYTES;
+        uint k_base = blk * QK2_K;
+
+        float d = load_d_dmin(block_byte);
+        float dmin = load_dmin(block_byte);
+
+        uint y_block_index = 0;
+        uint is = 0;
+
+        for (uint qs_index = 0; qs_index < 64; qs_index += 32) {
+            uint qs_byte_base = block_byte + QS_OFFSET + qs_index;
+
+            for (uint shift = 0; shift < 8; shift += 2) {
+                // First group of 16 elements
+                uint sc = load_byte(block_byte + SCALES_OFFSET + is);
+                is++;
+                float dl = d * float(sc & 0xF);
+                float ml = dmin * float(sc >> 4);
+
+                if (lane < 16) {
+                    uint qs_byte = load_byte(qs_byte_base + lane);
+                    uint q = (qs_byte >> shift) & 3;
+                    float v = dl * float(q) - ml;
+                    uint k_idx = k_base + y_block_index + lane;
+                    // Add perturbation
+                    uint weight_idx = out_n * op_k + k_idx;
+                    v += epsilon * philox_gaussian(effective_seed, weight_idx);
+                    float a = v_input_a[a_offset + k_idx * op_a_stride_k];
+                    acc += a * v;
+                }
+                y_block_index += 16;
+
+                // Second group of 16 elements
+                sc = load_byte(block_byte + SCALES_OFFSET + is);
+                is++;
+                dl = d * float(sc & 0xF);
+                ml = dmin * float(sc >> 4);
+
+                if (lane < 16) {
+                    uint qs_byte = load_byte(qs_byte_base + 16 + lane);
+                    uint q = (qs_byte >> shift) & 3;
+                    float v = dl * float(q) - ml;
+                    uint k_idx = k_base + y_block_index + lane;
+                    uint weight_idx = out_n * op_k + k_idx;
+                    v += epsilon * philox_gaussian(effective_seed, weight_idx);
+                    float a = v_input_a[a_offset + k_idx * op_a_stride_k];
+                    acc += a * v;
+                }
+                y_block_index += 16;
+            }
+        }
+    }
+
+    float sum = warp_reduce_sum(acc);
+
+    if (lane == 0) {
+        uint out_idx = batch * op_m * op_n + out_m * op_n + out_n;
+        v_dest[out_idx] = sum;
+    }
+}

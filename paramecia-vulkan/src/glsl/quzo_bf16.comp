@@ -1,0 +1,73 @@
+// QuZO BF16 perturbation / restore+update kernel
+//
+// BF16 is unquantized - no stochastic rounding needed.
+// Each thread handles one u32 word = 2 BF16 elements.
+//
+// Compile with: -DMODE_PERTURB=1 or -DMODE_RESTORE_UPDATE=1
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer DataBuf { uint data_buf[]; };
+layout(set = 0, binding = 1) buffer PerturbBuf { float perturbation[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint count;       // num_elements
+    float param1;     // epsilon or restore_epsilon
+    float param2;     // unused or update_scale
+    uint seed1_lo;
+    uint seed1_hi;
+    uint seed2_lo;
+    uint seed2_hi;
+    uint flags;       // bit 0 = add (perturb only)
+};
+
+// BF16 <-> float conversion
+float bf16_to_float(uint bits) {
+    return uintBitsToFloat(bits << 16u);
+}
+
+uint float_to_bf16(float val) {
+    return (floatBitsToUint(val) + 0x8000u) >> 16u;
+}
+
+void main() {
+    // Each thread handles one u32 word = 2 BF16 elements
+    uint word_idx = gl_GlobalInvocationID.x;
+    uint elem_lo = word_idx * 2u;
+    if (elem_lo >= count) return;
+    uint elem_hi = elem_lo + 1u;
+
+    uint word = data_buf[word_idx];
+    uint lo_bits = word & 0xFFFFu;
+    uint hi_bits = (word >> 16u) & 0xFFFFu;
+
+    float val_lo = bf16_to_float(lo_bits);
+    float val_hi = bf16_to_float(hi_bits);
+
+    float perturb_lo = perturbation[elem_lo];
+    float perturb_hi = (elem_hi < count) ? perturbation[elem_hi] : 0.0;
+
+#ifdef MODE_PERTURB
+    float sign = ((flags & 1u) != 0u) ? 1.0 : -1.0;
+    val_lo += sign * param1 * perturb_lo;
+    if (elem_hi < count) {
+        val_hi += sign * param1 * perturb_hi;
+    }
+#else // MODE_RESTORE_UPDATE
+    // restore: +restore_epsilon * perturb
+    // update:  -update_scale * perturb
+    // combined: +(restore_epsilon - update_scale) * perturb
+    float combined = param1 - param2;
+    val_lo += combined * perturb_lo;
+    if (elem_hi < count) {
+        val_hi += combined * perturb_hi;
+    }
+#endif
+
+    uint new_lo = float_to_bf16(val_lo);
+    uint new_hi = float_to_bf16(val_hi);
+    data_buf[word_idx] = new_lo | (new_hi << 16u);
+}

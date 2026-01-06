@@ -1,0 +1,246 @@
+// Q2_K Matrix-Vector Multiplication - Warp-optimized for decode phase (m=1)
+//
+// Computes: out[n] = weights[n,k] * input[k]
+// Where weights are Q2_K quantized (256 elements per block, 84 bytes each)
+//
+// Q2_K block structure (84 bytes):
+// - Bytes 0-15: u8 scales[16] (4-bit scales and mins for 16 groups)
+// - Bytes 16-79: u8 qs[64] (2-bit quants, packed)
+// - Bytes 80-81: f16 d (super-block scale for quantized scales)
+// - Bytes 82-83: f16 dmin (super-block scale for quantized mins)
+//
+// Each Q2_K block contains 16 groups of 16 elements
+// weight is represented as: x = d * scale * q - dmin * min
+//
+// Optimizations:
+// - Warp-level reductions (subgroupShuffleXor) for fast reduction
+// - Shared memory caching of 16 scales/mins to avoid redundant extraction
+// - Vec2 dequantization to process 2 elements per iteration
+// - Explicit FMA chaining for better instruction-level parallelism
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Q2_K constants
+#define QK2_K 256      // Elements per Q2_K block
+#define QK2_K_BYTES 84 // Bytes per block: 16 (scales) + 64 (qs) + 4 (2x f16 d+dmin)
+#define NUM_SCALES 16  // Number of scale groups per Q2_K block
+
+// Workgroup: 32 threads x 4 warps = 128 threads
+// Each warp processes 1 output element (4 outputs per workgroup)
+#define WARP_SIZE 32
+#define NWARPS 4
+
+layout(local_size_x = WARP_SIZE, local_size_y = NWARPS, local_size_z = 1) in;
+
+// Shared memory for caching scales/mins per warp (avoids redundant extraction)
+shared float shared_scales[NWARPS][NUM_SCALES];
+shared float shared_mins[NWARPS][NUM_SCALES];
+
+layout(push_constant) uniform PushConstants {
+    uint params[8];
+    // [0]: m (always 1 for mat-vec)
+    // [1]: k (reduction dimension)
+    // [2]: n (output dimension)
+    // [3]: a_stride_batch
+    // [4]: a_offset
+    // [5]: a_stride_k
+    // [6]: a_stride_m
+    // [7]: unused
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+// Output buffer (f32)
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+// Input buffer (f32) - activation vector
+layout(set = 0, binding = 1, std430) readonly buffer InputA {
+    float v_input_a[];
+};
+
+// Weight buffer (Q2_K) - quantized weights
+layout(set = 0, binding = 2, std430) readonly buffer InputB {
+    uint v_input_b[];
+};
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+#include "dequant_helpers.glsl"
+
+// Load Q2_K global scales (d and dmin)
+void load_q2k_scales(uint block_byte, out float d, out float dmin) {
+    // d is at bytes 80-81, dmin at bytes 82-83
+    d = load_f16(block_byte + 80);
+    dmin = load_f16(block_byte + 82);
+}
+
+// Extract 4-bit scale and min from scales array for a given group
+// Each byte contains scale (low 4 bits) and min (high 4 bits) for one group
+void load_q2k_group_scale_min(uint block_byte, uint group_idx, out float scale, out float min_val, float d, float dmin) {
+    uint scale_byte_offset = block_byte + group_idx;
+    uint scale_byte = load_byte(scale_byte_offset);
+
+    uint scale_raw = scale_byte & 0x0F;         // Low 4 bits
+    uint min_raw = (scale_byte >> 4) & 0x0F;    // High 4 bits
+    
+    scale = d * float(scale_raw);
+    min_val = dmin * float(min_raw);
+}
+
+// Compute scale index for Q2K element
+uint get_q2k_scale_idx(uint elem_idx) {
+    uint chunk = elem_idx / 128;
+    uint off_in_chunk = elem_idx % 128;
+    uint group32 = off_in_chunk / 32;
+    uint subgroup = (elem_idx % 32) / 16;
+    return chunk * 8 + group32 * 2 + subgroup;
+}
+
+// Load 2-bit quantized value using correct Q2_K layout
+uint load_q2_value(uint block_byte, uint off) {
+    // Q2_K layout: 256 elements split into 2 chunks of 128
+    // Each chunk has 4 groups of 32 elements
+    // Each group32 uses a different 2-bit shift (0, 2, 4, 6)
+    uint chunk = off / 128;              // Which 128-element half (0 or 1)
+    uint off_in_chunk = off % 128;       // Offset within the chunk
+    uint group32 = off_in_chunk / 32;    // Which 32-element group (0-3)
+    uint subgroup = (off % 32) / 16;     // Which 16-element subgroup (0 or 1)
+    uint lane = off % 16;                // Which element in subgroup (0-15)
+    uint shift = group32 * 2;            // Bit shift (0, 2, 4, or 6)
+    uint qs_index_base = chunk * 32;     // Base qs index for this chunk
+    uint qs_byte_index = qs_index_base + (subgroup * 16) + lane;
+
+    uint qs_byte = load_byte(block_byte + 16 + qs_byte_index);
+    uint q2 = (qs_byte >> shift) & 3;
+    return q2;
+}
+
+// Dequantize 2 consecutive Q2K elements at once
+vec2 dequantize_q2_vec2(uint block_byte, uint elem_idx0,
+                        float cached_scales[NUM_SCALES],
+                        float cached_mins[NUM_SCALES]) {
+    // Load two quantized values
+    uint q0 = load_q2_value(block_byte, elem_idx0);
+    uint q1 = load_q2_value(block_byte, elem_idx0 + 1);
+
+    // Get scales from cached values
+    uint scale_idx0 = get_q2k_scale_idx(elem_idx0);
+    uint scale_idx1 = get_q2k_scale_idx(elem_idx0 + 1);
+
+    float scale0 = cached_scales[scale_idx0];
+    float min0 = cached_mins[scale_idx0];
+    float scale1 = cached_scales[scale_idx1];
+    float min1 = cached_mins[scale_idx1];
+
+    // Dequantize: weight = scale * q - min
+    return vec2(
+        scale0 * float(q0) - min0,
+        scale1 * float(q1) - min1
+    );
+}
+
+// ============================================================================
+// Main kernel
+// ============================================================================
+// Dispatch: (ceil(n/4), batch, 1)
+// Each workgroup processes 4 output elements (1 per warp)
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint warp = gl_LocalInvocationID.y;
+    uint out_n = gl_WorkGroupID.x * NWARPS + warp;
+    uint batch = gl_WorkGroupID.y;
+
+    if (out_n >= op_n) {
+        return;
+    }
+
+    uint a_offset = op_a_offset + batch * op_a_stride_b;
+    uint num_blocks = (op_k + QK2_K - 1) / QK2_K;
+    uint weight_row_start = out_n * num_blocks * QK2_K_BYTES;
+
+    float sum = 0.0;
+
+    // Each Q2_K block has 256 elements in 16 groups of 16 elements
+    // Distribute work: 32 threads process 256 elements (8 elements per thread)
+    for (uint blk = 0; blk < num_blocks; blk++) {
+        uint k_start = blk * QK2_K;
+        uint block_byte = weight_row_start + blk * QK2_K_BYTES;
+
+        // Load global scales once per block
+        float d, dmin;
+        load_q2k_scales(block_byte, d, dmin);
+
+        // Cache scales in shared memory: first 16 threads load all 16 scales
+        if (lane < NUM_SCALES) {
+            float scale, min_val;
+            load_q2k_group_scale_min(block_byte, lane, scale, min_val, d, dmin);
+            shared_scales[warp][lane] = scale;
+            shared_mins[warp][lane] = min_val;
+        }
+        subgroupBarrier();
+
+        // All threads read cached scales into registers
+        float cached_scales[NUM_SCALES];
+        float cached_mins[NUM_SCALES];
+        for (uint s = 0; s < NUM_SCALES; s++) {
+            cached_scales[s] = shared_scales[warp][s];
+            cached_mins[s] = shared_mins[warp][s];
+        }
+
+        // Each thread processes 8 elements in 4 iterations of 2 elements each
+        for (uint i = 0; i < 8; i += 2) {
+            uint elem_idx0 = lane * 8 + i;  // 0-255
+            uint k0 = k_start + elem_idx0;
+
+            if (k0 + 1 < op_k) {
+                // Dequantize 2 elements at once
+                vec2 weights = dequantize_q2_vec2(block_byte, elem_idx0,
+                                                  cached_scales, cached_mins);
+
+                // Load 2 activations
+                uint a_idx0 = a_offset + k0 * op_a_stride_k;
+                vec2 a_vals = vec2(
+                    v_input_a[a_idx0],
+                    v_input_a[a_idx0 + op_a_stride_k]
+                );
+
+                // Accumulate with explicit FMA
+                sum = fma(weights.x, a_vals.x, sum);
+                sum = fma(weights.y, a_vals.y, sum);
+            } else if (k0 < op_k) {
+                // Handle last element if odd number of elements
+                uint q = load_q2_value(block_byte, elem_idx0);
+                uint scale_idx = get_q2k_scale_idx(elem_idx0);
+                float weight = cached_scales[scale_idx] * float(q) - cached_mins[scale_idx];
+                uint a_idx = a_offset + k0 * op_a_stride_k;
+                sum += weight * v_input_a[a_idx];
+            }
+        }
+    }
+
+    // Warp-level reduction
+    sum = warp_reduce_sum(sum);
+
+    // Lane 0 writes result
+    if (lane == 0) {
+        v_dest[batch * op_n + out_n] = sum;
+    }
+}

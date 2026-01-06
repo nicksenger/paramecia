@@ -1,0 +1,179 @@
+// Q3_K Matrix-Vector Multiplication - Cooperative with shared activation loading
+//
+// Dispatch: [ceil(n / NUM_ROWS), batch, 1]
+// Workgroup: 32 (x) × NUM_ROWS (y)
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(constant_id = 0) const uint NUM_ROWS = 2;
+
+#define QK3_K 256
+#define QK3_K_BYTES 110
+#define NUM_SCALES 16
+#define WARP_SIZE 32
+
+layout(local_size_x = WARP_SIZE, local_size_y_id = 0, local_size_z = 1) in;
+
+shared float shared_scales_arr[NUM_ROWS][NUM_SCALES];
+shared float shared_a[QK3_K];
+
+layout(push_constant) uniform PushConstants {
+    uint params[8];
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf { float v_dest[]; };
+layout(set = 0, binding = 1, std430) readonly buffer InputA { float v_input_a[]; };
+layout(set = 0, binding = 2, std430) readonly buffer InputB { uint v_input_b[]; };
+
+#include "dequant_helpers.glsl"
+
+float load_q3k_scale(uint block_byte) {
+    return load_f16(block_byte + 108);
+}
+
+float load_q3k_group_scale(uint block_byte, uint group_idx) {
+    uint sc_offset = block_byte + 96;
+
+    uint a0 = load_byte(sc_offset + 0) | (load_byte(sc_offset + 1) << 8) |
+              (load_byte(sc_offset + 2) << 16) | (load_byte(sc_offset + 3) << 24);
+    uint a1 = load_byte(sc_offset + 4) | (load_byte(sc_offset + 5) << 8) |
+              (load_byte(sc_offset + 6) << 16) | (load_byte(sc_offset + 7) << 24);
+    uint a2 = load_byte(sc_offset + 8) | (load_byte(sc_offset + 9) << 8) |
+              (load_byte(sc_offset + 10) << 16) | (load_byte(sc_offset + 11) << 24);
+
+    uint KMASK1 = 0x03030303u;
+    uint KMASK2 = 0x0f0f0f0fu;
+
+    uint d0 = (a0 & KMASK2) | (((a2) & KMASK1) << 4);
+    uint d1 = (a1 & KMASK2) | (((a2 >> 2) & KMASK1) << 4);
+    uint d2 = ((a0 >> 4) & KMASK2) | (((a2 >> 4) & KMASK1) << 4);
+    uint d3 = ((a1 >> 4) & KMASK2) | (((a2 >> 6) & KMASK1) << 4);
+
+    uint word;
+    uint idx = group_idx;
+    if (idx < 4) {
+        word = d0;
+    } else if (idx < 8) {
+        word = d1;
+        idx -= 4;
+    } else if (idx < 12) {
+        word = d2;
+        idx -= 8;
+    } else {
+        word = d3;
+        idx -= 12;
+    }
+
+    int scale_byte = int((word >> (idx * 8)) & 0xFF);
+    return float(scale_byte - 32);
+}
+
+int load_q3_value(uint block_byte, uint qs_idx, uint hmask_bit) {
+    uint qs_byte_offset = block_byte + 32 + (qs_idx / 4);
+    uint qs_byte = load_byte(qs_byte_offset);
+    uint bit_pos = (qs_idx % 4) * 2;
+    uint q2 = (qs_byte >> bit_pos) & 3;
+
+    uint hmask_byte_offset = block_byte + (qs_idx / 8);
+    uint hmask_byte = load_byte(hmask_byte_offset);
+
+    return int(q2) - ((hmask_byte & hmask_bit) != 0 ? 0 : 4);
+}
+
+vec2 dequantize_q3_vec2(uint block_byte, uint elem_idx0, float d,
+                        float cached_scales[NUM_SCALES]) {
+    uint group0 = elem_idx0 / 16;
+    uint group1 = (elem_idx0 + 1) / 16;
+
+    float scale0 = cached_scales[group0];
+    float scale1 = (group0 == group1) ? scale0 : cached_scales[group1];
+
+    uint hmask_bit0 = 1u << (group0 / 2);
+    uint hmask_bit1 = 1u << (group1 / 2);
+
+    int q0 = load_q3_value(block_byte, elem_idx0, hmask_bit0);
+    int q1 = load_q3_value(block_byte, elem_idx0 + 1, hmask_bit1);
+
+    return vec2(d * scale0 * float(q0), d * scale1 * float(q1));
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint row_in_wg = gl_LocalInvocationID.y;
+    uint flat_tid = gl_LocalInvocationIndex;
+    uint out_n = gl_WorkGroupID.x * NUM_ROWS + row_in_wg;
+    uint batch = gl_WorkGroupID.y;
+
+    if (out_n >= op_n) return;
+
+    uint a_offset = op_a_offset + batch * op_a_stride_b;
+    uint num_blocks = (op_k + QK3_K - 1) / QK3_K;
+    uint weight_row_start = out_n * num_blocks * QK3_K_BYTES;
+    uint total_threads = WARP_SIZE * NUM_ROWS;
+
+    float sum = 0.0;
+
+    for (uint blk = 0; blk < num_blocks; blk++) {
+        uint k_start = blk * QK3_K;
+        uint block_byte = weight_row_start + blk * QK3_K_BYTES;
+
+        // Cooperative activation load
+        for (uint i = flat_tid; i < QK3_K; i += total_threads) {
+            uint k_idx = k_start + i;
+            shared_a[i] = (k_idx < op_k) ? v_input_a[a_offset + k_idx * op_a_stride_k] : 0.0;
+        }
+        barrier();
+
+        float d = load_q3k_scale(block_byte);
+
+        if (lane < NUM_SCALES) {
+            shared_scales_arr[row_in_wg][lane] = load_q3k_group_scale(block_byte, lane);
+        }
+        subgroupBarrier();
+
+        float cached_scales[NUM_SCALES];
+        for (uint s = 0; s < NUM_SCALES; s++) {
+            cached_scales[s] = shared_scales_arr[row_in_wg][s];
+        }
+
+        for (uint i = 0; i < 8; i += 2) {
+            uint elem_idx0 = lane * 8 + i;
+            uint k0 = k_start + elem_idx0;
+
+            if (k0 + 1 < op_k) {
+                vec2 weights = dequantize_q3_vec2(block_byte, elem_idx0, d, cached_scales);
+                vec2 a_vals = vec2(shared_a[elem_idx0], shared_a[elem_idx0 + 1]);
+                sum = fma(weights.x, a_vals.x, sum);
+                sum = fma(weights.y, a_vals.y, sum);
+            } else if (k0 < op_k) {
+                uint group = elem_idx0 / 16;
+                float scale = cached_scales[group];
+                uint hmask_bit = 1u << (group / 2);
+                int q = load_q3_value(block_byte, elem_idx0, hmask_bit);
+                sum += d * scale * float(q) * shared_a[elem_idx0];
+            }
+        }
+
+        barrier();
+    }
+
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) {
+        v_dest[batch * op_n + out_n] = sum;
+    }
+}

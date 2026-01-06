@@ -1,0 +1,169 @@
+// Q2_K Matrix-Vector Multiplication - Cooperative with shared activation loading
+//
+// Dispatch: [ceil(n / NUM_ROWS), batch, 1]
+// Workgroup: 32 (x) × NUM_ROWS (y)
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(constant_id = 0) const uint NUM_ROWS = 2;
+
+#define QK2_K 256
+#define QK2_K_BYTES 84
+#define NUM_SCALES 16
+#define WARP_SIZE 32
+
+layout(local_size_x = WARP_SIZE, local_size_y_id = 0, local_size_z = 1) in;
+
+shared float shared_scales_arr[NUM_ROWS][NUM_SCALES];
+shared float shared_mins[NUM_ROWS][NUM_SCALES];
+shared float shared_a[QK2_K];
+
+layout(push_constant) uniform PushConstants {
+    uint params[8];
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf { float v_dest[]; };
+layout(set = 0, binding = 1, std430) readonly buffer InputA { float v_input_a[]; };
+layout(set = 0, binding = 2, std430) readonly buffer InputB { uint v_input_b[]; };
+
+#include "dequant_helpers.glsl"
+
+void load_q2k_scales(uint block_byte, out float d, out float dmin) {
+    d = load_f16(block_byte + 80);
+    dmin = load_f16(block_byte + 82);
+}
+
+void load_q2k_group_scale_min(uint block_byte, uint group_idx, out float scale, out float min_val, float d, float dmin) {
+    uint scale_byte_offset = block_byte + group_idx;
+    uint scale_byte = load_byte(scale_byte_offset);
+
+    uint scale_raw = scale_byte & 0x0F;
+    uint min_raw = (scale_byte >> 4) & 0x0F;
+
+    scale = d * float(scale_raw);
+    min_val = dmin * float(min_raw);
+}
+
+uint get_q2k_scale_idx(uint elem_idx) {
+    uint chunk = elem_idx / 128;
+    uint off_in_chunk = elem_idx % 128;
+    uint group32 = off_in_chunk / 32;
+    uint subgroup = (elem_idx % 32) / 16;
+    return chunk * 8 + group32 * 2 + subgroup;
+}
+
+uint load_q2_value(uint block_byte, uint off) {
+    uint chunk = off / 128;
+    uint off_in_chunk = off % 128;
+    uint group32 = off_in_chunk / 32;
+    uint subgroup = (off % 32) / 16;
+    uint lane = off % 16;
+    uint shift = group32 * 2;
+    uint qs_index_base = chunk * 32;
+    uint qs_byte_index = qs_index_base + (subgroup * 16) + lane;
+
+    uint qs_byte = load_byte(block_byte + 16 + qs_byte_index);
+    return (qs_byte >> shift) & 3;
+}
+
+vec2 dequantize_q2_vec2(uint block_byte, uint elem_idx0,
+                        float cached_scales[NUM_SCALES],
+                        float cached_mins_arr[NUM_SCALES]) {
+    uint q0 = load_q2_value(block_byte, elem_idx0);
+    uint q1 = load_q2_value(block_byte, elem_idx0 + 1);
+
+    uint scale_idx0 = get_q2k_scale_idx(elem_idx0);
+    uint scale_idx1 = get_q2k_scale_idx(elem_idx0 + 1);
+
+    return vec2(
+        cached_scales[scale_idx0] * float(q0) - cached_mins_arr[scale_idx0],
+        cached_scales[scale_idx1] * float(q1) - cached_mins_arr[scale_idx1]
+    );
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint row_in_wg = gl_LocalInvocationID.y;
+    uint flat_tid = gl_LocalInvocationIndex;
+    uint out_n = gl_WorkGroupID.x * NUM_ROWS + row_in_wg;
+    uint batch = gl_WorkGroupID.y;
+
+    if (out_n >= op_n) return;
+
+    uint a_offset = op_a_offset + batch * op_a_stride_b;
+    uint num_blocks = (op_k + QK2_K - 1) / QK2_K;
+    uint weight_row_start = out_n * num_blocks * QK2_K_BYTES;
+    uint total_threads = WARP_SIZE * NUM_ROWS;
+
+    float sum = 0.0;
+
+    for (uint blk = 0; blk < num_blocks; blk++) {
+        uint k_start = blk * QK2_K;
+        uint block_byte = weight_row_start + blk * QK2_K_BYTES;
+
+        // Cooperative activation load
+        for (uint i = flat_tid; i < QK2_K; i += total_threads) {
+            uint k_idx = k_start + i;
+            shared_a[i] = (k_idx < op_k) ? v_input_a[a_offset + k_idx * op_a_stride_k] : 0.0;
+        }
+        barrier();
+
+        float d, dmin;
+        load_q2k_scales(block_byte, d, dmin);
+
+        if (lane < NUM_SCALES) {
+            float scale, min_val;
+            load_q2k_group_scale_min(block_byte, lane, scale, min_val, d, dmin);
+            shared_scales_arr[row_in_wg][lane] = scale;
+            shared_mins[row_in_wg][lane] = min_val;
+        }
+        subgroupBarrier();
+
+        float cached_scales[NUM_SCALES];
+        float cached_mins_arr[NUM_SCALES];
+        for (uint s = 0; s < NUM_SCALES; s++) {
+            cached_scales[s] = shared_scales_arr[row_in_wg][s];
+            cached_mins_arr[s] = shared_mins[row_in_wg][s];
+        }
+
+        for (uint i = 0; i < 8; i += 2) {
+            uint elem_idx0 = lane * 8 + i;
+            uint k0 = k_start + elem_idx0;
+
+            if (k0 + 1 < op_k) {
+                vec2 weights = dequantize_q2_vec2(block_byte, elem_idx0,
+                                                  cached_scales, cached_mins_arr);
+                vec2 a_vals = vec2(shared_a[elem_idx0], shared_a[elem_idx0 + 1]);
+                sum = fma(weights.x, a_vals.x, sum);
+                sum = fma(weights.y, a_vals.y, sum);
+            } else if (k0 < op_k) {
+                uint q = load_q2_value(block_byte, elem_idx0);
+                uint scale_idx = get_q2k_scale_idx(elem_idx0);
+                float weight = cached_scales[scale_idx] * float(q) - cached_mins_arr[scale_idx];
+                sum += weight * shared_a[elem_idx0];
+            }
+        }
+
+        barrier();
+    }
+
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) {
+        v_dest[batch * op_n + out_n] = sum;
+    }
+}

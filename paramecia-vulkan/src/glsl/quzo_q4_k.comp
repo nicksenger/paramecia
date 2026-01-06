@@ -1,0 +1,140 @@
+// QuZO Q4K perturbation / restore+update kernel
+//
+// Q4K block: [half2 dm (4)][scales[12] (12)][qs[128] (128)] = 144 bytes = 36 words (aligned)
+// 128 threads per workgroup, each handles 1 byte in qs (2 x 4-bit values)
+// 256 elements per block
+//
+// Compile with: -DMODE_PERTURB=1 or -DMODE_RESTORE_UPDATE=1
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer DataBuf { uint data_buf[]; };
+layout(set = 0, binding = 1) buffer PerturbBuf { float perturbation[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint count;
+    float param1;
+    float param2;
+    uint seed1_lo;
+    uint seed1_hi;
+    uint seed2_lo;
+    uint seed2_hi;
+    uint flags;
+};
+
+shared uint s_data[36]; // 144 bytes = 36 words
+
+#include "quzo_common.comp"
+
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (wg >= count) return;
+
+    // Load block into shared memory
+    uint global_word_base = wg * 36u;
+    if (tid < 36u) {
+        s_data[tid] = data_buf[global_word_base + tid];
+    }
+    barrier();
+
+    // Block layout offsets (bytes):
+    // dm: 0-3, scales: 4-15, qs: 16-143
+    uint dm_byte = 0u;
+    uint scales_byte = 4u;
+    uint qs_byte = 16u;
+
+    // Read dm (dall, dmin)
+    vec2 dm = unpackHalf2x16(s_data[0]);
+    float dall = dm.x;
+    float dmin = dm.y;
+
+    if (abs(dall) < 1e-10) return;
+
+    // Thread mapping: 128 threads, one per qs byte
+    uint il = tid >> 5;       // 0-3 (sub-block pair)
+    uint within_il = tid & 31u;
+    uint is_idx = 2u * il;
+
+    // Two elements per byte: low nibble and high nibble
+    uint elem_lo = 64u * il + within_il;
+    uint elem_hi = 64u * il + within_il + 32u;
+    uint qs_offset = qs_byte + 32u * il + within_il;
+
+    // Read packed byte from shared memory
+    uint qs_word_idx = qs_offset >> 2;
+    uint qs_byte_pos = qs_offset & 3u;
+    uint packed = (s_data[qs_word_idx] >> (qs_byte_pos * 8u)) & 0xFFu;
+    uint q4_lo = packed & 0xFu;
+    uint q4_hi = (packed >> 4) & 0xFu;
+
+    // Get scales for low and high nibble sub-blocks
+    float sc_lo, m_lo, sc_hi, m_hi;
+    get_scale_min_k4(scales_byte, is_idx, sc_lo, m_lo);
+    get_scale_min_k4(scales_byte, is_idx + 1u, sc_hi, m_hi);
+
+    // Global element indices
+    uint global_base = wg * 256u;
+    uint global_lo = global_base + elem_lo;
+    uint global_hi = global_base + elem_hi;
+
+    float perturb_lo = perturbation[global_lo];
+    float perturb_hi = perturbation[global_hi];
+
+    uint64_t seed = (uint64_t(seed1_hi) << 32) | uint64_t(seed1_lo);
+
+    // ---- Process low nibble ----
+    {
+        float d1 = dall * sc_lo;
+        float val = d1 * float(q4_lo) - dmin * m_lo;
+
+#ifdef MODE_PERTURB
+        float sign = ((flags & 1u) != 0u) ? 1.0 : -1.0;
+        val += sign * param1 * perturb_lo;
+        uint64_t rng = init_rng(seed, global_lo);
+#else
+        val += param1 * perturb_lo;
+        val -= param2 * perturb_lo;
+        uint64_t update_seed = (uint64_t(seed2_hi) << 32) | uint64_t(seed2_lo);
+        uint64_t rng = init_rng(update_seed, global_lo);
+#endif
+
+        float q_float = abs(d1) > 1e-10 ? (val + dmin * m_lo) / d1 : 0.0;
+        q4_lo = stochastic_round_u4(q_float, rng);
+    }
+
+    // ---- Process high nibble ----
+    {
+        float d2 = dall * sc_hi;
+        float val = d2 * float(q4_hi) - dmin * m_hi;
+
+#ifdef MODE_PERTURB
+        float sign = ((flags & 1u) != 0u) ? 1.0 : -1.0;
+        val += sign * param1 * perturb_hi;
+        uint64_t rng = init_rng(seed, global_hi);
+#else
+        val += param1 * perturb_hi;
+        val -= param2 * perturb_hi;
+        uint64_t update_seed = (uint64_t(seed2_hi) << 32) | uint64_t(seed2_lo);
+        uint64_t rng = init_rng(update_seed, global_hi);
+#endif
+
+        float q_float = abs(d2) > 1e-10 ? (val + dmin * m_hi) / d2 : 0.0;
+        q4_hi = stochastic_round_u4(q_float, rng);
+    }
+
+    // Pack and write back
+    uint new_packed = q4_lo | (q4_hi << 4);
+    write_byte_shared(qs_word_idx, qs_byte_pos, new_packed);
+
+    barrier();
+
+    // Write back to global
+    if (tid < 36u) {
+        data_buf[global_word_base + tid] = s_data[tid];
+    }
+}

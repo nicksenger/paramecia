@@ -1,0 +1,54 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_AMD_gpu_shader_half_float: enable
+
+layout(local_size_x = 256) in;
+
+#include "common.comp"
+
+// CAST macro produces DST_TYPE directly (avoids redundant same-type wrapping)
+#if SRC_BF16
+    // bf16 (uint16) -> float intermediate, then to DST_TYPE
+    #define CAST(x) DST_TYPE(uintBitsToFloat(uint(x) << 16u))
+#elif DST_BF16
+    // any type -> float intermediate -> bf16 (uint16)
+    #define CAST(x) uint16_t((floatBitsToUint(float(x)) + 0x8000u) >> 16u)
+#elif NEED_UINT_CAST
+    // u8 -> uint intermediate -> DST_TYPE
+    #define CAST(x) DST_TYPE(uint(x))
+#else
+    #define CAST(x) DST_TYPE(x)
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Input {
+    SRC_TYPE input_data[];
+};
+layout(set = 0, binding = 1) buffer Output {
+    DST_TYPE output_data[];
+};
+layout(push_constant) uniform PushConstants {
+    uint rank;
+    uint base;
+    uint shape[MAX_RANK];
+    uint stride[MAX_RANK];
+} pc;
+
+void main() {
+    uint idx = global_linear_id();
+    uint total_elems = 1;
+    for (uint i = 0; i < pc.rank; ++i) {
+        // Handle dim size 0 safely - if any dim is 0, total elems is 0
+        if (pc.shape[i] == 0) {
+            total_elems = 0;
+            break;
+        }
+        total_elems *= pc.shape[i];
+    }
+    if (idx >= total_elems) return;
+    uint a_idx = get_physical_index(pc.rank, pc.base, pc.shape, pc.stride, idx);
+    output_data[idx] = CAST(input_data[a_idx]);
+}

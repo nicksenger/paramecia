@@ -1,0 +1,8 @@
+[package]
+name = "paramecia-wit"
+description = "WIT interface definitions for paramecia host components"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/nicksenger/paramecia"
+keywords = ["wit", "wasm", "component-model", "paramecia"]

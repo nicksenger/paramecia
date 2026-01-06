@@ -1,0 +1,77 @@
+// L2 Normalize + Scale
+//
+// Computes: out[i] = x[i] / (||x|| + eps) * scale
+// Per-row operation along last dimension.
+//
+// Dispatch: (num_rows, 1, 1) with local_size_x = 256
+// Each workgroup handles one row.
+
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint num_rows;
+    uint dim;
+    float scale;
+    float eps;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuf {
+    float v_input[];
+};
+
+layout(set = 0, binding = 1, std430) writeonly buffer OutputBuf {
+    float v_output[];
+};
+
+shared float s_partial_sum[32]; // For subgroup reduction results
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (row >= num_rows) return;
+
+    uint base = row * dim;
+
+    // Compute sum of squares using strided access
+    float sum_sq = 0.0;
+    for (uint i = tid; i < dim; i += 256) {
+        float val = v_input[base + i];
+        sum_sq += val * val;
+    }
+
+    // Subgroup reduction
+    sum_sq = subgroupAdd(sum_sq);
+
+    // Cross-subgroup reduction via shared memory
+    uint sg_id = gl_SubgroupID;
+    uint sg_size = gl_SubgroupSize;
+    uint num_subgroups = (256 + sg_size - 1) / sg_size;
+
+    if (gl_SubgroupInvocationID == 0) {
+        s_partial_sum[sg_id] = sum_sq;
+    }
+    barrier();
+
+    // Final reduction by first subgroup
+    if (sg_id == 0) {
+        float val = (gl_SubgroupInvocationID < num_subgroups) ?
+            s_partial_sum[gl_SubgroupInvocationID] : 0.0;
+        val = subgroupAdd(val);
+        if (gl_SubgroupInvocationID == 0) {
+            s_partial_sum[0] = val;
+        }
+    }
+    barrier();
+
+    float norm = sqrt(s_partial_sum[0]) + eps;
+    float inv_norm_scale = scale / norm;
+
+    // Write normalized + scaled output
+    for (uint i = tid; i < dim; i += 256) {
+        v_output[base + i] = v_input[base + i] * inv_norm_scale;
+    }
+}

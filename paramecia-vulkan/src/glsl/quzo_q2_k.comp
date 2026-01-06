@@ -1,0 +1,179 @@
+// QuZO Q2K perturbation / restore+update kernel
+//
+// Q2K block: [scales[16] (16)][qs[64] (64)][half2 dm (4)] = 84 bytes = 21 words (aligned)
+// 64 threads, each handles 1 byte in qs (4 x 2-bit values)
+// 256 elements per block
+//
+// Compile with: -DMODE_PERTURB=1 or -DMODE_RESTORE_UPDATE=1
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer DataBuf { uint data_buf[]; };
+layout(set = 0, binding = 1) buffer PerturbBuf { float perturbation[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint count;
+    float param1;
+    float param2;
+    uint seed1_lo;
+    uint seed1_hi;
+    uint seed2_lo;
+    uint seed2_hi;
+    uint flags;
+};
+
+shared uint s_data[21]; // 84 bytes = 21 words
+
+#include "quzo_common.comp"
+
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (wg >= count) return;
+
+    // Load block into shared memory
+    uint global_word_base = wg * 21u;
+    if (tid < 21u) {
+        s_data[tid] = data_buf[global_word_base + tid];
+    }
+    barrier();
+
+    // Block layout offsets (bytes):
+    // scales: 0-15, qs: 16-79, dm: 80-83
+    uint scales_byte = 0u;
+    uint qs_base_byte = 16u;
+    uint dm_byte = 80u;
+
+    // Read dm
+    vec2 dm = unpackHalf2x16(s_data[20]); // word 20 = bytes 80-83
+    float dall = dm.x;
+    float dmin = dm.y;
+
+    if (abs(dall) < 1e-10) return;
+
+    // Thread mapping
+    uint n = tid >> 5;        // 0 or 1
+    uint l = tid & 31u;
+    uint is_idx = 8u * n + l / 16u;
+
+    // Byte in qs containing 4 x 2-bit values
+    uint qs_offset = qs_base_byte + 32u * n + l;
+    uint qs_word_idx = qs_offset >> 2;
+    uint qs_byte_pos = qs_offset & 3u;
+    uint packed = (s_data[qs_word_idx] >> (qs_byte_pos * 8u)) & 0xFFu;
+
+    // Extract 4 x 2-bit values
+    uint q0 = packed & 3u;
+    uint q1 = (packed >> 2) & 3u;
+    uint q2 = (packed >> 4) & 3u;
+    uint q3 = (packed >> 6) & 3u;
+
+    uint global_base = wg * 256u + 128u * n;
+    uint64_t seed = (uint64_t(seed1_hi) << 32) | uint64_t(seed1_lo);
+#ifndef MODE_PERTURB
+    uint64_t update_seed = (uint64_t(seed2_hi) << 32) | uint64_t(seed2_lo);
+#endif
+
+    // Process 4 elements with different scale indices
+    // Element 0: scale index is_idx
+    {
+        uint sc_byte = read_byte(scales_byte + is_idx);
+        float d_sc = dall * float(sc_byte & 0xFu);
+        float d_m = dmin * float(sc_byte >> 4);
+        uint global_elem = global_base + l;
+        float val = d_sc * float(q0) - d_m;
+        float perturb = perturbation[global_elem];
+
+#ifdef MODE_PERTURB
+        float sign = ((flags & 1u) != 0u) ? 1.0 : -1.0;
+        val += sign * param1 * perturb;
+        uint64_t rng = init_rng(seed, global_elem);
+#else
+        val += param1 * perturb;
+        val -= param2 * perturb;
+        uint64_t rng = init_rng(update_seed, global_elem);
+#endif
+        float q_float = abs(d_sc) > 1e-10 ? (val + d_m) / d_sc : 0.0;
+        q0 = stochastic_round_u2(q_float, rng);
+    }
+
+    // Element 1: scale index is_idx + 2
+    {
+        uint sc_byte = read_byte(scales_byte + is_idx + 2u);
+        float d_sc = dall * float(sc_byte & 0xFu);
+        float d_m = dmin * float(sc_byte >> 4);
+        uint global_elem = global_base + 32u + l;
+        float val = d_sc * float(q1) - d_m;
+        float perturb = perturbation[global_elem];
+
+#ifdef MODE_PERTURB
+        float sign = ((flags & 1u) != 0u) ? 1.0 : -1.0;
+        val += sign * param1 * perturb;
+        uint64_t rng = init_rng(seed, global_elem);
+#else
+        val += param1 * perturb;
+        val -= param2 * perturb;
+        uint64_t rng = init_rng(update_seed, global_elem);
+#endif
+        float q_float = abs(d_sc) > 1e-10 ? (val + d_m) / d_sc : 0.0;
+        q1 = stochastic_round_u2(q_float, rng);
+    }
+
+    // Element 2: scale index is_idx + 4
+    {
+        uint sc_byte = read_byte(scales_byte + is_idx + 4u);
+        float d_sc = dall * float(sc_byte & 0xFu);
+        float d_m = dmin * float(sc_byte >> 4);
+        uint global_elem = global_base + 64u + l;
+        float val = d_sc * float(q2) - d_m;
+        float perturb = perturbation[global_elem];
+
+#ifdef MODE_PERTURB
+        float sign = ((flags & 1u) != 0u) ? 1.0 : -1.0;
+        val += sign * param1 * perturb;
+        uint64_t rng = init_rng(seed, global_elem);
+#else
+        val += param1 * perturb;
+        val -= param2 * perturb;
+        uint64_t rng = init_rng(update_seed, global_elem);
+#endif
+        float q_float = abs(d_sc) > 1e-10 ? (val + d_m) / d_sc : 0.0;
+        q2 = stochastic_round_u2(q_float, rng);
+    }
+
+    // Element 3: scale index is_idx + 6
+    {
+        uint sc_byte = read_byte(scales_byte + is_idx + 6u);
+        float d_sc = dall * float(sc_byte & 0xFu);
+        float d_m = dmin * float(sc_byte >> 4);
+        uint global_elem = global_base + 96u + l;
+        float val = d_sc * float(q3) - d_m;
+        float perturb = perturbation[global_elem];
+
+#ifdef MODE_PERTURB
+        float sign = ((flags & 1u) != 0u) ? 1.0 : -1.0;
+        val += sign * param1 * perturb;
+        uint64_t rng = init_rng(seed, global_elem);
+#else
+        val += param1 * perturb;
+        val -= param2 * perturb;
+        uint64_t rng = init_rng(update_seed, global_elem);
+#endif
+        float q_float = abs(d_sc) > 1e-10 ? (val + d_m) / d_sc : 0.0;
+        q3 = stochastic_round_u2(q_float, rng);
+    }
+
+    // Pack 4 x 2-bit values and write back
+    uint new_packed = q0 | (q1 << 2) | (q2 << 4) | (q3 << 6);
+    write_byte_shared(qs_word_idx, qs_byte_pos, new_packed);
+
+    barrier();
+
+    if (tid < 21u) {
+        data_buf[global_word_base + tid] = s_data[tid];
+    }
+}

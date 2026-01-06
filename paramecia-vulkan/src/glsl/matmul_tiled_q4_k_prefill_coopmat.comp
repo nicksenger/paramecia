@@ -1,0 +1,211 @@
+// Hierarchical Tiled Q4_K Matrix Multiplication - COOPMAT ACCELERATED
+// Q4_K: 256 elements per block, 144 bytes each
+//
+// Configuration: BM=64, BN=64, BK=32, WM=32, WN=32
+// Phase 6: Hierarchical Tiling + Cooperative Matrix (Tensor Cores)
+//
+// Architecture:
+//   Block Level:   BM×BN tile in shared memory (cooperative loading)
+//   Warp Level:    WM×WN subtile per warp (32×32)
+//   Coopmat Level: 16×16×16 tensor core operations
+//
+// Optimized for prefill workloads (m > 8) on tensor core GPUs
+// Workgroup: 128 threads = 4 warps = 2×2 warp grid
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Prefill-optimized tile configuration
+#define Q4_K 256
+#define Q4_K_BYTES 144
+#define BM 64   // Block M
+#define BN 64   // Block N
+#define BK 32   // Block K
+#define WM 32   // Warp M (2×2 grid = 4 warps)
+#define WN 32   // Warp N
+#define COOP_M 16  // Coopmat M (hardware tile size)
+#define COOP_N 16  // Coopmat N
+#define COOP_K 16  // Coopmat K
+
+// Coopmat tiles per warp: WM/COOP_M × WN/COOP_N = 2×2 = 4 tiles
+#define COOP_TILES_M 2
+#define COOP_TILES_N 2
+
+#include "matmul_tiled_common.glsl"
+
+layout(local_size_x = WARP_SIZE, local_size_y = NWARPS, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint params[8];
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputA {
+    float v_input_a[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer InputB {
+    uint v_input_b[];
+};
+
+// Shared memory: use fp16 for coopmat compatibility
+shared float16_t shared_a[BM * SHMEM_STRIDE_A];
+shared float16_t shared_b[BK * SHMEM_STRIDE_B];
+// Output buffer for coopmat results (float, not fp16)
+shared float shared_c[BM * BN];
+
+#include "dequant_kquants_tiled.glsl"
+
+// Dequantize Q4_K element to fp16 at [n_idx, k_idx]
+float16_t dequantize_q4_k_fp16(uint n_idx, uint k_idx, uint num_blocks) {
+    uint block_idx = k_idx / Q4_K;
+    uint elem_in_block = k_idx % Q4_K;
+    uint block_byte = n_idx * num_blocks * Q4_K_BYTES + block_idx * Q4_K_BYTES;
+    
+    float val = dequantize_q4k_elem(block_byte, elem_in_block);
+    return float16_t(val);
+}
+
+void main() {
+    uint lane_id = gl_LocalInvocationID.x;
+    uint warp_id = gl_LocalInvocationID.y;
+    uint tid = lane_id + warp_id * WARP_SIZE;
+
+    uint wg_m = gl_WorkGroupID.y * BM;
+    uint wg_n = gl_WorkGroupID.x * BN;
+    uint batch = gl_WorkGroupID.z;
+
+    if (wg_m >= op_m || wg_n >= op_n) return;
+
+    // Compute warp tile coordinates
+    uint warp_m_idx = warp_id / 2;  // 0 or 1 (2 warps in M)
+    uint warp_n_idx = warp_id % 2;  // 0 or 1 (2 warps in N)
+    uint warp_m_base = wg_m + warp_m_idx * WM;
+    uint warp_n_base = wg_n + warp_n_idx * WN;
+
+    // Define cooperative matrix accumulators (2×2 = 4 per warp)
+    coopmat<float, gl_ScopeSubgroup, COOP_M, COOP_N, gl_MatrixUseAccumulator> acc[COOP_TILES_M][COOP_TILES_N];
+
+    // Initialize accumulators to zero
+    for (uint tm = 0; tm < COOP_TILES_M; tm++) {
+        for (uint tn = 0; tn < COOP_TILES_N; tn++) {
+            acc[tm][tn] = coopmat<float, gl_ScopeSubgroup, COOP_M, COOP_N, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    uint a_offset = op_a_offset + batch * op_a_stride_b;
+    uint num_blocks = (op_k + Q4_K - 1) / Q4_K;
+    uint num_k_tiles = (op_k + BK - 1) / BK;
+
+    // Main K-loop: process BK chunks
+    for (uint k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        uint k_base = k_tile * BK;
+        uint k_tile_size = min(BK, op_k - k_base);
+
+        // Cooperative load A tile (fp32 → fp16 conversion)
+        for (uint i = tid; i < BM * BK; i += THREADS_PER_WG) {
+            uint tile_m = i / BK;
+            uint tile_k = i % BK;
+            uint global_m = wg_m + tile_m;
+            uint global_k = k_base + tile_k;
+
+            float16_t val = float16_t(0.0);
+            if (global_m < op_m && global_k < op_k) {
+                float val_f32 = v_input_a[a_offset + global_m * op_a_stride_m + global_k * op_a_stride_k];
+                val = float16_t(val_f32);
+            }
+            shared_a[tile_m * SHMEM_STRIDE_A + tile_k] = val;
+        }
+
+        // Cooperative load & dequantize B tile to fp16
+        for (uint i = tid; i < BK * BN; i += THREADS_PER_WG) {
+            uint tile_k = i / BN;
+            uint tile_n = i % BN;
+            uint global_n = wg_n + tile_n;
+            uint global_k = k_base + tile_k;
+
+            float16_t val = float16_t(0.0);
+            if (global_n < op_n && global_k < op_k) {
+                val = dequantize_q4_k_fp16(global_n, global_k, num_blocks);
+            }
+            shared_b[tile_k * SHMEM_STRIDE_B + tile_n] = val;
+        }
+
+        barrier();
+
+        // Compute using cooperative matrices
+        // Process BK in COOP_K chunks (32 / 16 = 2 iterations)
+        for (uint k_local = 0; k_local + COOP_K <= k_tile_size; k_local += COOP_K) {
+
+            // Each warp processes its WM×WN tile using 2×2 coopmat operations
+            for (uint tm = 0; tm < COOP_TILES_M; tm++) {
+                for (uint tn = 0; tn < COOP_TILES_N; tn++) {
+                    // Define coopmat matrices for this 16×16×16 operation
+                    coopmat<float16_t, gl_ScopeSubgroup, COOP_M, COOP_K, gl_MatrixUseA> matA;
+                    coopmat<float16_t, gl_ScopeSubgroup, COOP_K, COOP_N, gl_MatrixUseB> matB;
+
+                    // Compute source offsets in shared memory
+                    uint a_m_base = warp_m_idx * WM + tm * COOP_M;  // Row offset in shared_a
+                    uint a_k_base = k_local;                         // Col offset in shared_a
+                    uint b_k_base = k_local;                         // Row offset in shared_b
+                    uint b_n_base = warp_n_idx * WN + tn * COOP_N;  // Col offset in shared_b
+
+                    // Load from shared memory to coopmat (tensor core registers)
+                    coopMatLoad(matA, shared_a, a_m_base * SHMEM_STRIDE_A + a_k_base, SHMEM_STRIDE_A, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(matB, shared_b, b_k_base * SHMEM_STRIDE_B + b_n_base, SHMEM_STRIDE_B, gl_CooperativeMatrixLayoutRowMajor);
+
+                    // Tensor core multiply-accumulate: C += A * B
+                    acc[tm][tn] = coopMatMulAdd(matA, matB, acc[tm][tn]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Store results from coopmat accumulators to global memory
+    // First, store all coopmat results to shared memory
+    for (uint tm = 0; tm < COOP_TILES_M; tm++) {
+        for (uint tn = 0; tn < COOP_TILES_N; tn++) {
+            uint tile_m_offset = warp_m_idx * WM + tm * COOP_M;
+            uint tile_n_offset = warp_n_idx * WN + tn * COOP_N;
+            uint shmem_offset = tile_m_offset * BN + tile_n_offset;
+
+            // Store coopmat (float accumulator) to shared memory
+            coopMatStore(acc[tm][tn], shared_c, shmem_offset, BN, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+
+    barrier();  // Ensure all warps have written their results
+
+    // Now cooperatively write from shared memory to global memory
+    for (uint i = tid; i < BM * BN; i += THREADS_PER_WG) {
+        uint tile_m = i / BN;
+        uint tile_n = i % BN;
+        uint out_m = wg_m + tile_m;
+        uint out_n = wg_n + tile_n;
+
+        if (out_m < op_m && out_n < op_n) {
+            float val = shared_c[tile_m * BN + tile_n];
+            v_dest[batch * op_m * op_n + out_m * op_n + out_n] = val;
+        }
+    }
+}

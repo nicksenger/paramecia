@@ -1,0 +1,32 @@
+[package]
+name = "paramecia-metal"
+version = "0.1.0"
+edition = "2021"
+description = "Metal kernels for Paramecia"
+license = "Apache-2.0"
+
+[dependencies]
+half = { version = "2.5.0", features = [
+    "num-traits",
+    "use-intrinsics",
+    "rand_distr",
+] }
+thiserror = "2"
+objc2-metal = "0.3.2"
+objc2 = "0.6.3"
+objc2-foundation = "0.3.2"
+
+[dev-dependencies]
+clap = { version = "4.5.49", features = ["derive"] }
+half = { version = "2.7.1", features = [
+    "num-traits",
+    "use-intrinsics",
+    "rand_distr",
+] }
+anyhow = "1"
+rand = "0.9.2"
+rand_distr = "0.5.1"
+
+[profile.profiling]
+inherits = "release"
+debug = 2

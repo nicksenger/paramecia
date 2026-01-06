@@ -1,0 +1,64 @@
+[package]
+name = "paramecia-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core tensor library for Paramecia"
+license = "Apache-2.0"
+
+[dependencies]
+accelerate-src = { version = "0.3.2", optional = true }
+byteorder = { workspace = true }
+paramecia-cuda = { path = "../paramecia-cuda", optional = true }
+paramecia-metal = { path = "../paramecia-metal", optional = true }
+objc2-metal = { version = "0.3.1", optional = true }
+objc2-foundation = { version = "0.3.1", optional = true }
+paramecia-vulkan = { path = "../paramecia-vulkan", optional = true }
+cudarc = { version = "0.18.1", features = [
+    "std",
+    "cublas",
+    "cublaslt",
+    "curand",
+    "driver",
+    "nvrtc",
+    "f16",
+    "f8",
+    "cuda-version-from-build-system",
+    "dynamic-linking",
+], default-features = false, optional = true }
+ash = { version = "0.38", optional = true }
+gpu-allocator = { version = "0.27", optional = true, default-features = false, features = ["vulkan"] }
+crossbeam = { version = "0.8", optional = true }
+bytemuck = { workspace = true, optional = true }
+gemm = { version = "0.18.2", features = ["wasm-simd128-enable"] }
+half = { workspace = true }
+float8 = { version = "=0.5.0", features = ["num-traits", "rand_distr"] }
+intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"], optional = true }
+libc = { version = "0.2.147", optional = true }
+libm = "0.2.15"
+memmap2 = { version = "0.9.3", features = ["stable_deref_trait"] }
+num-traits = { workspace = true }
+num_cpus = "1.15.0"
+rand = { workspace = true }
+rand_distr = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+yoke = { version = "0.7.2", features = ["derive"] }
+zip = { version = "1.1.1", default-features = false }
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow = { version = "1", features = ["backtrace"] }
+
+[features]
+default = []
+cuda = ["cudarc", "dep:paramecia-cuda", "float8/cuda"]
+cudnn = ["cuda", "cudarc/cudnn"]
+nccl = ["cuda", "cudarc/nccl"]
+mkl = ["dep:libc", "dep:intel-mkl-src"]
+accelerate = ["dep:libc", "dep:accelerate-src"]
+metal = [
+    "dep:objc2-metal",
+    "dep:objc2-foundation",
+    "dep:paramecia-metal",
+]
+vulkan = ["dep:ash", "dep:gpu-allocator", "dep:paramecia-vulkan", "dep:bytemuck", "dep:libc", "dep:crossbeam"]

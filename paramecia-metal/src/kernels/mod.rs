@@ -1,0 +1,39 @@
+pub mod affine;
+pub mod binary;
+pub mod cast;
+pub mod convolution;
+pub mod deltanet;
+pub mod fill;
+pub mod flash_attn_q8;
+pub mod indexing;
+mod macros;
+pub mod mlx_gemm;
+pub mod quantized;
+pub mod quzo;
+pub mod random;
+pub mod reduce;
+pub mod sdpa;
+pub mod sort;
+pub mod ternary;
+pub mod unary;
+
+pub use affine::*;
+pub use binary::{call_binary_contiguous, call_binary_strided};
+pub use cast::{call_cast_contiguous, call_cast_strided};
+pub use convolution::*;
+pub use deltanet::*;
+pub use fill::*;
+pub use flash_attn_q8::*;
+pub use indexing::*;
+pub use mlx_gemm::{call_mlx_gemm, GemmDType};
+pub use quantized::{
+    call_indexed_moe_forward, call_indexed_moe_gate_up, call_quantized_matmul_mm_t,
+    call_quantized_matmul_mv_t, GgmlDType,
+};
+pub use quzo::*;
+pub use random::*;
+pub use reduce::*;
+pub use sdpa::{call_sdpa_full, call_sdpa_vector, call_sdpa_vector_2pass, SdpaDType};
+pub use sort::{call_arg_sort, call_mlx_arg_sort};
+pub use ternary::call_where_cond;
+pub use unary::*;

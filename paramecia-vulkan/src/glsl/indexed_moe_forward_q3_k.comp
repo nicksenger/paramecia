@@ -1,0 +1,252 @@
+// Indexed MoE Forward - Q3_K Quantized Expert Matmul
+//
+// Computes: output[batch, topk, n] = weights[expert_id, n, k] @ x[batch, j, k]
+// Where expert_id = ids[batch, topk]
+//
+// Adapted from matmul_q3_k.comp with expert indirection layer.
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Q3_K constants
+#define QK3_K 256        // Elements per Q3_K block
+#define QK3_K_BYTES 110  // Bytes per block
+#define HMASK_OFFSET 0
+#define QS_OFFSET 32
+#define SCALES_OFFSET 96
+#define D_OFFSET 108
+
+#define WARP_SIZE 32
+#define NWARPS 4
+
+layout(local_size_x = WARP_SIZE, local_size_y = NWARPS, local_size_z = 1) in;
+
+// Parameters via push constants (36 bytes = 9 x u32)
+layout(push_constant) uniform PushConstants {
+    uint params[9];
+    // [0]: n (out_dim)
+    // [1]: k (in_dim)
+    // [2]: batch
+    // [3]: topk
+    // [4]: x_inner_dim
+    // [5]: expert_stride (u32 words per expert)
+    // [6]: x_stride_batch
+    // [7]: x_stride_inner
+    // [8]: unused
+};
+
+#define op_n              params[0]
+#define op_k              params[1]
+#define op_batch          params[2]
+#define op_topk           params[3]
+#define op_x_inner_dim    params[4]
+#define op_expert_stride  params[5]
+#define op_x_stride_batch params[6]
+#define op_x_stride_inner params[7]
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputX {
+    float v_input_x[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer WeightsBuf {
+    uint v_input_b[];
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer IdsBuf {
+    uint v_ids[];
+};
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+float half_to_float_lo(uint packed) {
+    return unpackHalf2x16(packed).x;
+}
+
+uint load_byte(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = v_input_b[word_idx];
+    return (word >> (byte_in_word * 8)) & 0xFF;
+}
+
+float load_f16(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = v_input_b[word_idx];
+
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return unpackHalf2x16(word).y;
+    } else {
+        uint word2 = v_input_b[word_idx + 1];
+        uint h;
+        if (byte_in_word == 1) {
+            h = (word >> 8) | (word2 << 24);
+        } else {
+            h = (word >> 24) | (word2 << 8);
+        }
+        return half_to_float_lo(h);
+    }
+}
+
+uint load_u32_unaligned(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    if (byte_in_word == 0) {
+        return v_input_b[word_idx];
+    } else {
+        uint w0 = v_input_b[word_idx];
+        uint w1 = v_input_b[word_idx + 1];
+        return (w0 >> (byte_in_word * 8)) | (w1 << ((4 - byte_in_word) * 8));
+    }
+}
+
+float warp_reduce_sum(float v) {
+    v += subgroupShuffleXor(v, 16);
+    v += subgroupShuffleXor(v, 8);
+    v += subgroupShuffleXor(v, 4);
+    v += subgroupShuffleXor(v, 2);
+    v += subgroupShuffleXor(v, 1);
+    return v;
+}
+
+// Q3_K scale decoding (16 scales from 12 packed bytes)
+float get_q3k_scale(uint block_byte, uint is) {
+    uint sc_base = block_byte + SCALES_OFFSET;
+
+    uint a0 = load_u32_unaligned(sc_base);
+    uint a1 = load_u32_unaligned(sc_base + 4);
+    uint a2 = load_u32_unaligned(sc_base + 8);
+
+    uint KMASK1 = 0x03030303u;
+    uint KMASK2 = 0x0f0f0f0fu;
+
+    uint d0 = (a0 & KMASK2) | (((a2) & KMASK1) << 4);
+    uint d1 = (a1 & KMASK2) | (((a2 >> 2) & KMASK1) << 4);
+    uint d2 = ((a0 >> 4) & KMASK2) | (((a2 >> 4) & KMASK1) << 4);
+    uint d3 = ((a1 >> 4) & KMASK2) | (((a2 >> 6) & KMASK1) << 4);
+
+    uint word;
+    uint idx = is;
+    if (idx < 4) {
+        word = d0;
+    } else if (idx < 8) {
+        word = d1;
+        idx -= 4;
+    } else if (idx < 12) {
+        word = d2;
+        idx -= 8;
+    } else {
+        word = d3;
+        idx -= 12;
+    }
+
+    int scale_byte = int((word >> (idx * 8)) & 0xFF);
+    return float(scale_byte - 32);
+}
+
+// ============================================================================
+// Main kernel
+// ============================================================================
+// Dispatch: (ceil(n/4), batch, topk)
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint warp = gl_LocalInvocationID.y;
+    uint wg_x = gl_WorkGroupID.x;
+    uint batch_idx = gl_WorkGroupID.y;
+    uint topk_idx = gl_WorkGroupID.z;
+
+    uint out_col = wg_x * NWARPS + warp;
+
+    if (out_col >= op_n || batch_idx >= op_batch || topk_idx >= op_topk) {
+        return;
+    }
+
+    // Expert indirection
+    uint expert_id = v_ids[batch_idx * op_topk + topk_idx];
+    uint num_blocks = op_k / QK3_K;
+    uint row_bytes = num_blocks * QK3_K_BYTES;
+    uint expert_byte_offset = expert_id * op_expert_stride * 4;
+    uint b_byte_offset = expert_byte_offset + out_col * row_bytes;
+
+    // Input X pointer
+    uint x_inner_idx = min(topk_idx, op_x_inner_dim - 1);
+    uint x_offset = batch_idx * op_x_stride_batch + x_inner_idx * op_x_stride_inner;
+
+    float acc = 0.0;
+
+    for (uint blk = 0; blk < num_blocks; blk++) {
+        uint block_byte = b_byte_offset + blk * QK3_K_BYTES;
+        uint k_base = blk * QK3_K;
+
+        float d_all = load_f16(block_byte + D_OFFSET);
+
+        uint is = 0;
+        uint m = 1;
+
+        for (uint half_blk = 0; half_blk < 2; half_blk++) {
+            uint qs_base = block_byte + QS_OFFSET + half_blk * 32;
+            uint y_base = k_base + half_blk * 128;
+
+            for (uint shift = 0; shift < 8; shift += 2) {
+                // First sub-group of 16 elements
+                {
+                    float dl = d_all * get_q3k_scale(block_byte, is);
+                    is++;
+
+                    if (lane < 16) {
+                        uint qs_byte = load_byte(qs_base + lane);
+                        uint hmask_byte = load_byte(block_byte + HMASK_OFFSET + lane);
+                        uint q2 = (qs_byte >> shift) & 3;
+                        int q3 = int(q2) - ((hmask_byte & m) != 0 ? 0 : 4);
+
+                        uint k_idx = y_base + lane;
+                        float a = v_input_x[x_offset + k_idx];
+                        acc += a * dl * float(q3);
+                    }
+                }
+
+                // Second sub-group of 16 elements
+                {
+                    float dl = d_all * get_q3k_scale(block_byte, is);
+                    is++;
+
+                    if (lane < 16) {
+                        uint qs_byte = load_byte(qs_base + 16 + lane);
+                        uint hmask_byte = load_byte(block_byte + HMASK_OFFSET + 16 + lane);
+                        uint q2 = (qs_byte >> shift) & 3;
+                        int q3 = int(q2) - ((hmask_byte & m) != 0 ? 0 : 4);
+
+                        uint k_idx = y_base + 16 + lane;
+                        float a = v_input_x[x_offset + k_idx];
+                        acc += a * dl * float(q3);
+                    }
+                }
+
+                y_base += 32;
+                m <<= 1;
+            }
+        }
+    }
+
+    float sum = warp_reduce_sum(acc);
+
+    if (lane == 0) {
+        uint out_idx = batch_idx * op_topk * op_n + topk_idx * op_n + out_col;
+        v_dest[out_idx] = sum;
+    }
+}

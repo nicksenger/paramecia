@@ -1,0 +1,60 @@
+[package]
+name = "paramecia-text"
+description = "Text backend for paramecia interactive agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-stream = "0.1"
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+reqwest = { workspace = true }
+
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+uuid = { workspace = true }
+dirs = { workspace = true }
+sha2 = "0.10"
+half = { workspace = true }
+bytemuck = { workspace = true }
+rand = { workspace = true }
+regex = { workspace = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+paramecia-engine = { workspace = true }
+paramecia-bridge = { workspace = true }
+paramecia-core = { workspace = true }
+minijinja = { version = "2", features = ["json"] }
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+paramecia-harness = { workspace = true }
+paramecia-tools = { workspace = true }
+
+[[example]]
+name = "local_agent"
+required-features = []
+
+[features]
+default = []
+accelerate = ["paramecia-core/accelerate", "paramecia-engine/accelerate"]
+cuda = ["paramecia-core/cuda", "paramecia-engine/cuda"]
+metal = ["paramecia-core/metal", "paramecia-engine/metal"]
+vulkan = ["paramecia-core/vulkan", "paramecia-engine/vulkan"]
+qwen3next_80b_a3b = ["paramecia-engine/qwen3next_80b_a3b"]
+qwen35moe_35b_a3b = ["paramecia-engine/qwen35moe_35b_a3b"]
+qwen35moe_122b_a10b = ["paramecia-engine/qwen35moe_122b_a10b"]
+qwen35moe_397b_a17b = ["paramecia-engine/qwen35moe_397b_a17b"]
+qwen35_0p8b = ["paramecia-engine/qwen35_0p8b"]
+qwen35_4b = ["paramecia-engine/qwen35_4b"]
+qwen35_9b = ["paramecia-engine/qwen35_9b"]
+qwen35_27b = ["paramecia-engine/qwen35_27b"]

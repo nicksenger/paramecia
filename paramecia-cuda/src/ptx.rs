@@ -1,0 +1,15 @@
+pub const AFFINE: &str = include_str!(concat!(env!("OUT_DIR"), "/affine.ptx"));
+pub const BINARY: &str = include_str!(concat!(env!("OUT_DIR"), "/binary.ptx"));
+pub const CAST: &str = include_str!(concat!(env!("OUT_DIR"), "/cast.ptx"));
+pub const CONV: &str = include_str!(concat!(env!("OUT_DIR"), "/conv.ptx"));
+pub const DELTANET: &str = include_str!(concat!(env!("OUT_DIR"), "/deltanet.ptx"));
+pub const FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/fill.ptx"));
+pub const FLASH_ATTN_Q8: &str = include_str!(concat!(env!("OUT_DIR"), "/flash_attn_q8.ptx"));
+pub const INDEXING: &str = include_str!(concat!(env!("OUT_DIR"), "/indexing.ptx"));
+pub const QUANTIZED: &str = include_str!(concat!(env!("OUT_DIR"), "/quantized.ptx"));
+pub const QUZO_FUSED: &str = include_str!(concat!(env!("OUT_DIR"), "/quzo_fused.ptx"));
+pub const QUZO_PERTURB: &str = include_str!(concat!(env!("OUT_DIR"), "/quzo_perturb.ptx"));
+pub const REDUCE: &str = include_str!(concat!(env!("OUT_DIR"), "/reduce.ptx"));
+pub const SORT: &str = include_str!(concat!(env!("OUT_DIR"), "/sort.ptx"));
+pub const TERNARY: &str = include_str!(concat!(env!("OUT_DIR"), "/ternary.ptx"));
+pub const UNARY: &str = include_str!(concat!(env!("OUT_DIR"), "/unary.ptx"));

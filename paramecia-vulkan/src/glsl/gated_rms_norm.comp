@@ -1,0 +1,89 @@
+// Gated RMS Norm: out = silu(z) * rms_norm(x, weight)
+//   rms_norm(x, w) = x / sqrt(mean(x^2) + eps) * w
+//   silu(z) = z * sigmoid(z)
+//
+// Per-row operation along last dimension.
+// Dispatch: (num_rows, 1, 1) with local_size_x = 256
+
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint num_rows;
+    uint dim;
+    float eps;
+    uint _pad;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer XBuf {
+    float v_x[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer ZBuf {
+    float v_z[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer WeightBuf {
+    float v_weight[];
+};
+
+layout(set = 0, binding = 3, std430) writeonly buffer OutputBuf {
+    float v_output[];
+};
+
+shared float s_partial_sum[32];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (row >= num_rows) return;
+
+    uint base = row * dim;
+
+    // Compute mean of squares
+    float sum_sq = 0.0;
+    for (uint i = tid; i < dim; i += 256) {
+        float val = v_x[base + i];
+        sum_sq += val * val;
+    }
+
+    // Subgroup reduction
+    sum_sq = subgroupAdd(sum_sq);
+
+    uint sg_id = gl_SubgroupID;
+    uint sg_size = gl_SubgroupSize;
+    uint num_subgroups = (256 + sg_size - 1) / sg_size;
+
+    if (gl_SubgroupInvocationID == 0) {
+        s_partial_sum[sg_id] = sum_sq;
+    }
+    barrier();
+
+    if (sg_id == 0) {
+        float val = (gl_SubgroupInvocationID < num_subgroups) ?
+            s_partial_sum[gl_SubgroupInvocationID] : 0.0;
+        val = subgroupAdd(val);
+        if (gl_SubgroupInvocationID == 0) {
+            s_partial_sum[0] = val;
+        }
+    }
+    barrier();
+
+    float mean_sq = s_partial_sum[0] / float(dim);
+    float rms_inv = 1.0 / sqrt(mean_sq + eps);
+
+    // Write output: silu(z) * rms_norm(x)
+    for (uint i = tid; i < dim; i += 256) {
+        float x_val = v_x[base + i];
+        float z_val = v_z[base + i];
+        float w_val = v_weight[i];
+
+        float normed = x_val * rms_inv * w_val;
+        float silu_z = z_val / (1.0 + exp(-z_val));
+
+        v_output[base + i] = silu_z * normed;
+    }
+}

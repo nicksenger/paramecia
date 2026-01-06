@@ -1,0 +1,21 @@
+[package]
+name = "interactive-controller"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wit-bindgen = { version = "0.52", default-features = false, features = ["macros", "realloc", "async"] }
+futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
+async-channel = { version = "2.3", default-features = false }
+
+[build-dependencies]
+paramecia-wit = { path = "../../../paramecia-wit" }
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

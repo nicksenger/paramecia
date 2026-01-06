@@ -1,0 +1,306 @@
+// Q6_K Indexed MoE Gate+Up+SwiGLU - Cooperative Matrix
+// Each workgroup processes TILE_N output columns for a single input vector (M=1)
+// Computes: output[batch, topk, n] = silu(gate @ x) * (up @ x)
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#define Q6_K_K 256
+#define Q6_K_K_BYTES 210
+
+layout(constant_id = 0) const uint TILE_M = 16;
+layout(constant_id = 1) const uint TILE_N = 16;
+layout(constant_id = 2) const uint TILE_K = 16;
+
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform PushConstants { uint params[12]; };
+#define op_n                  params[0]
+#define op_k                  params[1]
+#define op_batch              params[2]
+#define op_topk               params[3]
+#define op_x_inner_dim        params[4]
+#define op_gate_expert_stride params[5]
+#define op_up_expert_stride   params[6]
+#define op_x_stride_batch     params[7]
+#define op_x_stride_inner     params[8]
+// params[9-11]: unused
+
+layout(set = 0, binding = 0, std430) writeonly buffer O { float v_dest[]; };
+layout(set = 0, binding = 1, std430) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2, std430) readonly buffer GateW { uint gate_weights[]; };
+layout(set = 0, binding = 3, std430) readonly buffer UpW { uint up_weights[]; };
+layout(set = 0, binding = 4, std430) readonly buffer I { uint ids[]; };
+
+shared float16_t shared_a[16 * 32];  // TILE_M * TILE_K (K can be 32 on some GPUs)
+shared float16_t shared_b[32 * 16];  // TILE_K * TILE_N
+// We only use the first row of these tiles (M=1 for MoE)
+shared float temp_c[16 * 16];  // TILE_M * TILE_N for storing matC results
+
+float half_to_float_lo(uint packed) { return unpackHalf2x16(packed).x; }
+float half_to_float_hi(uint packed) { return unpackHalf2x16(packed).y; }
+
+uint load_byte_gate(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    return (gate_weights[word_idx] >> ((byte_offset % 4) * 8)) & 0xFF;
+}
+
+uint load_byte_up(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    return (up_weights[word_idx] >> ((byte_offset % 4) * 8)) & 0xFF;
+}
+
+float load_f16_gate(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = gate_weights[word_idx];
+
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return half_to_float_hi(word);
+    } else {
+        uint word2 = gate_weights[word_idx + 1];
+        uint h;
+        if (byte_in_word == 1) {
+            h = (word >> 8) | (word2 << 24);
+        } else {
+            h = (word >> 24) | (word2 << 8);
+        }
+        return half_to_float_lo(h);
+    }
+}
+
+float load_f16_up(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = up_weights[word_idx];
+
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return half_to_float_hi(word);
+    } else {
+        uint word2 = up_weights[word_idx + 1];
+        uint h;
+        if (byte_in_word == 1) {
+            h = (word >> 8) | (word2 << 24);
+        } else {
+            h = (word >> 24) | (word2 << 8);
+        }
+        return half_to_float_lo(h);
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_n = gl_WorkGroupID.x;
+    uint batch_idx = gl_WorkGroupID.y;
+    uint topk_idx = gl_WorkGroupID.z;
+    uint n_start = wg_n * TILE_N;
+
+    if (n_start >= op_n || batch_idx >= op_batch || topk_idx >= op_topk) return;
+
+    uint expert_id = ids[batch_idx * op_topk + topk_idx];
+    uint gate_expert_base = expert_id * op_gate_expert_stride * 4;  // Convert u32 words to bytes
+    uint up_expert_base = expert_id * op_up_expert_stride * 4;      // Convert u32 words to bytes
+
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> matA;
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> matC;
+
+    // Compute gate matmul (1×K × K×N)
+    uint x_inner_idx = min(topk_idx, op_x_inner_dim - 1);
+    uint x_base_offset = batch_idx * op_x_stride_batch + x_inner_idx * op_x_stride_inner;
+    matC = coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(0.0);
+    for (uint k_tile = 0; k_tile < (op_k + TILE_K - 1) / TILE_K; k_tile++) {
+        uint k_start = k_tile * TILE_K;
+        // Load input vector (M=1, K=TILE_K), replicate across all M rows for coopmat
+        for (uint i = tid; i < TILE_M * TILE_K; i += 32) {
+            uint k_idx = k_start + (i % TILE_K);
+            float val = 0.0;
+            if (k_idx < op_k) {
+                val = x[x_base_offset + k_idx];
+            }
+            shared_a[i] = float16_t(val);
+        }
+        // Dequantize gate weights (K×N)
+        // Q6K format (210 bytes per block):
+        // - ql: 128 bytes at offset 0 (packed nibbles)
+        // - qh: 64 bytes at offset 128 (high bits)
+        // - scales: 16 i8 at offset 192
+        // - d: 1 f16 at offset 208
+        for (uint i = tid; i < TILE_K * TILE_N; i += 32) {
+            uint k_idx = k_start + (i / TILE_N);
+            uint n_idx = n_start + (i % TILE_N);
+            float val = 0.0;
+
+            if (k_idx < op_k && n_idx < op_n) {
+                uint blk = k_idx / Q6_K_K;
+                uint off = k_idx % Q6_K_K;
+                uint num_blocks = (op_k + Q6_K_K - 1) / Q6_K_K;
+                uint byte_off = gate_expert_base + n_idx * num_blocks * Q6_K_K_BYTES + blk * Q6_K_K_BYTES;
+
+                // Load d
+                float d = load_f16_gate(byte_off + 208);
+
+                // Decode based on position within block
+                uint j_base = (off < 128) ? 0 : 64;     // ql base: 0 or 64
+                uint qh_base = j_base / 2;               // qh base: 0 or 32
+                uint off_in_half = off % 128;
+                uint quarter = off_in_half / 32;         // 0,1,2,3
+                uint l = off_in_half % 32;
+
+                uint ql_idx, qh_shift;
+                bool use_upper_nibble;
+
+                if (quarter == 0) {  // off_in_half 0-31
+                    ql_idx = j_base + l;
+                    use_upper_nibble = false;
+                    qh_shift = 0;
+                } else if (quarter == 1) {  // off_in_half 32-63
+                    ql_idx = j_base + 32 + l;
+                    use_upper_nibble = false;
+                    qh_shift = 2;
+                } else if (quarter == 2) {  // off_in_half 64-95
+                    ql_idx = j_base + l;
+                    use_upper_nibble = true;
+                    qh_shift = 4;
+                } else {  // quarter == 3, off_in_half 96-127
+                    ql_idx = j_base + 32 + l;
+                    use_upper_nibble = true;
+                    qh_shift = 6;
+                }
+
+                uint ql = load_byte_gate(byte_off + ql_idx);
+                uint qh = load_byte_gate(byte_off + 128 + qh_base + l);
+
+                uint ql_bits = use_upper_nibble ? (ql >> 4) : (ql & 0xF);
+                uint qh_bits = (qh >> qh_shift) & 0x3;
+                int q = int(ql_bits | (qh_bits << 4)) - 32;
+
+                // Load scale (each scale covers 16 consecutive elements)
+                uint scale_idx = off / 16;
+                int scale_i8 = int(load_byte_gate(byte_off + 192 + scale_idx)) << 24 >> 24;
+                float scale = float(scale_i8);
+
+                val = d * scale * float(q);
+            }
+            shared_b[i] = float16_t(val);
+        }
+        barrier();
+        coopMatLoad(matA, shared_a, 0, TILE_K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, shared_b, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+        matC = coopMatMulAdd(matA, matB, matC);
+        barrier();
+    }
+    coopMatStore(matC, temp_c, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    // Read gate results from temp_c (first row) before computing up
+    float gate_val = 0.0;
+    if (tid < TILE_N) {
+        gate_val = temp_c[tid];
+    }
+
+    // Compute up matmul (1×K × K×N)
+    matC = coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(0.0);
+    for (uint k_tile = 0; k_tile < (op_k + TILE_K - 1) / TILE_K; k_tile++) {
+        uint k_start = k_tile * TILE_K;
+        // Load input vector (M=1, K=TILE_K), replicate across all M rows for coopmat
+        for (uint i = tid; i < TILE_M * TILE_K; i += 32) {
+            uint k_idx = k_start + (i % TILE_K);
+            float val = 0.0;
+            if (k_idx < op_k) {
+                val = x[x_base_offset + k_idx];
+            }
+            shared_a[i] = float16_t(val);
+        }
+        // Dequantize up weights (K×N)
+        // Q6K format (210 bytes per block):
+        // - ql: 128 bytes at offset 0 (packed nibbles)
+        // - qh: 64 bytes at offset 128 (high bits)
+        // - scales: 16 i8 at offset 192
+        // - d: 1 f16 at offset 208
+        for (uint i = tid; i < TILE_K * TILE_N; i += 32) {
+            uint k_idx = k_start + (i / TILE_N);
+            uint n_idx = n_start + (i % TILE_N);
+            float val = 0.0;
+
+            if (k_idx < op_k && n_idx < op_n) {
+                uint blk = k_idx / Q6_K_K;
+                uint off = k_idx % Q6_K_K;
+                uint num_blocks = (op_k + Q6_K_K - 1) / Q6_K_K;
+                uint byte_off = up_expert_base + n_idx * num_blocks * Q6_K_K_BYTES + blk * Q6_K_K_BYTES;
+
+                // Load d
+                float d = load_f16_up(byte_off + 208);
+
+                // Decode based on position within block
+                uint j_base = (off < 128) ? 0 : 64;     // ql base: 0 or 64
+                uint qh_base = j_base / 2;               // qh base: 0 or 32
+                uint off_in_half = off % 128;
+                uint quarter = off_in_half / 32;         // 0,1,2,3
+                uint l = off_in_half % 32;
+
+                uint ql_idx, qh_shift;
+                bool use_upper_nibble;
+
+                if (quarter == 0) {  // off_in_half 0-31
+                    ql_idx = j_base + l;
+                    use_upper_nibble = false;
+                    qh_shift = 0;
+                } else if (quarter == 1) {  // off_in_half 32-63
+                    ql_idx = j_base + 32 + l;
+                    use_upper_nibble = false;
+                    qh_shift = 2;
+                } else if (quarter == 2) {  // off_in_half 64-95
+                    ql_idx = j_base + l;
+                    use_upper_nibble = true;
+                    qh_shift = 4;
+                } else {  // quarter == 3, off_in_half 96-127
+                    ql_idx = j_base + 32 + l;
+                    use_upper_nibble = true;
+                    qh_shift = 6;
+                }
+
+                uint ql = load_byte_up(byte_off + ql_idx);
+                uint qh = load_byte_up(byte_off + 128 + qh_base + l);
+
+                uint ql_bits = use_upper_nibble ? (ql >> 4) : (ql & 0xF);
+                uint qh_bits = (qh >> qh_shift) & 0x3;
+                int q = int(ql_bits | (qh_bits << 4)) - 32;
+
+                // Load scale (each scale covers 16 consecutive elements)
+                uint scale_idx = off / 16;
+                int scale_i8 = int(load_byte_up(byte_off + 192 + scale_idx)) << 24 >> 24;
+                float scale = float(scale_i8);
+
+                val = d * scale * float(q);
+            }
+            shared_b[i] = float16_t(val);
+        }
+        barrier();
+        coopMatLoad(matA, shared_a, 0, TILE_K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, shared_b, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+        matC = coopMatMulAdd(matA, matB, matC);
+        barrier();
+    }
+    // Compute up matmul result and store in temp_c (overwrites gate)
+    coopMatStore(matC, temp_c, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    // Apply SwiGLU and write output
+    if (tid < TILE_N) {
+        uint n_idx = n_start + tid;
+        if (n_idx < op_n) {
+            float up_val = temp_c[tid];
+            float silu_gate = gate_val / (1.0 + exp(-gate_val));
+            uint out_idx = batch_idx * op_topk * op_n + topk_idx * op_n + n_idx;
+            v_dest[out_idx] = silu_gate * up_val;
+        }
+    }
+}

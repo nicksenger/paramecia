@@ -1,0 +1,50 @@
+[package]
+name = "paramecia-model"
+description = "Model architecture based on Qwen3-Next"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+byteorder = { workspace = true }
+paramecia-arrow = { workspace = true }
+paramecia-core = { workspace = true }
+paramecia-nn = { workspace = true }
+paramecia-tensor = { workspace = true }
+clap = { workspace = true }
+crc32fast = "1.4"
+crossbeam = "0.8"
+glowstick = { workspace = true }
+half = { workspace = true }
+inception = { workspace = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokenizers = { workspace = true, features = ["fancy-regex"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+
+[[example]]
+name = "list_tensors"
+required-features = []
+
+[[example]]
+name = "combine_mtp_gguf"
+required-features = []
+
+[features]
+default = []
+accelerate = ["paramecia-core/accelerate", "paramecia-nn/accelerate"]
+cuda = ["paramecia-core/cuda", "paramecia-nn/cuda"]
+metal = ["paramecia-core/metal", "paramecia-nn/metal"]
+vulkan = ["paramecia-core/vulkan", "paramecia-nn/vulkan"]
+qwen3next_80b_a3b = []
+qwen35moe_35b_a3b = []
+qwen35moe_122b_a10b = []
+qwen35moe_397b_a17b = []
+qwen35_0p8b = []
+qwen35_4b = []
+qwen35_9b = []
+qwen35_27b = []

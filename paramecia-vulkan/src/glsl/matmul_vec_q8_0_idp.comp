@@ -1,0 +1,239 @@
+// Q8_0 Matrix-Vector Multiplication - Packed Integer Dot Product
+//
+// Computes: out[n] = weights[n,k] * input[k]
+// Quantizes f32 activations on-the-fly to i8, then performs packed 4×i8 dot products
+// against the Q8_0 weight values. This avoids the i8→f32 dequantization cost.
+//
+// Approach:
+// 1. Cooperatively load f32 activations into shared memory
+// 2. Quantize activation tile on-the-fly to i8 (find max, compute scale, clamp)
+// 3. Packed 4×i8→i32 dot product (manual extraction, works on all hardware)
+// 4. Combine: result = w_scale * a_scale * idp_sum
+//
+// Dispatch: [ceil(n / NUM_ROWS), batch, 1]
+// Workgroup: BLOCK_SIZE (x) × NUM_ROWS (y)
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_integer_dot_product : require
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+layout(constant_id = 1) const uint NUM_ROWS = 2;
+
+#define QK8_0 32
+#define QK8_0_BYTES 34
+// Pack 4 i8 values per u32 for IDP
+#define PACKED_PER_BLOCK (QK8_0 / 4)  // 8 packed u32 per block
+
+#ifndef ACT_DTYPE
+// 0=f32, 1=f16, 2=bf16
+#define ACT_DTYPE 0
+#endif
+
+// Padded stride for bank-conflict-free shared memory
+#define A_STRIDE (QK8_0 + 1)
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint params[8];
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf { float v_dest[]; };
+#if ACT_DTYPE == 0
+layout(set = 0, binding = 1, std430) readonly buffer InputA { float v_input_a[]; };
+#else
+layout(set = 0, binding = 1, std430) readonly buffer InputA { uint16_t v_input_a[]; };
+#endif
+layout(set = 0, binding = 2, std430) readonly buffer InputB { uint v_input_b[]; };
+
+#include "dequant_helpers.glsl"
+
+// Shared memory for f32 activation tile (for cooperative loading)
+shared float shared_a[BLOCK_SIZE * A_STRIDE];
+
+// Shared memory for quantized activation tile (packed i8x4 as u32)
+shared uint shared_a_packed[BLOCK_SIZE * PACKED_PER_BLOCK];
+
+// Shared memory for per-block activation scales
+shared float shared_a_scale[BLOCK_SIZE];
+
+// Shared memory for cross-subgroup reduction
+shared float shmem_partials[(BLOCK_SIZE + 7) / 8][NUM_ROWS];
+
+// Load f16 scale from Q8_0 block
+float load_q8_scale(uint block_byte) {
+    uint word_idx = block_byte / 4;
+    uint byte_in_word = block_byte % 4;
+    uint word = v_input_b[word_idx];
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return half_to_float_lo(word >> 16);
+    } else {
+        uint word2 = v_input_b[word_idx + 1];
+        uint h = (byte_in_word == 1)
+            ? ((word >> 8) | (word2 << 24))
+            : ((word >> 24) | (word2 << 8));
+        return half_to_float_lo(h);
+    }
+}
+
+// Load a packed u32 of 4 consecutive i8 weight values from Q8_0 block
+uint load_q8_packed_u32(uint block_byte, uint group_idx) {
+    // group_idx: 0..7 (which group of 4 bytes within the 32-byte qs section)
+    uint byte_offset = block_byte + 2 + group_idx * 4;
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+
+    uint word = v_input_b[word_idx];
+    if (byte_in_word == 0) {
+        return word;
+    } else {
+        uint word2 = v_input_b[word_idx + 1];
+        return (word >> (byte_in_word * 8)) | (word2 << ((4 - byte_in_word) * 8));
+    }
+}
+
+// Signed 4×i8 dot product from two packed u32 values
+// Each u32 holds 4 signed i8 values packed as bytes
+int dot4_i8_packed(uint a, uint b) {
+    return dotPacked4x8EXT(int(a), int(b));
+}
+
+float load_activation(uint idx) {
+#if ACT_DTYPE == 1
+    return unpackHalf2x16(uint(v_input_a[idx])).x;
+#elif ACT_DTYPE == 2
+    return uintBitsToFloat(uint(v_input_a[idx]) << 16);
+#else
+    return v_input_a[idx];
+#endif
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row_in_wg = gl_LocalInvocationID.y;
+    uint flat_tid = gl_LocalInvocationIndex;
+    uint batch = gl_WorkGroupID.y;
+
+    uint out_n = gl_WorkGroupID.x * NUM_ROWS + row_in_wg;
+    if (out_n >= op_n) return;
+
+    uint num_blocks = (op_k + QK8_0 - 1) / QK8_0;
+    uint weight_row_byte = out_n * num_blocks * QK8_0_BYTES;
+    uint a_base = op_a_offset + batch * op_a_stride_b;
+
+    float acc = 0.0;
+    uint total_threads = BLOCK_SIZE * NUM_ROWS;
+    uint num_iters = (num_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    for (uint iter = 0; iter < num_iters; iter++) {
+        uint blk_base = iter * BLOCK_SIZE;
+        uint a_k_start = blk_base * QK8_0;
+
+        // Phase 1: Cooperative coalesced load of f32 activations
+        for (uint i = flat_tid; i < BLOCK_SIZE * QK8_0; i += total_threads) {
+            uint blk_local = i / QK8_0;
+            uint elem = i % QK8_0;
+            uint k_idx = a_k_start + i;
+            shared_a[blk_local * A_STRIDE + elem] =
+                (k_idx < op_k) ? load_activation(a_base + k_idx * op_a_stride_k) : 0.0;
+        }
+        barrier();
+
+        // Phase 2: On-the-fly quantization of activations to i8
+        // Each thread quantizes one block's activations (tid-th block)
+        if (blk_base + tid < num_blocks) {
+            // Find max absolute value in this block
+            float max_val = 0.0;
+            uint sa_base = tid * A_STRIDE;
+            for (uint i = 0; i < QK8_0; i++) {
+                max_val = max(max_val, abs(shared_a[sa_base + i]));
+            }
+
+            // Compute scale: scale = max / 127
+            float a_scale = max_val / 127.0;
+            float inv_scale = (max_val > 0.0) ? 127.0 / max_val : 0.0;
+            shared_a_scale[tid] = a_scale;
+
+            // Quantize and pack into u32 (4 i8 per u32)
+            for (uint g = 0; g < PACKED_PER_BLOCK; g++) {
+                int v0 = int(round(shared_a[sa_base + g*4 + 0] * inv_scale));
+                int v1 = int(round(shared_a[sa_base + g*4 + 1] * inv_scale));
+                int v2 = int(round(shared_a[sa_base + g*4 + 2] * inv_scale));
+                int v3 = int(round(shared_a[sa_base + g*4 + 3] * inv_scale));
+
+                v0 = clamp(v0, -127, 127);
+                v1 = clamp(v1, -127, 127);
+                v2 = clamp(v2, -127, 127);
+                v3 = clamp(v3, -127, 127);
+
+                shared_a_packed[tid * PACKED_PER_BLOCK + g] =
+                    (uint(v0) & 0xFF) |
+                    ((uint(v1) & 0xFF) << 8) |
+                    ((uint(v2) & 0xFF) << 16) |
+                    ((uint(v3) & 0xFF) << 24);
+            }
+        }
+        barrier();
+
+        // Phase 3: Packed integer dot products
+        uint blk = blk_base + tid;
+        if (blk < num_blocks) {
+            uint block_byte = weight_row_byte + blk * QK8_0_BYTES;
+            float w_scale = load_q8_scale(block_byte);
+            float a_scale = shared_a_scale[tid];
+
+            int idp_sum = 0;
+            for (uint g = 0; g < PACKED_PER_BLOCK; g++) {
+                uint w_packed = load_q8_packed_u32(block_byte, g);
+                uint a_packed = shared_a_packed[tid * PACKED_PER_BLOCK + g];
+
+                // 4×i8→i32 dot product (packed byte extraction)
+                idp_sum += dot4_i8_packed(w_packed, a_packed);
+            }
+
+            acc += w_scale * a_scale * float(idp_sum);
+        }
+
+        barrier();
+    }
+
+    // Reduction across BLOCK_SIZE threads
+    float sg_sum = subgroupAdd(acc);
+
+    uint num_subgroups = (BLOCK_SIZE + gl_SubgroupSize - 1) / gl_SubgroupSize;
+    if (num_subgroups > 1) {
+        if (gl_SubgroupInvocationID == 0) {
+            shmem_partials[gl_SubgroupID][row_in_wg] = sg_sum;
+        }
+        barrier();
+
+        if (tid == 0) {
+            float total = 0.0;
+            for (uint s = 0; s < num_subgroups; s++) {
+                total += shmem_partials[s][row_in_wg];
+            }
+            v_dest[batch * op_n + out_n] = total;
+        }
+    } else {
+        if (tid == 0) {
+            v_dest[batch * op_n + out_n] = sg_sum;
+        }
+    }
+}

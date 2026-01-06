@@ -1,0 +1,149 @@
+// Q8_0 Quantization: f32[N] -> Q8_0 blocks
+//
+// Each Q8_0 block: 32 floats -> 34 bytes (2-byte f16 scale + 32 x i8 quants)
+//
+// Process 2 blocks per workgroup (64 threads) to avoid cross-workgroup
+// word conflicts (34 bytes is not 4-byte aligned, so adjacent blocks
+// share a u32 word boundary). Processing in pairs ensures 4-byte alignment
+// at workgroup boundaries since 2*34 = 68, and 68 % 4 = 0.
+//
+// Dispatch: (ceil(num_blocks/2), 1, 1) with local_size_x = 64
+
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#ifndef ACT_DTYPE
+// 0=f32, 1=f16, 2=bf16
+#define ACT_DTYPE 0
+#endif
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint num_blocks;
+    uint output_byte_offset;  // byte offset into output buffer (must be 4-byte aligned)
+};
+
+#if ACT_DTYPE == 0
+layout(set = 0, binding = 0, std430) readonly buffer InputBuf {
+    float v_input[];
+};
+#else
+layout(set = 0, binding = 0, std430) readonly buffer InputBuf {
+    uint16_t v_input[];
+};
+#endif
+
+layout(set = 0, binding = 1, std430) writeonly buffer OutputBuf {
+    uint v_output[];
+};
+
+// 17 u32 words to assemble 68 bytes of output (2 blocks)
+// Plus 2 words for per-block max_abs results = 19 total
+shared uint s_work[19];
+
+float load_activation(uint idx) {
+#if ACT_DTYPE == 1
+    return unpackHalf2x16(uint(v_input[idx])).x;
+#elif ACT_DTYPE == 2
+    return uintBitsToFloat(uint(v_input[idx]) << 16);
+#else
+    return v_input[idx];
+#endif
+}
+
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;  // 0-63
+
+    uint block0 = wg * 2;
+    uint sub_block = tid / 32;  // 0 or 1
+    uint lane = tid % 32;
+    uint block_id = block0 + sub_block;
+    bool valid = (block_id < num_blocks);
+
+    // Load input (0 if out of bounds)
+    float val = valid ? load_activation(block_id * 32 + lane) : 0.0;
+    float abs_val = abs(val);
+
+    // --- Max reduction per 32-element block via shared memory ---
+    // Use s_work[0..63] overlaid as float for reduction, then s_work[17..18] for results
+    // Actually s_work is only 19 words. Use a different approach.
+
+    // Store abs values in first pass
+    if (tid < 19) s_work[tid] = 0;
+    barrier();
+
+    // Use s_work[17 + sub_block] for the max result
+    // Do tree reduction through shared memory for each 32-lane group
+
+    // Step-wise reduction: each step halves the active threads
+    // We'll overwrite s_work[0..63] - but we only have 19 entries.
+    // Need a different approach. Let's use a different shared array.
+    // Since we need 17 words for output + 64 words for reduction + 2 for max = 83 words
+    // That's fine for shared memory.
+
+    // Actually, let me just use subgroup reduction since subgroup size >= 32 on all
+    // modern desktop GPUs (NVIDIA=32, AMD=32 or 64, Intel=32).
+    // If subgroup_size == 32: subgroupMax within each sub_block is correct.
+    // If subgroup_size == 64: subgroupMax mixes both sub_blocks, which is wrong.
+    // To handle both: use subgroup ops then correct.
+
+    // Safest: just use atomicMax on shared memory
+    s_work[17 + sub_block] = 0;
+    barrier();
+
+    atomicMax(s_work[17 + sub_block], floatBitsToUint(abs_val));
+    barrier();
+
+    // atomicMax on float-as-uint works correctly for positive floats because
+    // IEEE 754 preserves ordering for positive values when interpreted as uint.
+    float max_abs = uintBitsToFloat(s_work[17 + sub_block]);
+
+    // Quantize
+    float scale = max_abs / 127.0;
+    float inv_scale = (max_abs > 0.0) ? (127.0 / max_abs) : 0.0;
+    int q = valid ? clamp(int(round(val * inv_scale)), -128, 127) : 0;
+    uint qb = uint(q) & 0xFFu;
+
+    // f16 scale
+    uint f16_scale = packHalf2x16(vec2(scale, 0.0)) & 0xFFFFu;
+
+    // --- Assemble output bytes in shared memory ---
+    // Block 0: bytes [0..33], Block 1: bytes [34..67]
+    // 17 u32 words cover bytes [0..67]
+
+    // Clear output words
+    if (tid < 17) s_work[tid] = 0;
+    barrier();
+
+    if (valid) {
+        uint local_base = sub_block * 34;
+
+        // Write scale (2 bytes) via atomicOr
+        if (lane == 0) {
+            uint b0 = local_base;
+            uint b1 = local_base + 1;
+            atomicOr(s_work[b0 / 4], (f16_scale & 0xFFu) << ((b0 % 4) * 8));
+            atomicOr(s_work[b1 / 4], ((f16_scale >> 8) & 0xFFu) << ((b1 % 4) * 8));
+        }
+
+        // Write quant byte
+        uint qbyte = local_base + 2 + lane;
+        atomicOr(s_work[qbyte / 4], qb << ((qbyte % 4) * 8));
+    }
+    barrier();
+
+    // --- Write to global memory ---
+    // block0 is always even, so out_byte_base = block0 * 34 = wg * 68
+    // 68 % 4 == 0, so always 4-byte aligned. output_byte_offset must also be 4-byte aligned.
+    uint out_word_base = (output_byte_offset + block0 * 34) / 4;
+    uint total_valid_bytes = (block0 + 1 < num_blocks) ? 68 : 34;
+
+    if (tid < 17 && tid * 4 < total_valid_bytes) {
+        v_output[out_word_base + tid] = s_work[tid];
+    }
+}

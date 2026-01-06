@@ -1,0 +1,37 @@
+// Fused SwiGLU: out[i] = silu(gate[i]) * up[i]
+//   where silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+//
+// Element-wise operation.
+// Dispatch: (ceil(N/256), 1, 1)
+
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint total_elements;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer GateBuf {
+    float v_gate[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer UpBuf {
+    float v_up[];
+};
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuf {
+    float v_output[];
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total_elements) return;
+
+    float g = v_gate[idx];
+    float u = v_up[idx];
+
+    // silu(g) = g * sigmoid(g) = g / (1 + exp(-g))
+    float silu_g = g / (1.0 + exp(-g));
+    v_output[idx] = silu_g * u;
+}

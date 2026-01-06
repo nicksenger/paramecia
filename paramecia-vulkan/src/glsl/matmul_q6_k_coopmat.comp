@@ -1,0 +1,171 @@
+// q6_k Cooperative Matrix Matmul
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#define Q6_K_K 256
+#define Q6_K_K_BYTES 210
+
+layout(constant_id = 0) const uint TILE_M = 16;
+layout(constant_id = 1) const uint TILE_N = 16;
+layout(constant_id = 2) const uint TILE_K = 16;
+
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform PushConstants { uint params[8]; };
+#define op_m params[0]
+#define op_k params[1]
+#define op_n params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+layout(set = 0, binding = 0, std430) writeonly buffer O { float v_dest[]; };
+layout(set = 0, binding = 1, std430) readonly buffer A { float v_input_a[]; };
+layout(set = 0, binding = 2, std430) readonly buffer B { uint v_input_b[]; };
+
+shared float16_t shared_a[16 * 16];
+shared float16_t shared_b[16 * 16];
+shared float temp_c[16 * 16];
+
+float half_to_float_lo(uint packed) { return unpackHalf2x16(packed).x; }
+uint load_byte(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    return (v_input_b[word_idx] >> ((byte_offset % 4) * 8)) & 0xFF;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_m = gl_WorkGroupID.x * TILE_M;
+    uint wg_n = gl_WorkGroupID.y * TILE_N;
+    uint batch = gl_WorkGroupID.z;
+
+    if (wg_m >= op_m || wg_n >= op_n) return;
+
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> matA;
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> matC;
+
+    matC = coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint k_tile = 0; k_tile < (op_k + TILE_K - 1) / TILE_K; k_tile++) {
+        uint k_start = k_tile * TILE_K;
+
+        // Load A
+        for (uint i = tid; i < TILE_M * TILE_K; i += 32) {
+            uint m_idx = wg_m + (i / TILE_K);
+            uint k_idx = k_start + (i % TILE_K);
+            float val = 0.0;
+            if (m_idx < op_m && k_idx < op_k) {
+                val = v_input_a[op_a_offset + batch * op_a_stride_b + m_idx * op_a_stride_m + k_idx * op_a_stride_k];
+            }
+            shared_a[i] = float16_t(val);
+        }
+
+        // Dequantize B
+        // Q6K format (210 bytes per block):
+        // - ql: 128 bytes at offset 0 (packed nibbles)
+        // - qh: 64 bytes at offset 128 (high bits)
+        // - scales: 16 i8 at offset 192
+        // - d: 1 f16 at offset 208
+        //
+        // Decoding pattern (per CPU implementation):
+        // For each 128-element half (j=0,128), using l=0..31:
+        //   aux8[l]    = (ql[l] & 0xF) | ((qh[l] & 3) << 4) - 32
+        //   aux8[l+32] = (ql[l+32] & 0xF) | (((qh[l] >> 2) & 3) << 4) - 32
+        //   aux8[l+64] = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4) - 32
+        //   aux8[l+96] = (ql[l+32] >> 4) | (((qh[l] >> 6) & 3) << 4) - 32
+        for (uint i = tid; i < TILE_K * TILE_N; i += 32) {
+            uint k_idx = k_start + (i / TILE_N);
+            uint n_idx = wg_n + (i % TILE_N);
+            float val = 0.0;
+            if (k_idx < op_k && n_idx < op_n) {
+                uint blk = k_idx / Q6_K_K;
+                uint off = k_idx % Q6_K_K;
+                uint num_blocks = (op_k + Q6_K_K - 1) / Q6_K_K;
+                uint byte_off = n_idx * num_blocks * Q6_K_K_BYTES + blk * Q6_K_K_BYTES;
+
+                // Load d from offset 208
+                uint d_word_idx = (byte_off + 208) / 4;
+                uint d_byte_in_word = (byte_off + 208) % 4;
+                uint d_word = v_input_b[d_word_idx];
+                float d;
+                if (d_byte_in_word == 0) {
+                    d = unpackHalf2x16(d_word).x;
+                } else if (d_byte_in_word == 2) {
+                    d = unpackHalf2x16(d_word >> 16).x;
+                } else {
+                    uint d_word2 = v_input_b[d_word_idx + 1];
+                    uint h = (d_byte_in_word == 1) ?
+                        ((d_word >> 8) | (d_word2 << 24)) :
+                        ((d_word >> 24) | (d_word2 << 8));
+                    d = unpackHalf2x16(h).x;
+                }
+
+                // Decode based on position within block
+                uint j_base = (off < 128) ? 0 : 64;     // ql base: 0 or 64
+                uint qh_base = j_base / 2;               // qh base: 0 or 32
+                uint off_in_half = off % 128;
+                uint quarter = off_in_half / 32;         // 0,1,2,3
+                uint l = off_in_half % 32;
+
+                uint ql_idx, qh_shift;
+                bool use_upper_nibble;
+
+                if (quarter == 0) {  // off_in_half 0-31
+                    ql_idx = j_base + l;
+                    use_upper_nibble = false;
+                    qh_shift = 0;
+                } else if (quarter == 1) {  // off_in_half 32-63
+                    ql_idx = j_base + 32 + l;
+                    use_upper_nibble = false;
+                    qh_shift = 2;
+                } else if (quarter == 2) {  // off_in_half 64-95
+                    ql_idx = j_base + l;
+                    use_upper_nibble = true;
+                    qh_shift = 4;
+                } else {  // quarter == 3, off_in_half 96-127
+                    ql_idx = j_base + 32 + l;
+                    use_upper_nibble = true;
+                    qh_shift = 6;
+                }
+
+                uint ql = load_byte(byte_off + ql_idx);
+                uint qh = load_byte(byte_off + 128 + qh_base + l);
+
+                uint ql_bits = use_upper_nibble ? (ql >> 4) : (ql & 0xF);
+                uint qh_bits = (qh >> qh_shift) & 0x3;
+                int q = int(ql_bits | (qh_bits << 4)) - 32;
+
+                // Load scale (each scale covers 16 consecutive elements)
+                uint scale_idx = off / 16;
+                int scale_i8 = int(load_byte(byte_off + 192 + scale_idx)) << 24 >> 24;
+                float scale = float(scale_i8);
+
+                val = d * scale * float(q);
+            }
+            shared_b[i] = float16_t(val);
+        }
+
+        barrier();
+        coopMatLoad(matA, shared_a, 0, TILE_K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, shared_b, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+        matC = coopMatMulAdd(matA, matB, matC);
+        barrier();
+    }
+
+    coopMatStore(matC, temp_c, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    for (uint i = tid; i < TILE_M * TILE_N; i += 32) {
+        uint m_idx = wg_m + (i / TILE_N);
+        uint n_idx = wg_n + (i % TILE_N);
+        if (m_idx < op_m && n_idx < op_n) {
+            v_dest[batch * op_m * op_n + m_idx * op_n + n_idx] = temp_c[i];
+        }
+    }
+}

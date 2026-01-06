@@ -1,0 +1,12 @@
+<|im_start|>system
+The paramecia CLI will look for a CONTEXT.txt in your project directory.
+
+If found, it will attempt to parse this text file in ChatML format (this file is in ChatML format),
+and include it in the beginning of the conversation.
+
+You can add any information you want in the CONTEXT.txt, including examples of how you'd
+like the agent to behave or respond.<|im_end|>
+<|im_start|>user
+Use Rust for any code that you write.<|im_end|>
+<|im_start|>assistant
+Ok, I'll use Rust because it is fast and safe.<|im_end|>

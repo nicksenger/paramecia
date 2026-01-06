@@ -1,0 +1,267 @@
+// Indexed MoE Gate+Up+SwiGLU Fused - Q2_K Quantized
+//
+// Computes: output[batch, topk, n] = silu(gate[expert, n, k] @ x) * (up[expert, n, k] @ x)
+// Where expert_id = ids[batch, topk]
+//
+// Fuses gate projection, up projection, and SwiGLU into a single dispatch.
+// Uses vectorized u32 loads for scale decoding (4 loads instead of 16 byte loads).
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Q2_K constants
+#define QK2_K 256       // Elements per Q2_K block
+#define QK2_K_BYTES 84  // Bytes per block
+#define SCALES_OFFSET 0
+#define QS_OFFSET 16
+#define D_OFFSET 80
+#define DMIN_OFFSET 82
+
+#define WARP_SIZE 32
+#define NWARPS 4
+
+layout(local_size_x = WARP_SIZE, local_size_y = NWARPS, local_size_z = 1) in;
+
+// Parameters via push constants (48 bytes = 12 x u32)
+layout(push_constant) uniform PushConstants {
+    uint params[12];
+    // [0]: n_ff (out_dim)
+    // [1]: k (in_dim)
+    // [2]: batch
+    // [3]: topk
+    // [4]: x_inner_dim
+    // [5]: gate_expert_stride (u32 words per expert)
+    // [6]: up_expert_stride (u32 words per expert)
+    // [7]: x_stride_batch
+    // [8]: x_stride_inner
+    // [9-11]: unused
+};
+
+#define op_n                  params[0]
+#define op_k                  params[1]
+#define op_batch              params[2]
+#define op_topk               params[3]
+#define op_x_inner_dim        params[4]
+#define op_gate_expert_stride params[5]
+#define op_up_expert_stride   params[6]
+#define op_x_stride_batch     params[7]
+#define op_x_stride_inner     params[8]
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputX {
+    float v_input_x[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer GateWeightsBuf {
+    uint v_gate_weights[];
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer UpWeightsBuf {
+    uint v_up_weights[];
+};
+
+layout(set = 0, binding = 4, std430) readonly buffer IdsBuf {
+    uint v_ids[];
+};
+
+// ============================================================================
+// Gate weight helpers
+// ============================================================================
+
+uint gate_load_byte(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    return (v_gate_weights[word_idx] >> (byte_in_word * 8)) & 0xFF;
+}
+
+uint gate_load_u32(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    if (byte_in_word == 0) {
+        return v_gate_weights[word_idx];
+    } else {
+        uint w0 = v_gate_weights[word_idx];
+        uint w1 = v_gate_weights[word_idx + 1];
+        return (w0 >> (byte_in_word * 8)) | (w1 << ((4 - byte_in_word) * 8));
+    }
+}
+
+float gate_load_d_dmin(uint block_byte) {
+    uint word = gate_load_u32(block_byte + D_OFFSET);
+    return unpackHalf2x16(word).x;
+}
+
+float gate_load_dmin(uint block_byte) {
+    uint word = gate_load_u32(block_byte + D_OFFSET);
+    return unpackHalf2x16(word).y;
+}
+
+// ============================================================================
+// Up weight helpers
+// ============================================================================
+
+uint up_load_byte(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    return (v_up_weights[word_idx] >> (byte_in_word * 8)) & 0xFF;
+}
+
+uint up_load_u32(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    if (byte_in_word == 0) {
+        return v_up_weights[word_idx];
+    } else {
+        uint w0 = v_up_weights[word_idx];
+        uint w1 = v_up_weights[word_idx + 1];
+        return (w0 >> (byte_in_word * 8)) | (w1 << ((4 - byte_in_word) * 8));
+    }
+}
+
+float up_load_d_dmin(uint block_byte) {
+    uint word = up_load_u32(block_byte + D_OFFSET);
+    return unpackHalf2x16(word).x;
+}
+
+float up_load_dmin(uint block_byte) {
+    uint word = up_load_u32(block_byte + D_OFFSET);
+    return unpackHalf2x16(word).y;
+}
+
+// ============================================================================
+// Common helpers
+// ============================================================================
+
+float warp_reduce_sum(float v) {
+    v += subgroupShuffleXor(v, 16);
+    v += subgroupShuffleXor(v, 8);
+    v += subgroupShuffleXor(v, 4);
+    v += subgroupShuffleXor(v, 2);
+    v += subgroupShuffleXor(v, 1);
+    return v;
+}
+
+// ============================================================================
+// Main kernel
+// ============================================================================
+// Dispatch: (ceil(n/4), batch, topk)
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint warp = gl_LocalInvocationID.y;
+    uint wg_x = gl_WorkGroupID.x;
+    uint batch_idx = gl_WorkGroupID.y;
+    uint topk_idx = gl_WorkGroupID.z;
+
+    uint out_col = wg_x * NWARPS + warp;
+
+    if (out_col >= op_n || batch_idx >= op_batch || topk_idx >= op_topk) {
+        return;
+    }
+
+    // Expert indirection
+    uint expert_id = v_ids[batch_idx * op_topk + topk_idx];
+    uint num_blocks = op_k / QK2_K;
+    uint row_bytes = num_blocks * QK2_K_BYTES;
+    uint gate_byte_offset = expert_id * op_gate_expert_stride * 4 + out_col * row_bytes;
+    uint up_byte_offset = expert_id * op_up_expert_stride * 4 + out_col * row_bytes;
+
+    // Input X pointer
+    uint x_inner_idx = min(topk_idx, op_x_inner_dim - 1);
+    uint x_offset = batch_idx * op_x_stride_batch + x_inner_idx * op_x_stride_inner;
+
+    float gate_acc = 0.0;
+    float up_acc = 0.0;
+
+    for (uint blk = 0; blk < num_blocks; blk++) {
+        uint gate_block_byte = gate_byte_offset + blk * QK2_K_BYTES;
+        uint up_block_byte = up_byte_offset + blk * QK2_K_BYTES;
+        uint k_base = blk * QK2_K;
+
+        float gate_d = gate_load_d_dmin(gate_block_byte);
+        float gate_dmin = gate_load_dmin(gate_block_byte);
+        float up_d = up_load_d_dmin(up_block_byte);
+        float up_dmin = up_load_dmin(up_block_byte);
+
+        uint y_block_index = 0;
+        uint gate_is = 0;
+        uint up_is = 0;
+
+        for (uint qs_index = 0; qs_index < 64; qs_index += 32) {
+            uint gate_qs_byte_base = gate_block_byte + QS_OFFSET + qs_index;
+            uint up_qs_byte_base = up_block_byte + QS_OFFSET + qs_index;
+
+            for (uint shift = 0; shift < 8; shift += 2) {
+                // First group of 16 elements
+                uint gate_sc = gate_load_byte(gate_block_byte + SCALES_OFFSET + gate_is);
+                uint up_sc = up_load_byte(up_block_byte + SCALES_OFFSET + up_is);
+                gate_is++;
+                up_is++;
+                float gate_dl = gate_d * float(gate_sc & 0xF);
+                float gate_ml = gate_dmin * float(gate_sc >> 4);
+                float up_dl = up_d * float(up_sc & 0xF);
+                float up_ml = up_dmin * float(up_sc >> 4);
+
+                if (lane < 16) {
+                    uint gate_qs_byte = gate_load_byte(gate_qs_byte_base + lane);
+                    uint gate_q = (gate_qs_byte >> shift) & 3;
+                    float gate_v = gate_dl * float(gate_q) - gate_ml;
+
+                    uint up_qs_byte = up_load_byte(up_qs_byte_base + lane);
+                    uint up_q = (up_qs_byte >> shift) & 3;
+                    float up_v = up_dl * float(up_q) - up_ml;
+
+                    uint k_idx = k_base + y_block_index + lane;
+                    float a = v_input_x[x_offset + k_idx];
+                    gate_acc += a * gate_v;
+                    up_acc += a * up_v;
+                }
+                y_block_index += 16;
+
+                // Second group of 16 elements
+                gate_sc = gate_load_byte(gate_block_byte + SCALES_OFFSET + gate_is);
+                up_sc = up_load_byte(up_block_byte + SCALES_OFFSET + up_is);
+                gate_is++;
+                up_is++;
+                gate_dl = gate_d * float(gate_sc & 0xF);
+                gate_ml = gate_dmin * float(gate_sc >> 4);
+                up_dl = up_d * float(up_sc & 0xF);
+                up_ml = up_dmin * float(up_sc >> 4);
+
+                if (lane < 16) {
+                    uint gate_qs_byte = gate_load_byte(gate_qs_byte_base + 16 + lane);
+                    uint gate_q = (gate_qs_byte >> shift) & 3;
+                    float gate_v = gate_dl * float(gate_q) - gate_ml;
+
+                    uint up_qs_byte = up_load_byte(up_qs_byte_base + 16 + lane);
+                    uint up_q = (up_qs_byte >> shift) & 3;
+                    float up_v = up_dl * float(up_q) - up_ml;
+
+                    uint k_idx = k_base + y_block_index + lane;
+                    float a = v_input_x[x_offset + k_idx];
+                    gate_acc += a * gate_v;
+                    up_acc += a * up_v;
+                }
+                y_block_index += 16;
+            }
+        }
+    }
+
+    float gate_sum = warp_reduce_sum(gate_acc);
+    float up_sum = warp_reduce_sum(up_acc);
+
+    if (lane == 0) {
+        float silu_gate = gate_sum / (1.0 + exp(-gate_sum));
+        uint out_idx = batch_idx * op_topk * op_n + topk_idx * op_n + out_col;
+        v_dest[out_idx] = silu_gate * up_sum;
+    }
+}

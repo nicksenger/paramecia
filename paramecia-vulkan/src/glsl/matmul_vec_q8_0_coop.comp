@@ -1,0 +1,268 @@
+// Q8_0 Matrix-Vector Multiplication - Cooperative K-reduction v2
+//
+// Computes: out[n] = weights[n,k] * input[k]
+// Where weights are Q8_0 quantized (32 elements per block, 34 bytes each)
+//
+// Improvements over v1:
+// 1. Cooperative activation loading into shared memory (coalesced global reads)
+// 2. Activations shared across NUM_ROWS output rows (loaded once, used NUM_ROWS times)
+// 3. Dynamic shared memory sizing for subgroup reduction
+// 4. Bank-conflict-free shared memory layout via A_STRIDE padding
+//
+// Dispatch: [ceil(n / NUM_ROWS), batch, 1]
+// Workgroup: BLOCK_SIZE (x) × NUM_ROWS (y)
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#ifndef ACT_DTYPE
+// 0=f32, 1=f16, 2=bf16
+#define ACT_DTYPE 0
+#endif
+
+// Specialization constants (tuned from Rust side)
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+layout(constant_id = 1) const uint NUM_ROWS = 2;
+
+// Q8_0 constants
+#define QK8_0 32        // Elements per Q8_0 block
+#define QK8_0_BYTES 34  // 2 bytes f16 scale + 32 bytes i8
+#define K_PER_ITER 8    // Process 8 elements per inner loop iteration
+
+// Padded stride for bank-conflict-free shared memory access
+// Thread tid reads shared_a[tid * A_STRIDE + j]
+// Bank = (tid * 33 + j) % 32 = (tid + j) % 32  (since 33 ≡ 1 mod 32)
+// → different threads access different banks for any fixed j
+#define A_STRIDE (QK8_0 + 1)
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+
+// Parameters via push constants (32 bytes)
+layout(push_constant) uniform PushConstants {
+    uint params[8];
+    // [0]: m (always 1 for mat-vec)
+    // [1]: k (reduction dimension - input size)
+    // [2]: n (output dimension)
+    // [3]: a_stride_batch
+    // [4]: a_offset
+    // [5]: a_stride_k (typically 1 for contiguous)
+    // [6]: a_stride_m (typically k for row-major)
+    // [7]: unused
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+// Output buffer (f32)
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+// Input activation buffer
+#if ACT_DTYPE == 0
+layout(set = 0, binding = 1, std430) readonly buffer InputA {
+    float v_input_a[];
+};
+#else
+layout(set = 0, binding = 1, std430) readonly buffer InputA {
+    uint16_t v_input_a[];
+};
+#endif
+
+// Weight buffer (Q8_0) - quantized weights, accessed as packed u32
+layout(set = 0, binding = 2, std430) readonly buffer InputB {
+    uint v_input_b[];
+};
+
+#include "dequant_helpers.glsl"
+
+// Shared memory for activation tile (coalesced loading, shared across all rows)
+// BLOCK_SIZE blocks × QK8_0 elements each, with A_STRIDE padding per block
+shared float shared_a[BLOCK_SIZE * A_STRIDE];
+
+// Shared memory for cross-subgroup reduction
+// Max subgroups = ceil(BLOCK_SIZE / min_subgroup_size)
+// min_subgroup_size ≥ 8 on all known hardware, so max = ceil(BLOCK_SIZE/8)
+shared float shmem_partials[(BLOCK_SIZE + 7) / 8][NUM_ROWS];
+
+float load_activation(uint idx) {
+#if ACT_DTYPE == 1
+    return unpackHalf2x16(uint(v_input_a[idx])).x;
+#elif ACT_DTYPE == 2
+    return uintBitsToFloat(uint(v_input_a[idx]) << 16);
+#else
+    return v_input_a[idx];
+#endif
+}
+
+// Load f16 scale from Q8_0 block at byte offset
+float load_q8_scale(uint block_byte) {
+    uint word_idx = block_byte / 4;
+    uint byte_in_word = block_byte % 4;
+    uint word = v_input_b[word_idx];
+
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return half_to_float_lo(word >> 16);
+    } else {
+        uint word2 = v_input_b[word_idx + 1];
+        uint h = (byte_in_word == 1)
+            ? ((word >> 8) | (word2 << 24))
+            : ((word >> 24) | (word2 << 8));
+        return half_to_float_lo(h);
+    }
+}
+
+// Load 4 consecutive i8 values and convert to vec4
+vec4 load_q8_4xi8_as_vec4(uint block_byte, uint qs_idx) {
+    uint byte_offset = block_byte + 2 + qs_idx;  // +2 to skip scale
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+
+    uint word = v_input_b[word_idx];
+    ivec4 i8_vals;
+
+    if (byte_in_word == 0) {
+        i8_vals.x = int(word << 24) >> 24;
+        i8_vals.y = int(word << 16) >> 24;
+        i8_vals.z = int(word << 8) >> 24;
+        i8_vals.w = int(word) >> 24;
+    } else {
+        uint word2 = v_input_b[word_idx + 1];
+        if (byte_in_word == 1) {
+            i8_vals.x = int(word << 16) >> 24;
+            i8_vals.y = int(word << 8) >> 24;
+            i8_vals.z = int(word) >> 24;
+            i8_vals.w = int(word2 << 24) >> 24;
+        } else if (byte_in_word == 2) {
+            i8_vals.x = int(word << 8) >> 24;
+            i8_vals.y = int(word) >> 24;
+            i8_vals.z = int(word2 << 24) >> 24;
+            i8_vals.w = int(word2 << 16) >> 24;
+        } else { // byte_in_word == 3
+            i8_vals.x = int(word) >> 24;
+            i8_vals.y = int(word2 << 24) >> 24;
+            i8_vals.z = int(word2 << 16) >> 24;
+            i8_vals.w = int(word2 << 8) >> 24;
+        }
+    }
+    return vec4(i8_vals);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;       // Thread within K-reduction team (0..BLOCK_SIZE-1)
+    uint row_in_wg = gl_LocalInvocationID.y; // Row within this workgroup (0..NUM_ROWS-1)
+    uint flat_tid = gl_LocalInvocationIndex;  // Linearized: tid + row_in_wg * BLOCK_SIZE
+    uint batch = gl_WorkGroupID.y;
+
+    // Output row index
+    uint out_n = gl_WorkGroupID.x * NUM_ROWS + row_in_wg;
+    if (out_n >= op_n) return;
+
+    // Number of Q8_0 blocks along K
+    uint num_blocks = (op_k + QK8_0 - 1) / QK8_0;
+
+    // Weight row byte offset for this output row
+    uint weight_row_byte = out_n * num_blocks * QK8_0_BYTES;
+
+    // Activation base offset
+    uint a_base = op_a_offset + batch * op_a_stride_b;
+
+    float acc = 0.0;
+    uint total_threads = BLOCK_SIZE * NUM_ROWS;
+    uint num_iters = (num_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    for (uint iter = 0; iter < num_iters; iter++) {
+        uint blk_base = iter * BLOCK_SIZE;
+        uint a_k_start = blk_base * QK8_0;
+
+        // Phase 1: Cooperative coalesced load of activations into shared memory
+        // All BLOCK_SIZE × NUM_ROWS threads participate for maximum bandwidth.
+        // Adjacent threads load adjacent floats → perfectly coalesced reads.
+        // Data is loaded once and reused by all NUM_ROWS output rows.
+        for (uint i = flat_tid; i < BLOCK_SIZE * QK8_0; i += total_threads) {
+            uint blk_local = i / QK8_0;    // Which block within this tile (0..BLOCK_SIZE-1)
+            uint elem = i % QK8_0;          // Element within block (0..31)
+            uint k_idx = a_k_start + i;
+            // Store with A_STRIDE padding for bank-conflict-free reads
+            shared_a[blk_local * A_STRIDE + elem] =
+                (k_idx < op_k) ? load_activation(a_base + k_idx * op_a_stride_k) : 0.0;
+        }
+        barrier();
+
+        // Phase 2: Each thread processes its block using shared activations
+        uint blk = blk_base + tid;
+        if (blk < num_blocks) {
+            uint block_byte = weight_row_byte + blk * QK8_0_BYTES;
+
+            // Load scale once per block
+            float scale = load_q8_scale(block_byte);
+            float block_sum = 0.0;
+
+            // Process 32 elements in this Q8_0 block (4 iterations of 8)
+            for (uint i = 0; i < QK8_0; i += K_PER_ITER) {
+                // Load 8 quantized weights (2x vec4)
+                vec4 w0 = load_q8_4xi8_as_vec4(block_byte, i);
+                vec4 w1 = load_q8_4xi8_as_vec4(block_byte, i + 4);
+
+                // Read 8 activations from shared memory (bank-conflict-free)
+                uint sa = tid * A_STRIDE + i;
+                vec4 a0 = vec4(shared_a[sa], shared_a[sa+1], shared_a[sa+2], shared_a[sa+3]);
+                vec4 a1 = vec4(shared_a[sa+4], shared_a[sa+5], shared_a[sa+6], shared_a[sa+7]);
+
+                // FMA chain
+                block_sum = fma(w0.x, a0.x, block_sum);
+                block_sum = fma(w0.y, a0.y, block_sum);
+                block_sum = fma(w0.z, a0.z, block_sum);
+                block_sum = fma(w0.w, a0.w, block_sum);
+                block_sum = fma(w1.x, a1.x, block_sum);
+                block_sum = fma(w1.y, a1.y, block_sum);
+                block_sum = fma(w1.z, a1.z, block_sum);
+                block_sum = fma(w1.w, a1.w, block_sum);
+            }
+
+            acc += scale * block_sum;
+        }
+
+        barrier();
+    }
+
+    // ---- Reduction across BLOCK_SIZE threads ----
+    // Step 1: subgroupAdd within each subgroup
+    float sg_sum = subgroupAdd(acc);
+
+    // Step 2: if BLOCK_SIZE > subgroup size, reduce across subgroups via shared memory
+    uint num_subgroups = (BLOCK_SIZE + gl_SubgroupSize - 1) / gl_SubgroupSize;
+    if (num_subgroups > 1) {
+        if (gl_SubgroupInvocationID == 0) {
+            shmem_partials[gl_SubgroupID][row_in_wg] = sg_sum;
+        }
+        barrier();
+
+        // Thread 0 of each row sums across subgroups
+        if (tid == 0) {
+            float total = 0.0;
+            for (uint s = 0; s < num_subgroups; s++) {
+                total += shmem_partials[s][row_in_wg];
+            }
+            v_dest[batch * op_n + out_n] = total;
+        }
+    } else {
+        // Single subgroup: lane 0 writes directly
+        if (tid == 0) {
+            v_dest[batch * op_n + out_n] = sg_sum;
+        }
+    }
+}

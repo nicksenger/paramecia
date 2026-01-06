@@ -1,0 +1,174 @@
+// Q2_K Indexed MoE Forward - Cooperative Matrix
+// Computes: output[batch, topk, n] = weights[expert_id, n, k] @ x[batch, j, k]
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#define Q2_K_K 256
+#define Q2_K_K_BYTES 84
+
+layout(constant_id = 0) const uint TILE_M = 16;
+layout(constant_id = 1) const uint TILE_N = 16;
+layout(constant_id = 2) const uint TILE_K = 16;
+
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform PushConstants { uint params[9]; };
+#define op_n              params[0]
+#define op_k              params[1]
+#define op_batch          params[2]
+#define op_topk           params[3]
+#define op_x_inner_dim    params[4]
+#define op_expert_stride  params[5]
+#define op_x_stride_batch params[6]
+#define op_x_stride_inner params[7]
+
+layout(set = 0, binding = 0, std430) writeonly buffer O { float v_dest[]; };
+layout(set = 0, binding = 1, std430) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2, std430) readonly buffer W { uint weights[]; };
+layout(set = 0, binding = 3, std430) readonly buffer I { uint ids[]; };
+
+// Padded shared memory to avoid bank conflicts
+shared float16_t shared_a[16 * 32];  // TILE_M * TILE_K (K can be 32 on some GPUs)
+shared float16_t shared_b[32 * 16];  // TILE_K * TILE_N
+shared float temp_c[16 * 16];  // TILE_M * TILE_N
+
+float half_to_float_lo(uint packed) { return unpackHalf2x16(packed).x; }
+float half_to_float_hi(uint packed) { return unpackHalf2x16(packed).y; }
+
+uint load_byte(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = weights[word_idx];
+    return (word >> (byte_in_word * 8)) & 0xFF;
+}
+
+float load_f16(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = weights[word_idx];
+
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return half_to_float_hi(word);
+    } else {
+        uint word2 = weights[word_idx + 1];
+        uint h;
+        if (byte_in_word == 1) {
+            h = (word >> 8) | (word2 << 24);
+        } else {
+            h = (word >> 24) | (word2 << 8);
+        }
+        return half_to_float_lo(h);
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_m = gl_WorkGroupID.x * TILE_M;  // Output rows
+    uint wg_n = gl_WorkGroupID.y * TILE_N;  // Output cols
+    uint batch_topk = gl_WorkGroupID.z;     // Combined batch * topk dimension
+
+    uint batch_idx = batch_topk / op_topk;
+    uint topk_idx = batch_topk % op_topk;
+
+    if (wg_m >= 1 || wg_n >= op_n || batch_idx >= op_batch) return;
+
+    // Load expert ID for this batch/topk
+    uint expert_id = ids[batch_idx * op_topk + topk_idx];
+    uint expert_base = expert_id * op_expert_stride * 4;  // Convert u32 words to bytes
+
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> matA;
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> matC;
+
+    matC = coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint k_tile = 0; k_tile < (op_k + TILE_K - 1) / TILE_K; k_tile++) {
+        uint k_start = k_tile * TILE_K;
+
+        // Load input x (activation)
+        uint x_inner_idx = min(topk_idx, op_x_inner_dim - 1);
+        uint x_base_offset = batch_idx * op_x_stride_batch + x_inner_idx * op_x_stride_inner;
+
+        for (uint i = tid; i < TILE_M * TILE_K; i += 32) {
+            uint k_idx = k_start + (i % TILE_K);
+            float val = 0.0;
+            if (k_idx < op_k) {
+                val = x[x_base_offset + k_idx];
+            }
+            shared_a[i] = float16_t(val);
+        }
+
+        // Dequantize weights from expert (Q2_K format)
+        // Q2K format (84 bytes per block):
+        // - scales: 16 bytes at offset 0 (each byte: lower 4 bits = scale, upper 4 bits = min)
+        // - qs: 64 bytes at offset 16 (2-bit values, 4 per byte)
+        // - d: f16 at offset 80
+        // - dmin: f16 at offset 82
+        //
+        // Formula: value = d * scale * q - dmin * min
+        for (uint i = tid; i < TILE_K * TILE_N; i += 32) {
+            uint k_idx = k_start + (i / TILE_N);
+            uint n_idx = wg_n + (i % TILE_N);
+            float val = 0.0;
+
+            if (k_idx < op_k && n_idx < op_n) {
+                uint blk = k_idx / Q2_K_K;
+                uint off = k_idx % Q2_K_K;
+                uint num_blocks = (op_k + Q2_K_K - 1) / Q2_K_K;
+                uint block_byte = expert_base + n_idx * num_blocks * Q2_K_K_BYTES + blk * Q2_K_K_BYTES;
+
+                // Load d and dmin
+                float d = load_f16(block_byte + 80);
+                float dmin = load_f16(block_byte + 82);
+
+                // Determine position within block
+                uint chunk = off / 128;
+                uint off_in_chunk = off % 128;
+                uint group32 = off_in_chunk / 32;
+                uint subgroup = (off % 32) / 16;
+                uint lane = off % 16;
+                uint shift = group32 * 2;
+                uint qs_index_base = chunk * 32;
+                uint qs_byte_index = qs_index_base + (subgroup * 16) + lane;
+                uint is = chunk * 8 + group32 * 2 + subgroup;
+
+                // Load scale byte
+                uint sc = load_byte(block_byte + 0 + is);
+                float dl = d * float(sc & 0xF);
+                float ml = dmin * float(sc >> 4);
+
+                // Load and extract quantized value
+                uint qs_byte = load_byte(block_byte + 16 + qs_byte_index);
+                uint q = (qs_byte >> shift) & 3u;
+
+                // Dequantize
+                val = dl * float(q) - ml;
+            }
+            shared_b[i] = float16_t(val);
+        }
+
+        barrier();
+        coopMatLoad(matA, shared_a, 0, TILE_K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, shared_b, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+        matC = coopMatMulAdd(matA, matB, matC);
+        barrier();
+    }
+
+    coopMatStore(matC, temp_c, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    // Write output (only first row since M=1)
+    for (uint i = tid; i < TILE_N; i += 32) {
+        uint n_idx = wg_n + i;
+        if (n_idx < op_n) {
+            uint out_idx = batch_idx * op_topk * op_n + topk_idx * op_n + n_idx;
+            v_dest[out_idx] = temp_c[i];  // First row is temp_c[0..TILE_N-1]
+        }
+    }
+}

@@ -1,0 +1,106 @@
+[package]
+name = "paramecia-cli"
+description = "CLI tool for paramecia"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+default-run = "paramecia"
+
+[[bin]]
+name = "paramecia"
+path = "src/main.rs"
+
+[dependencies]
+paramecia-harness = { workspace = true }
+paramecia-text = { workspace = true }
+paramecia-tools = { workspace = true }
+paramecia-engine = { workspace = true }
+paramecia-host = { workspace = true }
+paramecia-bridge = { workspace = true }
+paramecia-visualizer = { workspace = true }
+
+tokio = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+clap = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+
+console = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
+
+dirs = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+
+atty = "0.2"
+pulldown-cmark = "0.12"
+reqwest = { workspace = true }
+textwrap = "0.16"
+
+[dev-dependencies]
+tempfile = "3.18"
+
+[features]
+default = []
+accelerate = ["paramecia-text/accelerate"]
+cuda = ["paramecia-text/cuda", "paramecia-engine/cuda", "paramecia-host/cuda"]
+metal = ["paramecia-text/metal", "paramecia-engine/metal", "paramecia-host/metal"]
+vulkan = ["paramecia-text/vulkan", "paramecia-engine/vulkan", "paramecia-host/vulkan"]
+qwen3next_80b_a3b = [
+    "paramecia-text/qwen3next_80b_a3b",
+    "paramecia-engine/qwen3next_80b_a3b",
+    "paramecia-host/qwen3next_80b_a3b",
+    "paramecia-harness/qwen3next_80b_a3b",
+]
+qwen35moe_35b_a3b = [
+    "paramecia-text/qwen35moe_35b_a3b",
+    "paramecia-engine/qwen35moe_35b_a3b",
+    "paramecia-host/qwen35moe_35b_a3b",
+    "paramecia-harness/qwen35moe_35b_a3b",
+]
+qwen35moe_122b_a10b = [
+    "paramecia-text/qwen35moe_122b_a10b",
+    "paramecia-engine/qwen35moe_122b_a10b",
+    "paramecia-host/qwen35moe_122b_a10b",
+    "paramecia-harness/qwen35moe_122b_a10b",
+]
+qwen35moe_397b_a17b = [
+    "paramecia-text/qwen35moe_397b_a17b",
+    "paramecia-engine/qwen35moe_397b_a17b",
+    "paramecia-host/qwen35moe_397b_a17b",
+    "paramecia-harness/qwen35moe_397b_a17b",
+]
+qwen35_0p8b = [
+    "paramecia-text/qwen35_0p8b",
+    "paramecia-engine/qwen35_0p8b",
+    "paramecia-host/qwen35_0p8b",
+    "paramecia-harness/qwen35_0p8b",
+]
+qwen35_4b = [
+    "paramecia-text/qwen35_4b",
+    "paramecia-engine/qwen35_4b",
+    "paramecia-host/qwen35_4b",
+    "paramecia-harness/qwen35_4b",
+]
+qwen35_9b = [
+    "paramecia-text/qwen35_9b",
+    "paramecia-engine/qwen35_9b",
+    "paramecia-host/qwen35_9b",
+    "paramecia-harness/qwen35_9b",
+]
+qwen35_27b = [
+    "paramecia-text/qwen35_27b",
+    "paramecia-engine/qwen35_27b",
+    "paramecia-host/qwen35_27b",
+    "paramecia-harness/qwen35_27b",
+]
