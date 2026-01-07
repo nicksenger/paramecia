@@ -13,14 +13,14 @@
 
 ### Note from the author
 
-The goal of this project is to create an artificial intelligence agent which:
+The goal of this project is to create an artificial intelligence agent that:
 
-- Runs on a personal computer of "reasonable" specifications (aka my machine): 24gb VRAM + 64gb DDR5
-- Runs as a single process, from a single binary
+- Runs as a single process and from a single binary
+- Performs decently on a personal computer of what I consider _reasonable_ specifications: 24gb VRAM + 64gb SDRAM
 - Is capable of reading and editing its own source code in an agentic loop
-- Supports some form of "improvement" or weight modification
+- Supports some form of weight modification or improvement
 
-It's very early still, and this thing is not very capable. You can talk to it and it will grep around or recite cute markdown explanations of quantum mechanics, but do not expect frontier-level capabilities. The focus of this project is not maximal intelligence, it is _minimal reflection_.
+Currently, you can talk to this project and it will grep around iteself or give markdown explanations of quantum mechanics, etc, but it is not comparable to frontier-level cloud agentic AI. The focus of this project is _minimal reflection_, not maximal intelligence. That said, I hope it can be a sort of living experiment: one that anyone can take in whatever direction they choose.
 
 # Paramecia
 
