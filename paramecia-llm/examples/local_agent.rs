@@ -24,7 +24,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use futures::StreamExt;
-use paramecia_harness::{generate_multishot_examples, get_universal_system_prompt_with_tools, VibeConfig};
+use paramecia_harness::{
+    VibeConfig, generate_multishot_examples, get_universal_system_prompt_with_tools,
+};
 use paramecia_llm::backend::{
     Backend, BackendType, CompletionOptions, LocalBackend, ModelConfig, ProviderConfig,
 };

@@ -223,8 +223,7 @@ async fn run_worker(
 
                 // Run the agent (this is where inference happens)
                 let mut act_future = Box::pin(agent.act(&prompt, event_tx));
-                let mut act_result: Option<Result<(), paramecia_harness::error::VibeError>> =
-                    None;
+                let mut act_result: Option<Result<(), paramecia_harness::error::VibeError>> = None;
                 let mut shutdown_requested = false;
 
                 loop {

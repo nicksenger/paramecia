@@ -29,9 +29,9 @@ pub use config::VibeConfig;
 pub use error::{VibeError, VibeResult};
 pub use events::{AgentEvent, AssistantEvent, ToolCallEvent, ToolResultEvent};
 pub use modes::AgentMode;
+pub use multishot_examples::generate_multishot_examples;
 pub use prompts::UtilityPrompt;
 pub use system_prompt::{get_universal_system_prompt, get_universal_system_prompt_with_tools};
-pub use multishot_examples::generate_multishot_examples;
 pub use types::AgentStats;
 pub use utils::{
     CANCELLATION_TAG, CancellationReason, TOOL_ERROR_TAG, TaggedText, VIBE_STOP_EVENT_TAG,

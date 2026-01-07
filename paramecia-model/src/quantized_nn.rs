@@ -110,25 +110,45 @@ impl RmsNorm {
     pub fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
         let weight = vb.get(size, "weight")?.dequantize(vb.device())?;
-        Ok(Self { weight, eps, zero_centered: false, span })
+        Ok(Self {
+            weight,
+            eps,
+            zero_centered: false,
+            span,
+        })
     }
 
     pub fn from_qtensor(weight: QTensor, eps: f64) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
         let weight = weight.dequantize(&weight.device())?;
-        Ok(Self { weight, eps, zero_centered: false, span })
+        Ok(Self {
+            weight,
+            eps,
+            zero_centered: false,
+            span,
+        })
     }
 
     /// Create zero-centered (Gemma-style) RmsNorm from QTensor
     pub fn from_qtensor_zero_centered(weight: QTensor, eps: f64) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "rms-norm-zc");
         let weight = weight.dequantize(&weight.device())?;
-        Ok(Self { weight, eps, zero_centered: true, span })
+        Ok(Self {
+            weight,
+            eps,
+            zero_centered: true,
+            span,
+        })
     }
 
     pub fn from_weight(weight: Tensor, eps: f64) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
-        Ok(Self { weight, eps, zero_centered: false, span })
+        Ok(Self {
+            weight,
+            eps,
+            zero_centered: false,
+            span,
+        })
     }
 
     pub fn to_dtype(self, dtype: candle::DType) -> Result<Self> {
@@ -158,7 +178,7 @@ impl Module for RmsNorm {
         } else {
             self.weight.clone()
         };
-        
+
         // Zero-centered (Gemma-style): use (1 + weight) instead of weight
         if self.zero_centered {
             let one = Tensor::ones_like(&weight)?;
@@ -169,4 +189,3 @@ impl Module for RmsNorm {
         }
     }
 }
-

@@ -31,13 +31,13 @@ use crate::types::{AvailableTool, FunctionCall, LlmChunk, LlmMessage, LlmUsage, 
 
 /// Default maximum context length for inference.
 /// The Qwen3-Next model supports up to 128K context.
-/// 
+///
 /// Context length can be configured via `local_context_length` config or
 /// `PARAMECIA_CONTEXT_LENGTH` env var. Default: 131072 (128K).
-/// 
+///
 /// KV cache quantization can be configured via `local_kv_cache_quant` config or
 /// `PARAMECIA_KV_CACHE_QUANT` env var. Options: "f16", "bf16", "q8", "q4" (default).
-/// 
+///
 /// Memory scaling (approximate, with expert offload for 30B MoE):
 ///   - F16 KV-cache (maximum accuracy):
 ///     - 32K tokens: ~22 GB peak

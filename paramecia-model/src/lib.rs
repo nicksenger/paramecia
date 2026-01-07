@@ -1,7 +1,7 @@
-pub mod ops;
 pub mod generation;
 pub mod layer_pipeline;
 pub mod models;
+pub mod ops;
 pub mod quantized_nn;
 pub mod quantized_var_builder;
 pub mod qwen3_next;
@@ -57,8 +57,7 @@ pub mod token_output_stream {
             let text = self.decode(&self.tokens[self.prev_index..])?;
             // Emit whenever we have new complete text - allow all character types
             // including newlines/tabs to avoid buffering on whitespace boundaries
-            if text.len() > prev_text.len() && text.chars().last().is_some()
-            {
+            if text.len() > prev_text.len() && text.chars().last().is_some() {
                 // Use strip_prefix for safe UTF-8 handling - if the prefix doesn't match
                 // exactly (which shouldn't happen but guards against edge cases), fall back
                 // to character-based extraction

@@ -324,7 +324,7 @@ fn main() -> Result<()> {
 
     // Lazy state tracking: model state is synced up to (but not including) this position
     let mut state_position: usize = 0;
-    
+
     // Cache for hidden states from previous round - avoids redundant forward passes
     let mut cached_hidden: Option<Tensor> = None;
     let mut cached_next_token: Option<u32> = None;
@@ -334,40 +334,46 @@ fn main() -> Result<()> {
         // MTP speculative decoding
         if mtp_enabled && generated_tokens > 0 && effective_num_speculative > 0 {
             // Check if we have cached hidden states from previous round
-            let (hidden_states, next_token) = if let (Some(hidden), Some(tok)) = 
-                (cached_hidden.take(), cached_next_token.take()) 
+            let (hidden_states, next_token) = if let (Some(hidden), Some(tok)) =
+                (cached_hidden.take(), cached_next_token.take())
             {
                 // Use cached hidden states - no forward needed!
                 if args.verbose {
-                    eprintln!("\n[MTP DEBUG] Using cached hidden states, next_token={}", tok);
+                    eprintln!(
+                        "\n[MTP DEBUG] Using cached hidden states, next_token={}",
+                        tok
+                    );
                 }
                 (hidden, tok)
             } else {
                 // Need to catch-up: forward all tokens from state_position
                 let catchup_start = state_position;
                 let ctxt = &tokens[catchup_start..];
-                
+
                 if args.verbose {
                     eprintln!("\n[MTP DEBUG] Catch-up forward: state_pos={}, tokens.len()={}, processing {} tokens",
                         state_position, tokens.len(), ctxt.len());
                     let last_n = tokens.len().saturating_sub(10);
                     eprintln!("[MTP DEBUG] tokens[{}..]: {:?}", last_n, &tokens[last_n..]);
                 }
-                
+
                 let input = Tensor::new(ctxt, &device)?.unsqueeze(0)?;
-                let (logits, hidden_states) = model.forward_with_hidden_states(&input, catchup_start)?;
-                
+                let (logits, hidden_states) =
+                    model.forward_with_hidden_states(&input, catchup_start)?;
+
                 // State is now synced to tokens.len()
                 state_position = tokens.len();
-                
+
                 // Get logits for last position and sample next token
                 let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
                 let start_at = tokens.len().saturating_sub(args.repeat_last_n);
                 let penalty_context = &tokens[start_at..];
-                let logits = utils::apply_repeat_penalty(&logits, args.repeat_penalty, penalty_context)?;
-                let logits = utils::apply_presence_penalty(&logits, args.presence_penalty, penalty_context)?;
+                let logits =
+                    utils::apply_repeat_penalty(&logits, args.repeat_penalty, penalty_context)?;
+                let logits =
+                    utils::apply_presence_penalty(&logits, args.presence_penalty, penalty_context)?;
                 let next_token = logits_processor.sample(&logits)?;
-                
+
                 (hidden_states, next_token)
             };
 
@@ -398,23 +404,26 @@ fn main() -> Result<()> {
 
             // Track penalty context for draft generation
             let mut draft_penalty_tokens = tokens.clone();
-            
+
             // MTP base position: the position AFTER the last verified token
             // tokens.len() is the number of tokens including the just-generated next_token
             let mtp_base_pos = tokens.len();
-            
+
             for mtp_step in 0..effective_num_speculative {
                 let mtp_input = Tensor::new(&[current_token], &device)?.unsqueeze(0)?;
-                
+
                 // Actual sequence position for this draft token (for RoPE)
                 let mtp_pos = mtp_base_pos + mtp_step;
-                
+
                 if args.verbose {
                     let hid_f32 = current_hidden.to_dtype(DType::F32)?;
                     let mean = hid_f32.mean_all()?.to_scalar::<f32>()?;
-                    eprintln!("[EXAMPLE] MTP step {}: token={}, pos={}, hidden mean={:.4}", mtp_step, current_token, mtp_pos, mean);
+                    eprintln!(
+                        "[EXAMPLE] MTP step {}: token={}, pos={}, hidden mean={:.4}",
+                        mtp_step, current_token, mtp_pos, mean
+                    );
                 }
-                
+
                 // Use actual sequence position for RoPE, mtp_step for layer selection
                 let (mtp_logits, mtp_hidden) = model.forward_mtp_with_hidden(
                     &mtp_input,
@@ -425,12 +434,17 @@ fn main() -> Result<()> {
                 let mtp_logits = mtp_logits.squeeze(0)?.to_dtype(DType::F32)?;
 
                 // Apply repeat penalty
-                let start_at = draft_penalty_tokens.len().saturating_sub(args.repeat_last_n);
+                let start_at = draft_penalty_tokens
+                    .len()
+                    .saturating_sub(args.repeat_last_n);
                 let penalty_context = &draft_penalty_tokens[start_at..];
                 let mtp_logits_penalized =
                     utils::apply_repeat_penalty(&mtp_logits, args.repeat_penalty, penalty_context)?;
-                let mtp_logits_penalized =
-                    utils::apply_presence_penalty(&mtp_logits_penalized, args.presence_penalty, penalty_context)?;
+                let mtp_logits_penalized = utils::apply_presence_penalty(
+                    &mtp_logits_penalized,
+                    args.presence_penalty,
+                    penalty_context,
+                )?;
 
                 // Use greedy (argmax) for draft generation to match verification
                 let draft_token = mtp_logits_penalized.argmax(0)?.to_scalar::<u32>()?;
@@ -447,7 +461,7 @@ fn main() -> Result<()> {
             }
 
             // JOINT VERIFICATION-GENERATION with O(1) STATE SLICING
-            // 
+            //
             // Key optimizations:
             // 1. PARALLEL verification with intermediate DeltaNet state materialization
             // 2. ALL ACCEPTED: O(1) - use H[last] for MTP, no extra forward
@@ -463,10 +477,10 @@ fn main() -> Result<()> {
                 let verify_start = tokens.len() - 1;
 
                 // PARALLEL verification with state materialization
-                // - all_logits: [batch, seq_len, vocab] 
+                // - all_logits: [batch, seq_len, vocab]
                 // - all_hidden: [batch, seq_len, hidden] (pre-norm, for MTP)
                 // - intermediate DeltaNet states stored for O(1) slicing
-                let (all_logits, all_hidden) = 
+                let (all_logits, all_hidden) =
                     model.verify_with_state_materialization(&verify_input, verify_start)?;
                 let all_logits_f32 = all_logits.squeeze(0)?.to_dtype(DType::F32)?;
 
@@ -477,7 +491,11 @@ fn main() -> Result<()> {
 
                 // Debug: print verification details
                 if args.verbose {
-                    eprintln!("\n[MTP DEBUG] tokens.len()={}, verify_start={}", tokens.len(), verify_start);
+                    eprintln!(
+                        "\n[MTP DEBUG] tokens.len()={}, verify_start={}",
+                        tokens.len(),
+                        verify_start
+                    );
                     eprintln!("[MTP DEBUG] verify_tokens: {:?}", verify_tokens);
                 }
 
@@ -496,10 +514,16 @@ fn main() -> Result<()> {
                     // Apply penalties and compute target probabilities
                     let start_at = penalty_tokens.len().saturating_sub(args.repeat_last_n);
                     let penalty_context = &penalty_tokens[start_at..];
-                    let logits_penalized =
-                        utils::apply_repeat_penalty(&logits_i, args.repeat_penalty, penalty_context)?;
-                    let logits_penalized =
-                        utils::apply_presence_penalty(&logits_penalized, args.presence_penalty, penalty_context)?;
+                    let logits_penalized = utils::apply_repeat_penalty(
+                        &logits_i,
+                        args.repeat_penalty,
+                        penalty_context,
+                    )?;
+                    let logits_penalized = utils::apply_presence_penalty(
+                        &logits_penalized,
+                        args.presence_penalty,
+                        penalty_context,
+                    )?;
 
                     // Top-K relaxed verification: accept if draft is in top-K candidates
                     let accept = if args.spec_top_k <= 1 {
@@ -508,40 +532,47 @@ fn main() -> Result<()> {
                         if args.verbose {
                             eprintln!(
                                 "[MTP DEBUG] i={}: draft={}, main_argmax={}, accept={}",
-                                i, draft_token, main_argmax, main_argmax == draft_token
+                                i,
+                                draft_token,
+                                main_argmax,
+                                main_argmax == draft_token
                             );
                         }
                         main_argmax == draft_token
                     } else {
                         // Relaxed top-K matching
                         let k = args.spec_top_k;
-                        
+
                         // Get logits as a vector and find top-K indices on CPU
                         // (arg_sort can be slow on GPU for small vocab, and we only need top-K)
                         let logits_vec: Vec<f32> = logits_penalized.to_vec1()?;
-                        
+
                         // Create (index, logit) pairs and find top-K
                         let mut indexed_logits: Vec<(u32, f32)> = logits_vec
                             .iter()
                             .enumerate()
                             .map(|(i, &v)| (i as u32, v))
                             .collect();
-                        
+
                         // Partial sort to get top-K (more efficient than full sort)
                         indexed_logits.select_nth_unstable_by(k - 1, |a, b| {
                             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                         });
-                        
+
                         // Check if draft token is in top-K
-                        let top_k_vec: Vec<u32> = indexed_logits[..k].iter().map(|(i, _)| *i).collect();
+                        let top_k_vec: Vec<u32> =
+                            indexed_logits[..k].iter().map(|(i, _)| *i).collect();
                         let in_top_k = top_k_vec.contains(&draft_token);
-                        
+
                         if args.verbose {
                             let main_argmax = logits_penalized.argmax(0)?.to_scalar::<u32>()?;
                             // Sort for display
                             let mut display_vec = indexed_logits[..k].to_vec();
-                            display_vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                            let display_indices: Vec<u32> = display_vec.iter().take(5).map(|(i, _)| *i).collect();
+                            display_vec.sort_by(|a, b| {
+                                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            let display_indices: Vec<u32> =
+                                display_vec.iter().take(5).map(|(i, _)| *i).collect();
                             eprintln!(
                                 "[MTP DEBUG] i={}: draft={}, main_argmax={}, top_{}={:?}, accept={}",
                                 i, draft_token, main_argmax, k, display_indices, in_top_k
@@ -567,14 +598,14 @@ fn main() -> Result<()> {
                 }
 
                 // JOINT VERIFICATION-GENERATION: Handle based on acceptance
-                // 
+                //
                 // Key insight: We use the hidden states from verification directly.
                 // The bonus/correction token becomes the "anchor" of the NEXT verification batch.
                 //
                 if rejection_token.is_none() && num_accepted == draft_tokens.len() {
                     // ALL ACCEPTED - State is already correct from parallel verification!
                     state_position = verify_start + verify_tokens.len();
-                    
+
                     // Get bonus token from last position's logits
                     let last_pos = verify_tokens.len() - 1;
                     let last_logits = all_logits_f32.i(last_pos)?;
@@ -586,21 +617,29 @@ fn main() -> Result<()> {
                     }
                     let start_at = temp_tokens.len().saturating_sub(args.repeat_last_n);
                     let penalty_context = &temp_tokens[start_at..];
-                    let last_logits =
-                        utils::apply_repeat_penalty(&last_logits, args.repeat_penalty, penalty_context)?;
-                    let last_logits =
-                        utils::apply_presence_penalty(&last_logits, args.presence_penalty, penalty_context)?;
+                    let last_logits = utils::apply_repeat_penalty(
+                        &last_logits,
+                        args.repeat_penalty,
+                        penalty_context,
+                    )?;
+                    let last_logits = utils::apply_presence_penalty(
+                        &last_logits,
+                        args.presence_penalty,
+                        penalty_context,
+                    )?;
 
                     // Sample bonus token
                     let bonus_token = logits_processor.sample(&last_logits)?;
-                    
+
                     // Get hidden states for MTP from verification (NO EXTRA FORWARD!)
                     // H[last_pos] is the hidden state that produced the bonus logits
                     let mtp_hidden = all_hidden.narrow(1, last_pos, 1)?;
 
                     if args.verbose {
-                        eprintln!("[MTP DEBUG] All accepted! bonus={}, H[{}], NO EXTRA FORWARD", 
-                            bonus_token, last_pos);
+                        eprintln!(
+                            "[MTP DEBUG] All accepted! bonus={}, H[{}], NO EXTRA FORWARD",
+                            bonus_token, last_pos
+                        );
                     }
 
                     // Add all accepted draft tokens
@@ -623,18 +662,25 @@ fn main() -> Result<()> {
                     // Cache bonus token for next iteration - NO FORWARD NEEDED!
                     // MTP will use (bonus_token, mtp_hidden) for drafting
                     // Next verification batch: [bonus_token, new_drafts...]
-                    if index < args.sample_len && bonus_token != eos_token && bonus_token != im_end_token {
+                    if index < args.sample_len
+                        && bonus_token != eos_token
+                        && bonus_token != im_end_token
+                    {
                         cached_hidden = Some(mtp_hidden);
                         cached_next_token = Some(bonus_token);
                     }
-                    
+
                     if args.verbose {
-                        eprintln!("[MTP DEBUG] tokens.len()={}, state_position={}, cached={}",
-                            tokens.len(), state_position, cached_hidden.is_some());
+                        eprintln!(
+                            "[MTP DEBUG] tokens.len()={}, state_position={}, cached={}",
+                            tokens.len(),
+                            state_position,
+                            cached_hidden.is_some()
+                        );
                     }
                 } else if let Some(rej) = rejection_token {
                     // PARTIAL REJECT with O(1) STATE SLICING
-                    // 
+                    //
                     // The verification already materialized intermediate states.
                     // We just "pick" the state after the last accepted token.
                     //
@@ -645,14 +691,14 @@ fn main() -> Result<()> {
                     //
                     let slice_index = num_accepted;
                     model.restore_to_intermediate_state(slice_index, verify_start);
-                    
+
                     // State is now at verify_start + slice_index + 1
                     state_position = verify_start + slice_index + 1;
-                    
+
                     // Get hidden state from verification (NO EXTRA FORWARD!)
                     // H[slice_index] is the hidden that produced the logits for the rejection
                     let mtp_hidden = all_hidden.narrow(1, slice_index, 1)?;
-                    
+
                     if args.verbose {
                         eprintln!("[MTP DEBUG] Partial reject: accepted={}, rej={}, O(1) slice to index {}",
                             num_accepted, rej, slice_index);
@@ -678,13 +724,17 @@ fn main() -> Result<()> {
                         cached_hidden = Some(mtp_hidden);
                         cached_next_token = Some(rej);
                     }
-                    
+
                     // Clear intermediate states - no longer needed
                     model.clear_intermediate_states();
-                    
+
                     if args.verbose {
-                        eprintln!("[MTP DEBUG] tokens.len()={}, state_position={}, cached={}",
-                            tokens.len(), state_position, cached_hidden.is_some());
+                        eprintln!(
+                            "[MTP DEBUG] tokens.len()={}, state_position={}, cached={}",
+                            tokens.len(),
+                            state_position,
+                            cached_hidden.is_some()
+                        );
                     }
                 }
             }
@@ -695,10 +745,10 @@ fn main() -> Result<()> {
             let ctxt = &tokens[start_pos..];
             let input = Tensor::new(ctxt, &device)?.unsqueeze(0)?;
             let logits = model.forward(&input, start_pos)?;
-            
+
             // State is now synced
             state_position = tokens.len();
-            
+
             // Get logits for last position
             // model.forward returns [batch, seq, vocab] or [batch, vocab] for seq=1
             let logits = logits.squeeze(0)?; // Remove batch dim

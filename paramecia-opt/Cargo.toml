@@ -5,8 +5,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-candle = { package = "candle-core", path = "../../qzo/candle-core", version = "0.9.2-alpha.1" }
-candle-nn = { path = "../../qzo/candle-nn", package = "candle-nn", version = "0.9.2-alpha.1" }
+candle = { package = "candle-core", git = "https://github.com/nicksenger/candle.git", branch = "paramecia" }
+candle-nn = { package = "candle-nn", git = "https://github.com/nicksenger/candle.git", branch = "paramecia" }
 paramecia-model = { path = "../paramecia-model" }
 rand = "0.9.0"
 rand_distr = "0.5.1"
@@ -15,8 +15,9 @@ thiserror = "1"
 [dev-dependencies]
 hf-hub = "0.4.1"
 tokenizers = { version = "0.21.0", default-features = false, features = ["onig"] }
-candle-examples = { path = "../../qzo/candle-examples", package = "candle-examples", version = "0.9.2-alpha.1" }
+candle-examples = { package = "candle-examples", git = "https://github.com/nicksenger/candle.git", branch = "paramecia" }
 paramecia-model = { path = "../paramecia-model" }
+hirschberg = { workspace = true }
 
 [features]
 default = []

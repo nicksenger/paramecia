@@ -13,7 +13,10 @@ use std::path::PathBuf;
 ///
 /// These messages are injected into the conversation history after the system
 /// prompt to teach the model the correct format for tool calls.
-pub fn generate_multishot_examples(tool_manager: &ToolManager, workdir: &PathBuf) -> Vec<LlmMessage> {
+pub fn generate_multishot_examples(
+    tool_manager: &ToolManager,
+    workdir: &PathBuf,
+) -> Vec<LlmMessage> {
     let mut messages = Vec::new();
 
     // Only add examples for tools that are actually available
@@ -23,18 +26,17 @@ pub fn generate_multishot_examples(tool_manager: &ToolManager, workdir: &PathBuf
     if available.iter().any(|t| t == "read_file") {
         let example_path = workdir.join("README.md");
         let example_path_str = example_path.to_string_lossy();
-        messages.push(LlmMessage::user(
-            &format!("Please use the read_file tool to read {}", example_path_str),
-        ));
-        messages.push(LlmMessage::assistant(
-            &format!(
-                "Ok, I'll read the file at the path specified.\n\n\
+        messages.push(LlmMessage::user(&format!(
+            "Please use the read_file tool to read {}",
+            example_path_str
+        )));
+        messages.push(LlmMessage::assistant(&format!(
+            "Ok, I'll read the file at the path specified.\n\n\
                 <tool_call>\n\
                 {{\"name\": \"read_file\", \"arguments\": {{\"path\": \"{}\"}}}}\n\
                 </tool_call>",
-                example_path_str
-            ),
-        ));
+            example_path_str
+        )));
     }
 
     // Example 2: bash

@@ -21,7 +21,7 @@
 
 use candle::{Device, IndexOp, Result, Tensor};
 use hf_hub::api::sync::Api;
-use paramecia_eval::{cosine_similarity, hirschberg_alignment_score};
+use hirschberg::Config as HirschbergConfig;
 use paramecia_model::qwen3_next::{DeviceOffloadMode, KvCacheQuantization, ModelWeights};
 use paramecia_opt::{Eggroll, EggrollParams, LayerConfig};
 use std::collections::HashMap;
@@ -33,6 +33,59 @@ use tokenizers::Tokenizer;
 const DEFAULT_COSINE_WEIGHT: f32 = 0.6;
 /// Default weight for Hirschberg alignment in Replicate scoring.
 const DEFAULT_HIRSCHBERG_WEIGHT: f32 = 0.4;
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let x = f64::from(x);
+        let y = f64::from(y);
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom == 0.0 {
+        0.0
+    } else {
+        (dot / denom) as f32
+    }
+}
+
+fn hirschberg_alignment_score(
+    a: &str,
+    b: &str,
+    match_score: i32,
+    mismatch_score: i32,
+    gap_score: i32,
+) -> f32 {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+
+    let max_len = a_chars.len().max(b_chars.len());
+    if max_len == 0 {
+        return 0.0;
+    }
+
+    let config = HirschbergConfig {
+        match_score,
+        mismatch_score,
+        gap_score,
+    };
+    let score = config.compute(&a_chars, &b_chars).score();
+
+    // Normalize to roughly [-1, 1] by dividing by the best-possible score for the
+    // longer sequence (perfect match, no gaps).
+    let denom = (match_score.max(1) as f32) * (max_len as f32);
+    (score as f32) / denom
+}
 
 fn compute_cross_entropy_loss(logits: &Tensor, targets: &Tensor) -> Result<f32> {
     let (batch_size, seq_len, vocab_size) = logits.dims3()?;

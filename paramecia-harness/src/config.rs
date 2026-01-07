@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::error::{VibeError, VibeResult};
-use crate::paths::{local_config_file, AGENTS_DIR, CONFIG_FILE, ENV_FILE};
+use crate::paths::{AGENTS_DIR, CONFIG_FILE, ENV_FILE, local_config_file};
 use crate::prompts::load_prompt;
 use crate::session::SessionLoggingConfig;
 use paramecia_llm::backend::BackendType;
@@ -581,9 +581,9 @@ fn default_providers() -> Vec<ProviderConfig> {
         local_tokenizer_path: None,
         local_max_tokens: Some(4096),
         local_device: None,
-        local_offload: None,             // Defaults to "experts" in backend
-        local_context_length: None,      // Defaults to 131072 in backend
-        local_kv_cache_quant: None,      // Defaults to "f16" in backend
+        local_offload: None,        // Defaults to "experts" in backend
+        local_context_length: None, // Defaults to 131072 in backend
+        local_kv_cache_quant: None, // Defaults to "f16" in backend
     }]
 }
 
