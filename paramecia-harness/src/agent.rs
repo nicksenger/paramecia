@@ -83,6 +83,8 @@ pub struct Agent {
     last_finish_reason: Option<String>,
     /// Tools approved for "always allow" during this session.
     session_approved_tools: std::collections::HashSet<String>,
+    /// Cancellation flag for interrupting ongoing operations.
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Agent {
@@ -167,6 +169,7 @@ impl Agent {
             max_price: None,
             last_finish_reason: None,
             session_approved_tools: std::collections::HashSet::new(),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // Update pricing
@@ -293,6 +296,18 @@ impl Agent {
             .store(mode as u8, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Cancel the current operation.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Check if cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Check if auto-approve is enabled.
     #[must_use]
     pub fn auto_approve(&self) -> bool {
@@ -338,6 +353,24 @@ impl Agent {
         user_message: &str,
         event_tx: mpsc::Sender<AgentEvent>,
     ) -> VibeResult<()> {
+        // Reset cancellation flag
+        self.cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.act_with_cancellation(user_message, event_tx, self.cancelled.clone()).await
+    }
+
+    /// Process a user message and stream events with external cancellation.
+    ///
+    /// Events are sent to the provided channel as they happen.
+    /// The caller should spawn this in a separate task and listen on the receiver
+    /// concurrently to receive events in real-time.
+    pub async fn act_with_cancellation(
+        &mut self,
+        user_message: &str,
+        event_tx: mpsc::Sender<AgentEvent>,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> VibeResult<()> {
+        // Reset the provided cancellation flag
+        cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
         // Clean message history before processing
         self.clean_message_history();
 
@@ -349,7 +382,7 @@ impl Agent {
         self.stats.context_tokens = AgentStats::calculate_context_tokens(&self.messages);
 
         // Run conversation loop - events are sent to event_tx as they happen
-        self.conversation_loop(event_tx).await?;
+        self.conversation_loop(event_tx, cancelled).await?;
 
         Ok(())
     }
@@ -441,7 +474,7 @@ impl Agent {
         }
     }
 
-    async fn conversation_loop(&mut self, tx: mpsc::Sender<AgentEvent>) -> VibeResult<()> {
+    async fn conversation_loop(&mut self, tx: mpsc::Sender<AgentEvent>, cancelled: Arc<std::sync::atomic::AtomicBool>) -> VibeResult<()> {
         loop {
             // Run before-turn middleware
             let context = ConversationContext {
@@ -502,7 +535,7 @@ impl Agent {
 
             // Perform LLM turn
             self.stats.steps += 1;
-            let (should_continue, user_cancelled) = self.perform_llm_turn(&tx).await?;
+            let (should_continue, user_cancelled) = self.perform_llm_turn(&tx, Arc::clone(&cancelled)).await?;
 
             if user_cancelled {
                 // User cancelled during tool execution, stop the loop
@@ -539,6 +572,7 @@ impl Agent {
     async fn perform_llm_turn(
         &mut self,
         tx: &mpsc::Sender<AgentEvent>,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
     ) -> VibeResult<(bool, bool)> {
         let active_model = self.config.get_active_model()?;
         let model_config = LlmModelConfig {
@@ -586,6 +620,11 @@ impl Agent {
 
             // Process streaming chunks
             while let Some(chunk) = stream.next().await {
+                // Check for cancellation periodically
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok((false, false));
+                }
+
                 let chunk = chunk.map_err(VibeError::Llm)?;
 
                 // Update finish reason and usage from the last chunk

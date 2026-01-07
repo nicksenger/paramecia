@@ -208,6 +208,10 @@ async fn run_worker(
                 let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
                 let result_tx_clone = result_tx.clone();
 
+                // Create a cancellation flag that can be accessed without borrowing agent
+                let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let cancelled_for_agent = Arc::clone(&cancelled);
+
                 // Spawn event forwarder
                 let forward_handle = tokio::spawn(async move {
                     while let Some(event) = event_rx.recv().await {
@@ -222,9 +226,10 @@ async fn run_worker(
                 });
 
                 // Run the agent (this is where inference happens)
-                let mut act_future = Box::pin(agent.act(&prompt, event_tx));
+                let mut act_future = Box::pin(agent.act_with_cancellation(&prompt, event_tx, cancelled_for_agent));
                 let mut act_result: Option<Result<(), paramecia_harness::error::VibeError>> = None;
                 let mut shutdown_requested = false;
+                let mut interrupted = false;
 
                 loop {
                     tokio::select! {
@@ -240,7 +245,9 @@ async fn run_worker(
                                         .await;
                                 }
                                 AgentCommand::Interrupt => {
-                                    // Interrupt is currently a no-op; consume the command
+                                    // Cancel the ongoing agent action
+                                    interrupted = true;
+                                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
                                 }
                                 AgentCommand::Shutdown => {
                                     shutdown_requested = true;
@@ -265,11 +272,17 @@ async fn run_worker(
 
                 match act_result {
                     Some(Ok(())) => {
-                        let _ = result_tx
-                            .send(AgentResult::Done {
-                                context_tokens: agent.stats().context_tokens,
-                            })
-                            .await;
+                        if interrupted {
+                            let _ = result_tx
+                                .send(AgentResult::Error("Agent action was interrupted by user".to_string()))
+                                .await;
+                        } else {
+                            let _ = result_tx
+                                .send(AgentResult::Done {
+                                    context_tokens: agent.stats().context_tokens,
+                                })
+                                .await;
+                        }
                     }
                     Some(Err(e)) => {
                         let _ = result_tx.send(AgentResult::Error(e.to_string())).await;
@@ -324,8 +337,8 @@ async fn run_worker(
             }
 
             AgentCommand::Interrupt => {
-                // Interrupt is a no-op for now - the agent needs proper cancellation support
-                // The UI will show the interrupt message immediately though
+                // Interrupt is handled during Act commands - no-op in other states
+                // The UI will show the interrupt message immediately
             }
 
             AgentCommand::SetMode(new_mode) => {

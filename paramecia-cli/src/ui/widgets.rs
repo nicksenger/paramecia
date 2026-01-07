@@ -1,7 +1,7 @@
 //! Widget rendering for the TUI.
 
 use paramecia_harness::modes::AgentMode;
-use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use ratatui::{
     prelude::*,
     style::{Color, Modifier, Style},
@@ -190,8 +190,10 @@ pub fn render_assistant_message(msg: &AssistantMessage, width: u16) -> Vec<Line<
         return lines;
     }
 
+    let max_table_width = usize::from(width.max(1)).saturating_sub(2);
+
     // Parse markdown and render with styling
-    let rendered_lines = render_markdown(&msg.content);
+    let rendered_lines = render_markdown(&msg.content, max_table_width);
 
     let bullet_prefix = vec![Span::styled("● ", Style::default().fg(colors::YELLOW))];
     let indent_prefix = vec![Span::raw("  ")];
@@ -307,9 +309,571 @@ fn split_content_at_width(content: &str, max_width: usize) -> (String, String) {
     (content.to_string(), String::new())
 }
 
+fn preprocess_markdown_tables(content: &str) -> String {
+    let mut output: Vec<String> = Vec::new();
+    let mut table_buffer: Vec<String> = Vec::new();
+    let mut in_code_block = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let is_fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+
+        if is_fence {
+            flush_table_buffer(&mut table_buffer, &mut output);
+            in_code_block = !in_code_block;
+            output.push(line.to_string());
+            continue;
+        }
+
+        if in_code_block {
+            output.push(line.to_string());
+            continue;
+        }
+
+        if is_tableish_line(line) {
+            table_buffer.push(line.to_string());
+        } else {
+            flush_table_buffer(&mut table_buffer, &mut output);
+            output.push(line.to_string());
+        }
+    }
+
+    flush_table_buffer(&mut table_buffer, &mut output);
+
+    output.join("\n")
+}
+
+fn flush_table_buffer(buffer: &mut Vec<String>, output: &mut Vec<String>) {
+    if buffer.is_empty() {
+        return;
+    }
+
+    let normalized = normalize_table_block(buffer);
+    output.extend(normalized);
+    buffer.clear();
+}
+
+fn is_tableish_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let normalized = normalize_delimiters(trimmed);
+    let delimiter_count = normalized.matches('|').count();
+    if delimiter_count < 2 {
+        return false;
+    }
+
+    let cell_count = normalized
+        .trim_matches('|')
+        .split('|')
+        .filter(|cell| !cell.trim().is_empty())
+        .count();
+
+    cell_count >= 2
+}
+
+fn normalize_delimiters(line: &str) -> String {
+    let mut normalized = line.replace('+', "|");
+    // Treat adjacent pipes as a single delimiter to be forgiving.
+    while normalized.contains("||") {
+        normalized = normalized.replace("||", "|");
+    }
+    normalized
+}
+
+fn is_border_only_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|ch| ch == '+' || ch == '|' || ch == '-' || ch == '=')
+}
+
+fn is_separator_cells(cells: &[String]) -> bool {
+    cells.iter().all(|cell| {
+        cell.trim()
+            .chars()
+            .all(|ch| ch == '-' || ch == ':' || ch.is_whitespace())
+    })
+}
+
+fn normalize_alignment_cell(cell: &str) -> String {
+    let trimmed = cell.trim();
+    let left = trimmed.starts_with(':');
+    let right = trimmed.ends_with(':');
+    let dash_count = trimmed.chars().filter(|ch| *ch == '-').count();
+    let count = dash_count.max(3);
+
+    format!(
+        "{}{}{}",
+        if left { ":" } else { "" },
+        "-".repeat(count),
+        if right { ":" } else { "" }
+    )
+}
+
+fn normalize_table_block(lines: &[String]) -> Vec<String> {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+
+    for line in lines {
+        if is_border_only_line(line) {
+            continue;
+        }
+
+        let replaced = normalize_delimiters(line);
+        let trimmed = replaced.trim_matches('|');
+        let cells: Vec<String> = trimmed.split('|').map(|cell| cell.trim().to_string()).collect();
+
+        if cells.iter().all(|cell| cell.is_empty()) {
+            continue;
+        }
+
+        rows.push(cells);
+    }
+
+    if rows.is_empty() {
+        return lines.to_vec();
+    }
+
+    let column_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if column_count < 2 {
+        return lines.to_vec();
+    }
+
+    for row in rows.iter_mut() {
+        if row.len() < column_count {
+            row.resize(column_count, String::new());
+        }
+    }
+
+    let mut normalized: Vec<String> = Vec::new();
+
+    normalized.push(format!("| {} |", rows[0].join(" | ")));
+
+    let (alignment_row, data_start_idx) = if rows.len() > 1 && is_separator_cells(&rows[1]) {
+        (Some(rows[1].clone()), 2usize)
+    } else {
+        (None, 1usize)
+    };
+
+    let separator_cells = match alignment_row {
+        Some(cells) => cells
+            .iter()
+            .map(|cell| normalize_alignment_cell(cell))
+            .collect::<Vec<String>>(),
+        None => (0..column_count).map(|_| String::from("---")).collect(),
+    };
+
+    normalized.push(format!("| {} |", separator_cells.join(" | ")));
+
+    for row in rows.into_iter().skip(data_start_idx) {
+        normalized.push(format!("| {} |", row.join(" | ")));
+    }
+
+    normalized
+}
+
+#[derive(Default)]
+struct TableState {
+    alignments: Vec<Alignment>,
+    header_rows: Vec<Vec<Vec<Span<'static>>>>,
+    body_rows: Vec<Vec<Vec<Span<'static>>>>,
+    current_row: Vec<Vec<Span<'static>>>,
+    current_cell: Vec<Span<'static>>,
+    in_header: bool,
+}
+
+impl TableState {
+    fn new(alignments: Vec<Alignment>) -> Self {
+        Self {
+            alignments,
+            ..Self::default()
+        }
+    }
+
+    fn start_head(&mut self) {
+        self.in_header = true;
+    }
+
+    fn end_head(&mut self) {
+        self.finish_row();
+        self.in_header = false;
+    }
+
+    fn start_row(&mut self) {
+        self.current_cell.clear();
+        self.current_row.clear();
+    }
+
+    fn finish_row(&mut self) {
+        if !self.current_cell.is_empty() {
+            self.finish_cell();
+        }
+
+        if self.current_row.is_empty() {
+            return;
+        }
+
+        if self.in_header {
+            for cell in self.current_row.iter_mut() {
+                for span in cell.iter_mut() {
+                    span.style = span.style.add_modifier(Modifier::BOLD);
+                }
+            }
+            self.header_rows.push(std::mem::take(&mut self.current_row));
+        } else {
+            self.body_rows.push(std::mem::take(&mut self.current_row));
+        }
+    }
+
+    fn start_cell(&mut self) {
+        self.current_cell.clear();
+    }
+
+    fn finish_cell(&mut self) {
+        self.current_row
+            .push(std::mem::take(&mut self.current_cell));
+    }
+
+    fn push_span(&mut self, span: Span<'static>) {
+        self.current_cell.push(span);
+    }
+
+    fn column_count(&self) -> usize {
+        let header_columns = self
+            .header_rows
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
+        let body_columns = self.body_rows.iter().map(Vec::len).max().unwrap_or(0);
+        header_columns.max(body_columns)
+    }
+}
+
+fn compute_column_widths(table: &TableState, max_table_width: usize) -> Vec<usize> {
+    let column_count = table.column_count();
+    if column_count == 0 || max_table_width == 0 {
+        return Vec::new();
+    }
+
+    let mut column_widths = vec![1usize; column_count];
+    for row in table
+        .header_rows
+        .iter()
+        .chain(table.body_rows.iter())
+    {
+        for (idx, cell) in row.iter().enumerate() {
+            column_widths[idx] = column_widths[idx].max(spans_width(cell));
+        }
+    }
+
+    let minimum_table_width = 4usize.saturating_mul(column_count).saturating_add(1);
+    if max_table_width < minimum_table_width {
+        return vec![1; column_count];
+    }
+
+    let max_content_width = max_table_width
+        .saturating_sub(3usize.saturating_mul(column_count).saturating_add(1));
+    if max_content_width == 0 {
+        return vec![1; column_count];
+    }
+    let total_content_width: usize = column_widths.iter().sum();
+
+    if total_content_width <= max_content_width {
+        return column_widths;
+    }
+
+    distribute_column_widths(column_widths, max_content_width)
+}
+
+fn distribute_column_widths(column_widths: Vec<usize>, max_total_content: usize) -> Vec<usize> {
+    if column_widths.is_empty() {
+        return column_widths;
+    }
+    if max_total_content == 0 {
+        return vec![1; column_widths.len()];
+    }
+
+    let base_widths: Vec<usize> = column_widths
+        .into_iter()
+        .map(|width| width.max(1))
+        .collect();
+    let total: usize = base_widths.iter().sum();
+
+    if total == 0 || total <= max_total_content {
+        return base_widths;
+    }
+
+    let total_f = total as f64;
+    let limit_f = max_total_content as f64;
+
+    let mut scaled_widths: Vec<usize> = base_widths
+        .iter()
+        .map(|width| {
+            let scaled = (*width as f64) * limit_f / total_f;
+            scaled.floor() as usize
+        })
+        .map(|width| width.max(1))
+        .collect();
+
+    let mut remainders: Vec<(usize, f64)> = base_widths
+        .iter()
+        .enumerate()
+        .map(|(idx, width)| {
+            let scaled = (*width as f64) * limit_f / total_f;
+            let floored = scaled.floor().max(1.0);
+            (idx, scaled - floored)
+        })
+        .collect();
+
+    let mut remaining = max_total_content.saturating_sub(scaled_widths.iter().sum());
+
+    remainders.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut remainder_idx = 0usize;
+    while remaining > 0 && !remainders.is_empty() {
+        let (idx, _) = remainders[remainder_idx];
+        scaled_widths[idx] = scaled_widths[idx].saturating_add(1);
+        remaining = remaining.saturating_sub(1);
+        remainder_idx = (remainder_idx + 1) % remainders.len();
+    }
+
+    scaled_widths
+}
+
+fn wrap_cell_spans(spans: &[Span<'static>], max_width: usize) -> Vec<Vec<Span<'static>>> {
+    if max_width == 0 {
+        return vec![Vec::new()];
+    }
+
+    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut current_line: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0usize;
+
+    for span in spans {
+        let mut remaining = span.content.to_string();
+        let style = span.style;
+
+        while !remaining.is_empty() {
+            let available = max_width.saturating_sub(current_width.min(max_width));
+            if available == 0 {
+                lines.push(std::mem::take(&mut current_line));
+                current_width = 0;
+                continue;
+            }
+
+            let (fit, rest) = split_content_at_width(&remaining, available);
+
+            if !fit.is_empty() {
+                current_width = current_width
+                    .saturating_add(display_width(&fit))
+                    .min(max_width);
+                current_line.push(Span::styled(fit, style));
+            }
+
+            remaining = rest;
+
+            if !remaining.is_empty() {
+                lines.push(std::mem::take(&mut current_line));
+                current_width = 0;
+            }
+        }
+    }
+
+    if current_line.is_empty() {
+        if lines.is_empty() {
+            lines.push(Vec::new());
+        }
+    } else {
+        lines.push(current_line);
+    }
+
+    lines
+}
+
+fn wrap_row_cells(
+    row: &[Vec<Span<'static>>],
+    column_widths: &[usize],
+) -> Vec<Vec<Vec<Span<'static>>>> {
+    column_widths
+        .iter()
+        .enumerate()
+        .map(|(idx, width)| {
+            let cell = row
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| vec![Span::raw("")]);
+            wrap_cell_spans(&cell, *width)
+        })
+        .collect()
+}
+
+fn render_table_rows(
+    rows: &[Vec<Vec<Span<'static>>>],
+    alignments: &[Alignment],
+    column_widths: &[usize],
+    border_style: Style,
+    lines: &mut Vec<Line<'static>>,
+) {
+    for row in rows {
+        let wrapped_cells = wrap_row_cells(row, column_widths);
+        let row_height = wrapped_cells
+            .iter()
+            .map(|cell_lines| cell_lines.len())
+            .max()
+            .unwrap_or(1);
+
+        for line_idx in 0..row_height {
+            let mut spans = vec![Span::styled("│", border_style)];
+
+            for (col_idx, col_width) in column_widths.iter().enumerate() {
+                let line_spans = wrapped_cells
+                    .get(col_idx)
+                    .and_then(|cell| cell.get(line_idx))
+                    .cloned()
+                    .unwrap_or_else(Vec::new);
+                let alignment = alignments
+                    .get(col_idx)
+                    .copied()
+                    .unwrap_or(Alignment::Left);
+                let content_width = spans_width(&line_spans).min(*col_width);
+                let remaining = col_width.saturating_sub(content_width);
+                let (left_pad, right_pad) = match alignment {
+                    Alignment::Right => (remaining, 0),
+                    Alignment::Center => {
+                        let half = remaining / 2;
+                        (half, remaining.saturating_sub(half))
+                    }
+                    _ => (0, remaining),
+                };
+
+                spans.push(Span::raw(" ".repeat(left_pad.saturating_add(1))));
+                spans.extend(line_spans);
+                spans.push(Span::raw(" ".repeat(right_pad.saturating_add(1))));
+                spans.push(Span::styled("│", border_style));
+            }
+
+            lines.push(Line::from(spans));
+        }
+    }
+}
+
+fn render_table(table: TableState, max_width: usize) -> Vec<Line<'static>> {
+    let column_count = table.column_count();
+    if column_count == 0 {
+        return Vec::new();
+    }
+
+    let column_widths = compute_column_widths(&table, max_width);
+    if column_widths.is_empty() {
+        return Vec::new();
+    }
+
+    let border_style = Style::default().fg(colors::MUTED);
+    let mut lines = Vec::new();
+
+    lines.push(render_separator(
+        &column_widths,
+        border_style,
+        '┌',
+        '┬',
+        '┐',
+    ));
+
+    render_table_rows(
+        &table.header_rows,
+        &table.alignments,
+        &column_widths,
+        border_style,
+        &mut lines,
+    );
+
+    if !table.header_rows.is_empty() && !table.body_rows.is_empty() {
+        lines.push(render_separator(
+            &column_widths,
+            border_style,
+            '├',
+            '┼',
+            '┤',
+        ));
+    } else if !table.header_rows.is_empty() {
+        lines.push(render_separator(
+            &column_widths,
+            border_style,
+            '├',
+            '┴',
+            '┤',
+        ));
+    }
+
+    for (row_idx, row) in table.body_rows.iter().enumerate() {
+        render_table_rows(
+            std::slice::from_ref(row),
+            &table.alignments,
+            &column_widths,
+            border_style,
+            &mut lines,
+        );
+
+        if row_idx + 1 < table.body_rows.len() {
+            lines.push(render_separator(
+                &column_widths,
+                border_style,
+                '├',
+                '┼',
+                '┤',
+            ));
+        }
+    }
+
+    lines.push(render_separator(
+        &column_widths,
+        border_style,
+        '└',
+        '┴',
+        '┘',
+    ));
+
+    lines
+}
+
+fn render_separator(
+    column_widths: &[usize],
+    border_style: Style,
+    left: char,
+    middle: char,
+    right: char,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    spans.push(Span::styled(left.to_string(), border_style));
+
+    for (idx, width) in column_widths.iter().enumerate() {
+        let cell_width = width.saturating_add(2);
+        spans.push(Span::styled("─".repeat(cell_width), border_style));
+
+        if idx + 1 == column_widths.len() {
+            spans.push(Span::styled(right.to_string(), border_style));
+        } else {
+            spans.push(Span::styled(middle.to_string(), border_style));
+        }
+    }
+
+    Line::from(spans)
+}
+
 /// Render markdown content to styled lines.
-fn render_markdown(content: &str) -> Vec<Line<'static>> {
-    let parser = Parser::new(content);
+fn render_markdown(content: &str, max_table_width: usize) -> Vec<Line<'static>> {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+
+    let preprocessed = preprocess_markdown_tables(content);
+    let parser = Parser::new_ext(&preprocessed, options);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
 
@@ -319,11 +883,33 @@ fn render_markdown(content: &str) -> Vec<Line<'static>> {
     let mut in_code_block = false;
     let mut heading_level: Option<u8> = None;
     let mut list_depth: usize = 0;
+    let mut table_state: Option<TableState> = None;
 
     for event in parser {
         match event {
             Event::Start(tag) => {
                 match tag {
+                    Tag::Table(alignments) => {
+                        if !current_spans.is_empty() {
+                            lines.push(Line::from(std::mem::take(&mut current_spans)));
+                        }
+                        table_state = Some(TableState::new(alignments));
+                    }
+                    Tag::TableHead => {
+                        if let Some(table) = table_state.as_mut() {
+                            table.start_head();
+                        }
+                    }
+                    Tag::TableRow => {
+                        if let Some(table) = table_state.as_mut() {
+                            table.start_row();
+                        }
+                    }
+                    Tag::TableCell => {
+                        if let Some(table) = table_state.as_mut() {
+                            table.start_cell();
+                        }
+                    }
                     Tag::Heading { level, .. } => {
                         heading_level = Some(level as u8);
                     }
@@ -386,6 +972,27 @@ fn render_markdown(content: &str) -> Vec<Line<'static>> {
                             lines.push(Line::from(std::mem::take(&mut current_spans)));
                         }
                     }
+                    TagEnd::TableHead => {
+                        if let Some(table) = table_state.as_mut() {
+                            table.end_head();
+                        }
+                    }
+                    TagEnd::TableRow => {
+                        if let Some(table) = table_state.as_mut() {
+                            table.finish_row();
+                        }
+                    }
+                    TagEnd::TableCell => {
+                        if let Some(table) = table_state.as_mut() {
+                            table.finish_cell();
+                        }
+                    }
+                    TagEnd::Table => {
+                        if let Some(table) = table_state.take() {
+                            lines.extend(render_table(table, max_table_width));
+                            lines.push(Line::from(""));
+                        }
+                    }
                     TagEnd::CodeBlock => {
                         in_code_block = false;
                     }
@@ -417,6 +1024,24 @@ fn render_markdown(content: &str) -> Vec<Line<'static>> {
             Event::Text(text) => {
                 let text_str = text.to_string();
 
+                if let Some(table) = table_state.as_mut() {
+                    if in_code_block {
+                        for (line_idx, line) in text_str.lines().enumerate() {
+                            if line_idx > 0 {
+                                table.push_span(Span::raw(" "));
+                            }
+                            table.push_span(Span::styled(
+                                line.to_string(),
+                                Style::default().bg(colors::SURFACE).fg(colors::FOREGROUND),
+                            ));
+                        }
+                    } else {
+                        let style = build_text_style(bold, italic, heading_level);
+                        table.push_span(Span::styled(text_str, style));
+                    }
+                    continue;
+                }
+
                 if in_code_block {
                     // Render code block lines with background
                     for line in text_str.lines() {
@@ -431,6 +1056,14 @@ fn render_markdown(content: &str) -> Vec<Line<'static>> {
                 }
             }
             Event::Code(code) => {
+                if let Some(table) = table_state.as_mut() {
+                    table.push_span(Span::styled(
+                        format!("`{}`", code),
+                        Style::default().bg(colors::SURFACE).fg(colors::FOREGROUND),
+                    ));
+                    continue;
+                }
+
                 // Inline code
                 current_spans.push(Span::styled(
                     format!("`{}`", code),
@@ -438,9 +1071,19 @@ fn render_markdown(content: &str) -> Vec<Line<'static>> {
                 ));
             }
             Event::SoftBreak => {
+                if let Some(table) = table_state.as_mut() {
+                    table.push_span(Span::raw(" "));
+                    continue;
+                }
+
                 current_spans.push(Span::raw(" "));
             }
             Event::HardBreak => {
+                if let Some(table) = table_state.as_mut() {
+                    table.push_span(Span::raw(" "));
+                    continue;
+                }
+
                 if !current_spans.is_empty() {
                     lines.push(Line::from(std::mem::take(&mut current_spans)));
                 }
