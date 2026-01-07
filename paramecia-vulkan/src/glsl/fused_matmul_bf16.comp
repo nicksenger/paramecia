@@ -1,0 +1,121 @@
+// Fused BF16 Matmul + Perturbation - GLSL/SPIR-V version
+//
+// Computes: C[m,n] = A[m,k] * (B_bf16[n,k] + epsilon * z[n,k])^T
+// Where B is stored as BF16 and z is generated on-the-fly via Philox RNG.
+//
+// BF16 layout: each weight is 2 bytes (uint16), stored row-major [n, k].
+// Dequantize: shift left 16 to form IEEE754 f32, then add perturbation.
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "philox.comp"
+
+#define WARP_SIZE 32
+#define NWARPS 4
+
+layout(local_size_x = WARP_SIZE, local_size_y = NWARPS, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint params[12];
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+#define op_seed_lo    params[7]
+#define op_seed_hi    params[8]
+#define op_epsilon_bits params[9]
+#define op_tid_lo     params[10]
+#define op_tid_hi     params[11]
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputA {
+    float v_input_a[];
+};
+
+// BF16 weights stored as packed u32 (2 bf16 per u32)
+layout(set = 0, binding = 2, std430) readonly buffer InputB {
+    uint v_input_b[];
+};
+
+// Convert bf16 (stored in low 16 bits of uint) to float
+float bf16_to_float(uint bf16_bits) {
+    return uintBitsToFloat(bf16_bits << 16);
+}
+
+float warp_reduce_sum(float v) {
+    v += subgroupShuffleXor(v, 16);
+    v += subgroupShuffleXor(v, 8);
+    v += subgroupShuffleXor(v, 4);
+    v += subgroupShuffleXor(v, 2);
+    v += subgroupShuffleXor(v, 1);
+    return v;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint warp = gl_LocalInvocationID.y;
+    uint wg_x = gl_WorkGroupID.x;
+    uint wg_y = gl_WorkGroupID.y;
+    uint batch = gl_WorkGroupID.z;
+
+    uint out_n = wg_x * NWARPS + warp;
+    uint out_m = wg_y;
+
+    if (out_n >= op_n || out_m >= op_m) return;
+
+    uint a_offset = op_a_offset + batch * op_a_stride_b + out_m * op_a_stride_m;
+
+    // BF16 weight row: out_n * k elements, each 2 bytes
+    uint b_byte_offset = out_n * op_k * 2;
+
+    uvec2 effective_seed = uvec2(op_seed_lo ^ op_tid_lo, op_seed_hi ^ op_tid_hi);
+    float epsilon = uintBitsToFloat(op_epsilon_bits);
+
+    float acc = 0.0;
+
+    // Each lane processes elements lane, lane+32, lane+64, ...
+    for (uint col = lane; col < op_k; col += WARP_SIZE) {
+        // Load BF16 weight
+        uint byte_pos = b_byte_offset + col * 2;
+        uint word_idx = byte_pos / 4;
+        uint word = v_input_b[word_idx];
+
+        float w;
+        if ((byte_pos % 4) == 0) {
+            w = bf16_to_float(word & 0xFFFFu);
+        } else {
+            w = bf16_to_float(word >> 16);
+        }
+
+        // Add perturbation
+        uint weight_idx = out_n * op_k + col;
+        float z = philox_gaussian(effective_seed, weight_idx);
+        w += epsilon * z;
+
+        // Load activation
+        float a = v_input_a[a_offset + col * op_a_stride_k];
+        acc += w * a;
+    }
+
+    float sum = warp_reduce_sum(acc);
+
+    if (lane == 0) {
+        uint out_idx = batch * op_m * op_n + out_m * op_n + out_n;
+        v_dest[out_idx] = sum;
+    }
+}

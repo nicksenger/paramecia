@@ -1,0 +1,184 @@
+// Q5_K Matrix-Vector Multiplication - Cooperative with shared activation loading
+//
+// Dispatch: [ceil(n / NUM_ROWS), batch, 1]
+// Workgroup: 32 (x) × NUM_ROWS (y)
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(constant_id = 0) const uint NUM_ROWS = 2;
+
+#define Q5_K_K 256
+#define Q5_K_K_BYTES 176
+#define NUM_SCALES 8
+#define WARP_SIZE 32
+
+layout(local_size_x = WARP_SIZE, local_size_y_id = 0, local_size_z = 1) in;
+
+shared float shared_d_scaled[NUM_ROWS][NUM_SCALES];
+shared float shared_m_scaled[NUM_ROWS][NUM_SCALES];
+shared float shared_a[Q5_K_K];
+
+layout(push_constant) uniform PushConstants {
+    uint params[8];
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf { float v_dest[]; };
+layout(set = 0, binding = 1, std430) readonly buffer InputA { float v_input_a[]; };
+layout(set = 0, binding = 2, std430) readonly buffer InputB { uint v_input_b[]; };
+
+#include "dequant_helpers.glsl"
+
+void get_q5k_scale_min(uint block_byte, uint is, out float d_scaled, out float m_scaled) {
+    float d = load_f16(block_byte + 0);
+    float dmin = load_f16(block_byte + 2);
+
+    uint sc_offset = block_byte + 4;
+    uint b0 = load_byte(sc_offset + 0);
+    uint b1 = load_byte(sc_offset + 1);
+    uint b2 = load_byte(sc_offset + 2);
+    uint b3 = load_byte(sc_offset + 3);
+    uint b4 = load_byte(sc_offset + 4);
+    uint b5 = load_byte(sc_offset + 5);
+    uint b6 = load_byte(sc_offset + 6);
+    uint b7 = load_byte(sc_offset + 7);
+    uint b8 = load_byte(sc_offset + 8);
+    uint b9 = load_byte(sc_offset + 9);
+    uint b10 = load_byte(sc_offset + 10);
+    uint b11 = load_byte(sc_offset + 11);
+
+    uint sc, mn;
+    if (is < 4) {
+        uint[4] b_lo = uint[](b0, b1, b2, b3);
+        uint[4] b_hi = uint[](b4, b5, b6, b7);
+        sc = b_lo[is] & 0x3F;
+        mn = b_hi[is] & 0x3F;
+    } else {
+        uint[4] b_hi2 = uint[](b8, b9, b10, b11);
+        uint[4] b_lo = uint[](b0, b1, b2, b3);
+        uint[4] b_mid = uint[](b4, b5, b6, b7);
+        uint idx = is - 4;
+        uint q_is4 = b_hi2[idx];
+        uint q_is4n = b_lo[idx];
+        uint q_is = b_mid[idx];
+        sc = (q_is4 & 0xF) | (((q_is4n >> 6) & 0x3) << 4);
+        mn = ((q_is4 >> 4) & 0xF) | (((q_is >> 6) & 0x3) << 4);
+    }
+
+    d_scaled = d * float(sc);
+    m_scaled = dmin * float(mn);
+}
+
+uint load_q5_value(uint block_byte, uint off) {
+    uint l = off % 32;
+    uint group = off / 32;
+    bool is_upper_nibble = (group % 2) == 1;
+    uint qs_idx = (group / 2) * 32 + l;
+    uint qh_idx = l;
+    uint qh_mask = 1u << group;
+
+    uint qs_byte = load_byte(block_byte + 48 + qs_idx);
+    uint qh_byte = load_byte(block_byte + 16 + qh_idx);
+
+    uint q_nibble = is_upper_nibble ? (qs_byte >> 4) : (qs_byte & 0xF);
+    uint q_high_bit = ((qh_byte & qh_mask) != 0) ? 16u : 0u;
+    return q_nibble + q_high_bit;
+}
+
+vec2 dequantize_q5_vec2(uint block_byte, uint elem_idx0,
+                        float cached_d_scaled[NUM_SCALES],
+                        float cached_m_scaled[NUM_SCALES]) {
+    uint q0 = load_q5_value(block_byte, elem_idx0);
+    uint q1 = load_q5_value(block_byte, elem_idx0 + 1);
+
+    uint group0 = elem_idx0 / 32;
+    uint group1 = (elem_idx0 + 1) / 32;
+
+    return vec2(
+        cached_d_scaled[group0] * float(q0) - cached_m_scaled[group0],
+        cached_d_scaled[group1] * float(q1) - cached_m_scaled[group1]
+    );
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint row_in_wg = gl_LocalInvocationID.y;
+    uint flat_tid = gl_LocalInvocationIndex;
+    uint out_n = gl_WorkGroupID.x * NUM_ROWS + row_in_wg;
+    uint batch = gl_WorkGroupID.y;
+
+    if (out_n >= op_n) return;
+
+    uint a_offset = op_a_offset + batch * op_a_stride_b;
+    uint num_blocks = (op_k + Q5_K_K - 1) / Q5_K_K;
+    uint weight_row_start = out_n * num_blocks * Q5_K_K_BYTES;
+    uint total_threads = WARP_SIZE * NUM_ROWS;
+
+    float sum = 0.0;
+
+    for (uint blk = 0; blk < num_blocks; blk++) {
+        uint k_start = blk * Q5_K_K;
+        uint block_byte = weight_row_start + blk * Q5_K_K_BYTES;
+
+        // Cooperative activation load
+        for (uint i = flat_tid; i < Q5_K_K; i += total_threads) {
+            uint k_idx = k_start + i;
+            shared_a[i] = (k_idx < op_k) ? v_input_a[a_offset + k_idx * op_a_stride_k] : 0.0;
+        }
+        barrier();
+
+        if (lane < NUM_SCALES) {
+            float d_scaled, m_scaled;
+            get_q5k_scale_min(block_byte, lane, d_scaled, m_scaled);
+            shared_d_scaled[row_in_wg][lane] = d_scaled;
+            shared_m_scaled[row_in_wg][lane] = m_scaled;
+        }
+        subgroupBarrier();
+
+        float cached_d_scaled[NUM_SCALES];
+        float cached_m_scaled[NUM_SCALES];
+        for (uint s = 0; s < NUM_SCALES; s++) {
+            cached_d_scaled[s] = shared_d_scaled[row_in_wg][s];
+            cached_m_scaled[s] = shared_m_scaled[row_in_wg][s];
+        }
+
+        for (uint i = 0; i < 8; i += 2) {
+            uint elem_idx0 = lane * 8 + i;
+            uint k0 = k_start + elem_idx0;
+
+            if (k0 + 1 < op_k) {
+                vec2 weights = dequantize_q5_vec2(block_byte, elem_idx0,
+                                                  cached_d_scaled, cached_m_scaled);
+                vec2 a_vals = vec2(shared_a[elem_idx0], shared_a[elem_idx0 + 1]);
+                sum = fma(weights.x, a_vals.x, sum);
+                sum = fma(weights.y, a_vals.y, sum);
+            } else if (k0 < op_k) {
+                uint q = load_q5_value(block_byte, elem_idx0);
+                uint group = elem_idx0 / 32;
+                float weight = cached_d_scaled[group] * float(q) - cached_m_scaled[group];
+                sum += weight * shared_a[elem_idx0];
+            }
+        }
+
+        barrier();
+    }
+
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) {
+        v_dest[batch * op_n + out_n] = sum;
+    }
+}

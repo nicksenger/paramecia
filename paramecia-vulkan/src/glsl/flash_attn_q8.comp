@@ -1,0 +1,546 @@
+// Flash Attention with Q8_0 quantized K/V cache - GLSL/SPIR-V version
+//
+// Compile with: glslc -fshader-stage=compute -O flash_attn_q8.comp -o flash_attn_q8.spv
+// Or for specific head dims:
+//   glslc -DHEAD_DIM=64 -fshader-stage=compute -O flash_attn_q8.comp -o flash_attn_q8_d64.spv
+//   glslc -DHEAD_DIM=128 -fshader-stage=compute -O flash_attn_q8.comp -o flash_attn_q8_d128.spv
+//   glslc -DHEAD_DIM=256 -fshader-stage=compute -O flash_attn_q8.comp -o flash_attn_q8_d256.spv
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#ifdef USE_INTEGER_DOT
+#extension GL_EXT_integer_dot_product : require
+#endif
+
+// Default head dimension, override with -DHEAD_DIM=N
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+
+// Constants
+#define WARP_SIZE 32
+#define NWARPS 4
+#define QK8_0 32
+#define QI8_0 8
+
+// Explicit 32-lane reductions using shuffle XOR
+// These work correctly regardless of the actual subgroup size because
+// XOR with masks <= 16 stays within 32-lane boundaries
+float warp_reduce_sum_32(float v) {
+    v += subgroupShuffleXor(v, 16);
+    v += subgroupShuffleXor(v, 8);
+    v += subgroupShuffleXor(v, 4);
+    v += subgroupShuffleXor(v, 2);
+    v += subgroupShuffleXor(v, 1);
+    return v;
+}
+
+float warp_reduce_max_32(float v) {
+    v = max(v, subgroupShuffleXor(v, 16));
+    v = max(v, subgroupShuffleXor(v, 8));
+    v = max(v, subgroupShuffleXor(v, 4));
+    v = max(v, subgroupShuffleXor(v, 2));
+    v = max(v, subgroupShuffleXor(v, 1));
+    return v;
+}
+
+// Derived constants based on head dimension
+#if HEAD_DIM == 64
+    #define INTS_PER_ROW 16
+    #define BLOCKS_PER_ROW 2
+    #define NTHREADS_V 16
+    #define ACC_PER_LANE 2
+#elif HEAD_DIM == 128
+    #define INTS_PER_ROW 32
+    #define BLOCKS_PER_ROW 4
+    #define NTHREADS_V 32
+    #define ACC_PER_LANE 2
+#elif HEAD_DIM == 256
+    #define INTS_PER_ROW 64
+    #define BLOCKS_PER_ROW 8
+    #define NTHREADS_V 32
+    #define ACC_PER_LANE 4
+#else
+    #error "Unsupported HEAD_DIM, must be 64, 128, or 256"
+#endif
+
+layout(local_size_x = WARP_SIZE, local_size_y = NWARPS, local_size_z = 1) in;
+
+// Parameters via push constants (25 x u32 = 100 bytes)
+layout(push_constant) uniform PushConstants {
+    uint params[25];
+    // [0]: scale (as u32 bits)
+    // [1]: batch
+    // [2]: num_heads
+    // [3]: num_kv_heads
+    // [4]: head_dim
+    // [5]: seq_q
+    // [6]: seq_k
+    // [7]: q_offset
+    // [8]: causal (0 or 1)
+    // [9-12]: q_strides (b, seq, h, d)
+    // [13-16]: k_strides (b, seq, h, d) - bytes
+    // [17-20]: v_strides (b, seq, h, d) - bytes
+    // [21-24]: o_strides (b, seq, h, d)
+};
+
+#define op_scale        uintBitsToFloat(params[0])
+#define op_batch        params[1]
+#define op_num_heads    params[2]
+#define op_num_kv_heads params[3]
+#define op_head_dim     params[4]
+#define op_seq_q        params[5]
+#define op_seq_k        params[6]
+#define op_q_offset     params[7]
+#define op_causal       params[8]
+
+#define op_q_stride_b   params[9]
+#define op_q_stride_seq params[10]
+#define op_q_stride_h   params[11]
+#define op_q_stride_d   params[12]
+
+#define op_k_stride_b   params[13]
+#define op_k_stride_seq params[14]
+#define op_k_stride_h   params[15]
+#define op_k_stride_d   params[16]
+
+#define op_v_stride_b   params[17]
+#define op_v_stride_seq params[18]
+#define op_v_stride_h   params[19]
+#define op_v_stride_d   params[20]
+
+#define op_o_stride_b   params[21]
+#define op_o_stride_seq params[22]
+#define op_o_stride_h   params[23]
+#define op_o_stride_d   params[24]
+
+// Output buffer (F16 packed as u32)
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    uint v_dest[];
+};
+
+// Q input (F16 packed as u32)
+layout(set = 0, binding = 1, std430) readonly buffer QBuf {
+    uint v_q[];
+};
+
+// Q8_0 block structure (34 bytes total):
+// - 2 bytes: f16 scale (d)
+// - 32 bytes: int8 values (qs)
+// Using packed16 representation for better access patterns (llama.cpp style)
+struct block_q8_0_packed16 {
+    float16_t d;
+    int16_t qs[16];  // 32 int8s packed as 16 int16s
+};
+
+// K input (Q8_0 quantized blocks)
+layout(set = 0, binding = 2, std430) readonly buffer KBuf {
+    block_q8_0_packed16 k_blocks[];
+};
+
+// V input (Q8_0 quantized blocks)
+layout(set = 0, binding = 3, std430) readonly buffer VBuf {
+    block_q8_0_packed16 v_blocks[];
+};
+
+// Shared memory
+shared int q_q8[INTS_PER_ROW];
+shared float q_d[BLOCKS_PER_ROW];
+shared float tile_max_s;
+shared float tile_sum_s;
+shared float warp_red_s[NWARPS];
+shared float kq_w[NWARPS * WARP_SIZE];
+shared float acc_s[NWARPS][WARP_SIZE][ACC_PER_LANE * 2];
+
+// Helper: unpack f16 from u32
+float unpackHalf2x16_x(uint v) {
+    return unpackHalf2x16(v).x;
+}
+
+float unpackHalf2x16_y(uint v) {
+    return unpackHalf2x16(v).y;
+}
+
+// Helper: load f16 from v_q packed u32 array
+float load_q_f16(uint idx) {
+    uint word_idx = idx / 2;
+    uint word = v_q[word_idx];
+    if ((idx % 2) == 0) {
+        return unpackHalf2x16_x(word);
+    } else {
+        return unpackHalf2x16_y(word);
+    }
+}
+
+// Convert byte offset to block index
+// Storage layout: [seq, batch, head, blocks_per_head]
+// Each head has (head_dim / 32) Q8_0 blocks
+// bytes_per_row = blocks_per_head * 34
+// Total blocks = seq * batch * heads * blocks_per_head
+uint byte_offset_to_block_idx(uint byte_offset) {
+    // Each Q8_0 block is 34 bytes
+    return byte_offset / 34;
+}
+
+// Helper: Load Q8_0 block scale from K buffer
+float load_k_q8_scale(uint block_idx) {
+    return float(k_blocks[block_idx].d);
+}
+
+// Helper: Load 4 i8 values from K buffer using bitfieldExtract
+// iqs is the int8 index within the block (0-31), must be multiple of 4
+ivec4 load_k_q8_4xi8(uint block_idx, uint iqs) {
+    // qs[] is int16[16], so iqs/2 gives us the int16 pair index
+    // Each int16 contains 2 int8s
+    uint qs_idx = iqs / 2;  // 0-15
+    int val0 = int(k_blocks[block_idx].qs[qs_idx]);      // promote int16 -> int32
+    int val1 = int(k_blocks[block_idx].qs[qs_idx + 1]);  // promote int16 -> int32
+
+    // Extract sign-extended int8 values using bitfieldExtract
+    int i0 = bitfieldExtract(val0, 0, 8);   // low byte of val0
+    int i1 = bitfieldExtract(val0, 8, 8);   // high byte of val0
+    int i2 = bitfieldExtract(val1, 0, 8);   // low byte of val1
+    int i3 = bitfieldExtract(val1, 8, 8);   // high byte of val1
+
+    return ivec4(i0, i1, i2, i3);
+}
+
+int load_k_q8_packed_i8x4(uint block_idx, uint iqs) {
+    uint qs_idx = iqs / 2;
+    uint v0 = uint(int(k_blocks[block_idx].qs[qs_idx])) & 0xFFFFu;
+    uint v1 = uint(int(k_blocks[block_idx].qs[qs_idx + 1])) & 0xFFFFu;
+    return int((v0 & 0xFFu) | ((v0 >> 8) << 8) | ((v1 & 0xFFu) << 16) | ((v1 >> 8) << 24));
+}
+
+// Helper: Load Q8_0 block scale from V buffer
+float load_v_q8_scale(uint block_idx) {
+    return float(v_blocks[block_idx].d);
+}
+
+// Helper: Load 4 i8 values from V buffer
+ivec4 load_v_q8_4xi8(uint block_idx, uint iqs) {
+    uint qs_idx = iqs / 2;
+    int val0 = int(v_blocks[block_idx].qs[qs_idx]);      // promote int16 -> int32
+    int val1 = int(v_blocks[block_idx].qs[qs_idx + 1]);  // promote int16 -> int32
+
+    int i0 = bitfieldExtract(val0, 0, 8);   // low byte of val0
+    int i1 = bitfieldExtract(val0, 8, 8);   // high byte of val0
+    int i2 = bitfieldExtract(val1, 0, 8);   // low byte of val1
+    int i3 = bitfieldExtract(val1, 8, 8);   // high byte of val1
+
+    return ivec4(i0, i1, i2, i3);
+}
+
+// Dot product of 4 int8 values (using ivec4)
+int dot4I8(ivec4 a, ivec4 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+}
+
+int dot4I8Packed(int a, int b) {
+#ifdef USE_INTEGER_DOT
+    return dotPacked4x8EXT(a, b);
+#else
+    return 0;
+#endif
+}
+
+// Pack 4 int8 values into a single int (for Q quantization in shared memory)
+int packI8x4(int i0, int i1, int i2, int i3) {
+    return (i0 & 0xFF) | ((i1 & 0xFF) << 8) | ((i2 & 0xFF) << 16) | ((i3 & 0xFF) << 24);
+}
+
+// Unpack int to 4 int8 values
+ivec4 unpackI8x4(int packed) {
+    int i0 = (packed << 24) >> 24;
+    int i1 = (packed << 16) >> 24;
+    int i2 = (packed << 8) >> 24;
+    int i3 = packed >> 24;
+    return ivec4(i0, i1, i2, i3);
+}
+
+void main() {
+    uint ib = gl_WorkGroupID.x;
+    uint ih = gl_WorkGroupID.y;
+    uint iq_seq = gl_WorkGroupID.z;
+
+    uint batch = op_batch;
+    uint num_heads = op_num_heads;
+    uint num_kv_heads = op_num_kv_heads;
+    uint seq_q = op_seq_q;
+    uint seq_k = op_seq_k;
+    float scale = op_scale;
+    bool causal = op_causal != 0;
+    uint q_offset_base = op_q_offset;
+
+    if (ib >= batch || ih >= num_heads || iq_seq >= seq_q) {
+        return;
+    }
+
+    // Thread indexing within workgroup
+    uint lane = gl_LocalInvocationID.x;
+    uint warp = gl_LocalInvocationID.y;
+    uint tid = warp * WARP_SIZE + lane;
+
+    uint kv_head = (num_kv_heads != num_heads) ? (ih * num_kv_heads) / num_heads : ih;
+
+    // Compute Q row pointer
+    uint q_row_offset = ib * op_q_stride_b + iq_seq * op_q_stride_seq + ih * op_q_stride_h;
+
+    // Output row pointer
+    uint out_row_offset = ib * op_o_stride_b + iq_seq * op_o_stride_seq + ih * op_o_stride_h;
+
+    // Quantize Q to Q8_1 in shared memory (scale-only)
+    // Only warp 0 does this
+    if (warp == 0) {
+        uint nthreads_quantize = min(uint(INTS_PER_ROW), uint(WARP_SIZE));
+
+        for (uint i0 = 0; i0 < INTS_PER_ROW; i0 += nthreads_quantize) {
+            float vals[4] = float[4](0.0, 0.0, 0.0, 0.0);  // Initialize to match CUDA
+            if (lane < nthreads_quantize) {
+                uint base = 4 * (i0 + lane);
+                for (uint l = 0; l < 4; l++) {
+                    uint q_idx = q_row_offset + (base + l) * op_q_stride_d;
+                    vals[l] = scale * load_q_f16(q_idx);
+                }
+            }
+
+            // Find max abs in group of 8 lanes (QI8_0 = 8)
+            float amax = abs(vals[0]);
+            amax = max(amax, abs(vals[1]));
+            amax = max(amax, abs(vals[2]));
+            amax = max(amax, abs(vals[3]));
+
+            // Reduce within 8-lane groups using subgroup shuffle
+            amax = max(amax, subgroupShuffleXor(amax, 4));
+            amax = max(amax, subgroupShuffleXor(amax, 2));
+            amax = max(amax, subgroupShuffleXor(amax, 1));
+
+            float d = amax / 127.0;
+            int q32 = 0;
+
+            if (lane < nthreads_quantize) {
+                if (d != 0.0) {
+                    float inv_d = 1.0 / d;
+                    int q0 = int(roundEven(vals[0] * inv_d));
+                    int q1 = int(roundEven(vals[1] * inv_d));
+                    int q2 = int(roundEven(vals[2] * inv_d));
+                    int q3 = int(roundEven(vals[3] * inv_d));
+                    q32 = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+                }
+
+                q_q8[i0 + lane] = q32;
+                if ((lane % QI8_0) == 0) {
+                    q_d[(i0 + lane) / QI8_0] = d;
+                }
+            }
+        }
+    }
+    // Workgroup barrier is sufficient for shared-memory visibility and ordering.
+    barrier();
+
+    // Online softmax state
+    float kq_max = -3.40282e+38;
+    float kq_sum = 0.0;
+
+    // V accumulator
+    float acc[ACC_PER_LANE * 2];
+    for (int i = 0; i < ACC_PER_LANE * 2; i++) {
+        acc[i] = 0.0;
+    }
+
+    uint q_abs = q_offset_base + iq_seq;
+
+    // Process K/V tiles
+    const uint KEYS_PER_TILE = NWARPS * WARP_SIZE;  // 128
+
+    for (uint tile0 = 0; tile0 < seq_k; tile0 += KEYS_PER_TILE) {
+        float score_reg = -3.40282e+38;
+        float warp_max = -3.40282e+38;
+
+        // Each warp processes 32 keys
+        for (uint i_key = 0; i_key < WARP_SIZE; i_key++) {
+            uint k_idx = tile0 + warp * WARP_SIZE + i_key;
+            float score = -3.40282e+38;
+
+            bool key_in_range = k_idx < seq_k;
+            bool key_allowed = !causal || (k_idx <= q_abs);
+
+            if (key_in_range && key_allowed) {
+                // Compute K row byte offset, then convert to block base index
+                // Note: strides are in bytes, and are guaranteed to be multiples of 34 (block size)
+                uint k_row_byte = ib * op_k_stride_b + k_idx * op_k_stride_seq + kv_head * op_k_stride_h;
+                uint k_row_block = k_row_byte / 34;
+
+                // Dot product Q . K using quantized values
+                float sum = 0.0;
+                for (uint k_int_0 = 0; k_int_0 < INTS_PER_ROW; k_int_0 += WARP_SIZE) {
+                    uint k_int = k_int_0 + lane;
+                    if (k_int < INTS_PER_ROW) {
+                        uint iblk = k_int / QI8_0;      // block index within this row (0-3 for HEAD_DIM=128)
+                        uint iqs_group = k_int % QI8_0;  // group of 4 int8s within block (0-7)
+                        uint iqs = iqs_group * 4;        // int8 index within block (0,4,8,...,28)
+
+                        // Load K block using structured access
+                        uint k_block_idx = k_row_block + iblk;
+                        float k_scale = load_k_q8_scale(k_block_idx);
+#ifdef USE_INTEGER_DOT
+                        int k_packed = load_k_q8_packed_i8x4(k_block_idx, iqs);
+#else
+                        ivec4 k_vals = load_k_q8_4xi8(k_block_idx, iqs);
+#endif
+
+                        // Load Q from shared memory (packed int8)
+                        int q_packed = q_q8[k_int];
+                        float q_scale = q_d[iblk];
+
+                        // Dot product of 4 int8 values
+#ifdef USE_INTEGER_DOT
+                        int dp = dot4I8Packed(k_packed, q_packed);
+#else
+                        ivec4 q_vals = unpackI8x4(q_packed);
+                        int dp = dot4I8(k_vals, q_vals);
+#endif
+                        sum += (k_scale * q_scale) * float(dp);
+                    }
+                }
+
+                // Explicit 32-lane reduction for sum (works regardless of subgroup size)
+                sum = warp_reduce_sum_32(sum);
+                score = sum;
+            }
+
+            warp_max = max(warp_max, score);
+            // Use lane (gl_LocalInvocationID.x) for score assignment, matching CUDA
+            if (lane == i_key) {
+                score_reg = score;
+            }
+        }
+
+        // Reduce max across warp (explicit 32-lane reduction)
+        warp_max = warp_reduce_max_32(warp_max);
+        if (lane == 0) {
+            warp_red_s[warp] = warp_max;
+        }
+        barrier();
+
+        // Global tile max
+        if (warp == 0 && lane == 0) {
+            float tm = warp_red_s[0];
+            tm = max(tm, warp_red_s[1]);
+            tm = max(tm, warp_red_s[2]);
+            tm = max(tm, warp_red_s[3]);
+            tile_max_s = tm;
+        }
+        barrier();
+
+        // Update running max and rescale
+        float kq_max_new = max(kq_max, tile_max_s);
+        float kq_scale_old = (kq_max > -3.0e+38) ? exp(kq_max - kq_max_new) : 0.0;
+
+        kq_sum *= kq_scale_old;
+        for (int i = 0; i < ACC_PER_LANE * 2; i++) {
+            acc[i] *= kq_scale_old;
+        }
+        kq_max = kq_max_new;
+
+        // Compute exp(score - max) for this thread's key
+        float w = (score_reg > -3.0e+38) ? exp(score_reg - kq_max) : 0.0;
+        kq_w[tid] = w;
+
+        // Sum reduction (explicit 32-lane reduction)
+        float warp_sum = warp_reduce_sum_32(w);
+        if (lane == 0) {
+            warp_red_s[warp] = warp_sum;
+        }
+        barrier();
+
+        if (warp == 0 && lane == 0) {
+            tile_sum_s = warp_red_s[0] + warp_red_s[1] + warp_red_s[2] + warp_red_s[3];
+        }
+        barrier();
+
+        kq_sum += tile_sum_s;
+
+        // Accumulate V weighted by attention weights
+        for (uint k0 = 0; k0 < WARP_SIZE; k0++) {
+            uint k_idx = tile0 + warp * WARP_SIZE + k0;
+            float wk = kq_w[warp * WARP_SIZE + k0];
+
+            if (wk == 0.0 || k_idx >= seq_k) {
+                continue;
+            }
+
+            // V row byte offset, converted to block base index
+            uint v_row_byte = ib * op_v_stride_b + k_idx * op_v_stride_seq + kv_head * op_v_stride_h;
+            uint v_row_block = v_row_byte / 34;
+
+            if (lane < NTHREADS_V) {
+                for (uint base_el = 0; base_el < HEAD_DIM; base_el += NTHREADS_V * 4) {
+                    uint i_el = base_el + lane * 4;
+                    uint iblk = i_el / QK8_0;       // block index within row
+                    uint iqs = i_el % QK8_0;        // int8 index within block (0,4,8,...,28)
+
+                    // Load V using structured access
+                    uint v_block_idx = v_row_block + iblk;
+                    float v_scale = load_v_q8_scale(v_block_idx);
+                    ivec4 v_vals = load_v_q8_4xi8(v_block_idx, iqs);
+
+                    // Dequantize
+                    float v0 = v_scale * float(v_vals.x);
+                    float v1 = v_scale * float(v_vals.y);
+                    float v2 = v_scale * float(v_vals.z);
+                    float v3 = v_scale * float(v_vals.w);
+
+                    uint out_i0 = base_el / (NTHREADS_V * 2);
+                    acc[out_i0 * 2 + 0] += wk * v0;
+                    acc[out_i0 * 2 + 1] += wk * v1;
+                    acc[(out_i0 + 1) * 2 + 0] += wk * v2;
+                    acc[(out_i0 + 1) * 2 + 1] += wk * v3;
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Store warp accumulators to shared and reduce
+    for (int i = 0; i < ACC_PER_LANE * 2; i++) {
+        acc_s[warp][lane][i] = acc[i];
+    }
+    barrier();
+
+    // Warp 0 reduces and writes output
+    if (warp == 0) {
+        float inv_sum = (kq_sum > 0.0) ? 1.0 / kq_sum : 0.0;
+
+        if (lane < NTHREADS_V) {
+            for (uint i = 0; i < ACC_PER_LANE; i++) {
+                float sx = acc_s[0][lane][i * 2];
+                float sy = acc_s[0][lane][i * 2 + 1];
+                sx += acc_s[1][lane][i * 2];
+                sy += acc_s[1][lane][i * 2 + 1];
+                sx += acc_s[2][lane][i * 2];
+                sy += acc_s[2][lane][i * 2 + 1];
+                sx += acc_s[3][lane][i * 2];
+                sy += acc_s[3][lane][i * 2 + 1];
+
+                sx *= inv_sum;
+                sy *= inv_sum;
+
+                uint base_el = (i / 2) * (NTHREADS_V * 4) + lane * 4 + (i % 2) * 2;
+                uint out_idx0 = out_row_offset + base_el * op_o_stride_d;
+
+                // Pack and store f16
+                uint packed = packHalf2x16(vec2(sx, sy));
+                uint word_idx = out_idx0 / 2;
+                v_dest[word_idx] = packed;
+            }
+        }
+    }
+}

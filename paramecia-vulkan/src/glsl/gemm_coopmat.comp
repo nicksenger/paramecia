@@ -1,0 +1,167 @@
+// Tiled GEMM with Cooperative Matrix: C = alpha * A * B + beta * C
+//
+// Uses VK_KHR_cooperative_matrix (Tensor Cores / WMMA / XMX) for acceleration
+//
+// Tile sizes are provided via specialization constants and must match
+// hardware capabilities queried from VkPhysicalDevice.
+//
+// Dispatch: (ceil(N/TILE_N), ceil(M/TILE_M), batch)
+// local_size: (32, 1, 1) - single subgroup
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+
+// Tile sizes (configured at runtime via specialization constants)
+layout(constant_id = 0) const uint TILE_M = 16;
+layout(constant_id = 1) const uint TILE_N = 16;
+layout(constant_id = 2) const uint TILE_K = 16;
+
+// Workgroup size: one subgroup (typically 32 threads for NVIDIA/AMD)
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#include "common.comp"
+
+#if BF16
+    #define CAST_OUT(x) uint16_t((floatBitsToUint(x) + 0x8000u) >> 16u)
+    #define CAST_IN(x) uintBitsToFloat(uint(x) << 16u)
+    #define SUM_TYPE float
+#else
+    #define CAST_OUT(x) TYPE(x)
+    #define CAST_IN(x) (x)
+    #define SUM_TYPE TYPE
+#endif
+
+layout(set = 0, binding = 0) readonly buffer MatrixA {
+    TYPE a[];
+};
+
+layout(set = 0, binding = 1) readonly buffer MatrixB {
+    TYPE b[];
+};
+
+layout(set = 0, binding = 2) buffer MatrixC {
+    TYPE c[];
+};
+
+// Must exactly match the GemmPushConstants struct in Rust.
+layout(push_constant) uniform GemmPushConstants {
+    uint m;
+    uint n;
+    uint k;
+    uint a_stride_bh;
+    uint a_stride_m;
+    uint a_stride_k;
+    uint b_stride_bh;
+    uint b_stride_k;
+    uint b_stride_n;
+    uint a_base;
+    uint b_base;
+    uint ldc;
+    uint c_stride_bh;
+    float alpha;
+    float beta;
+} pc;
+
+// Shared memory for cooperative matrix loading
+// Using larger fixed sizes to accommodate various tile sizes
+shared float16_t shared_a[32 * 32];  // Max tile for A (supports up to 32x32)
+shared float16_t shared_b[32 * 32];  // Max tile for B (supports up to 32x32)
+shared float temp_c[32 * 32];        // Temporary storage for result (supports up to 32x32)
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_m = gl_WorkGroupID.y * TILE_M;  // M tile start (row)
+    uint wg_n = gl_WorkGroupID.x * TILE_N;  // N tile start (col)
+    uint batch = gl_WorkGroupID.z;
+
+    // Early exit if out of bounds
+    if (wg_m >= pc.m || wg_n >= pc.n) {
+        return;
+    }
+
+    uint a_batch_off = pc.a_base + batch * pc.a_stride_bh;
+    uint b_batch_off = pc.b_base + batch * pc.b_stride_bh;
+
+    // Define cooperative matrix types
+    // MatA: TILE_M x TILE_K, row-major
+    // MatB: TILE_K x TILE_N, row-major
+    // MatC: TILE_M x TILE_N, accumulator
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> matA;
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> matC;
+
+    // Initialize accumulator to zero
+    matC = coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(0.0);
+
+    // Number of K tiles
+    uint num_k_tiles = (pc.k + TILE_K - 1) / TILE_K;
+
+    // Loop over K dimension in TILE_K chunks
+    for (uint k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        uint k_start = k_tile * TILE_K;
+
+        // Load A tile cooperatively into shared memory
+        // A[wg_m:wg_m+TILE_M, k_start:k_start+TILE_K]
+        for (uint i = tid; i < TILE_M * TILE_K; i += 32) {
+            uint m_idx = wg_m + (i / TILE_K);
+            uint k_idx = k_start + (i % TILE_K);
+
+            float val = 0.0;
+            if (m_idx < pc.m && k_idx < pc.k) {
+                uint a_offset = a_batch_off + m_idx * pc.a_stride_m + k_idx * pc.a_stride_k;
+                val = float(CAST_IN(a[a_offset]));
+            }
+            shared_a[i] = float16_t(val);
+        }
+
+        // Load B tile cooperatively into shared memory
+        // B[k_start:k_start+TILE_K, wg_n:wg_n+TILE_N]
+        for (uint i = tid; i < TILE_K * TILE_N; i += 32) {
+            uint k_idx = k_start + (i / TILE_N);
+            uint n_idx = wg_n + (i % TILE_N);
+
+            float val = 0.0;
+            if (k_idx < pc.k && n_idx < pc.n) {
+                uint b_offset = b_batch_off + k_idx * pc.b_stride_k + n_idx * pc.b_stride_n;
+                val = float(CAST_IN(b[b_offset]));
+            }
+            shared_b[i] = float16_t(val);
+        }
+
+        barrier();
+
+        // Load tiles into cooperative matrices
+        coopMatLoad(matA, shared_a, 0, TILE_K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, shared_b, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+
+        // Multiply-accumulate
+        matC = coopMatMulAdd(matA, matB, matC);
+
+        barrier();
+    }
+
+    // Store result to shared memory
+    coopMatStore(matC, temp_c, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+
+    barrier();
+
+    // Apply alpha/beta scaling and write results to global memory
+    uint c_batch_stride = pc.m * pc.ldc;
+    for (uint i = tid; i < TILE_M * TILE_N; i += 32) {
+        uint m_idx = wg_m + (i / TILE_N);
+        uint n_idx = wg_n + (i % TILE_N);
+
+        if (m_idx < pc.m && n_idx < pc.n) {
+            uint c_index = batch * c_batch_stride + m_idx * pc.ldc + n_idx;
+
+            float old_c = (pc.beta == 0.0) ? 0.0 : float(CAST_IN(c[c_index]));
+            float final_val = pc.alpha * temp_c[i] + pc.beta * old_c;
+
+            c[c_index] = CAST_OUT(final_val);
+        }
+    }
+}

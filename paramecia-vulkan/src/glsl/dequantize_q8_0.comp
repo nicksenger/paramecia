@@ -1,0 +1,70 @@
+// Q8_0 Dequantization: Q8_0 blocks -> f32[N]
+//
+// Each Q8_0 block: 34 bytes (2-byte f16 scale + 32 x i8 quants) -> 32 floats
+//
+// Each thread processes one element within a block.
+// Dispatch: (ceil(total_elements / 256), 1, 1)
+//
+// Supports dequantizing a subrange via input_byte_offset push constant,
+// so a pre-allocated buffer can be partially dequantized without copying.
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint num_elements;       // total number of elements to dequantize
+    uint input_byte_offset;  // byte offset into the input buffer (must be 4-byte aligned)
+};
+
+// Input: raw Q8_0 bytes stored as u32 words
+layout(set = 0, binding = 0, std430) readonly buffer InputBuf {
+    uint v_input[];
+};
+
+// Output: f32 values
+layout(set = 0, binding = 1, std430) writeonly buffer OutputBuf {
+    float v_output[];
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= num_elements) return;
+
+    uint block_idx = idx / 32;
+    uint elem_in_block = idx % 32;
+
+    // Q8_0 block layout: [f16 scale (2 bytes)][i8 quants[32] (32 bytes)] = 34 bytes
+    uint block_byte = input_byte_offset + block_idx * 34;
+
+    // Load f16 scale (2 bytes at block_byte)
+    uint scale_word_idx = block_byte / 4;
+    uint scale_byte_in_word = block_byte % 4;
+    uint word = v_input[scale_word_idx];
+    float scale;
+    if (scale_byte_in_word == 0) {
+        scale = unpackHalf2x16(word).x;
+    } else if (scale_byte_in_word == 2) {
+        scale = unpackHalf2x16(word >> 16).x;
+    } else {
+        uint word2 = v_input[scale_word_idx + 1];
+        uint h;
+        if (scale_byte_in_word == 1) {
+            h = (word >> 8) | (word2 << 24);
+        } else { // 3
+            h = (word >> 24) | (word2 << 8);
+        }
+        scale = unpackHalf2x16(h).x;
+    }
+
+    // Load i8 quant value
+    uint q_byte_offset = block_byte + 2 + elem_in_block;
+    uint q_word_idx = q_byte_offset / 4;
+    uint q_byte_in_word = q_byte_offset % 4;
+    uint q_word = v_input[q_word_idx];
+    int q = int(q_word >> (q_byte_in_word * 8)) << 24 >> 24; // sign-extend
+
+    v_output[idx] = scale * float(q);
+}

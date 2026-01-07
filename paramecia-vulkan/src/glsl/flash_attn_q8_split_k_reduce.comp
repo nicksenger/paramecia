@@ -1,0 +1,101 @@
+// Flash Attention Q8 split-K reduction
+//
+// Inputs:
+// - partial numerators: [split_k, rows, head_dim] float
+// - split stats: [split_k, rows, 2] where [m_split, l_split]
+// Output:
+// - final attention output in packed f16: [rows, head_dim]
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint batch;
+    uint num_heads;
+    uint seq_q;
+    uint head_dim;
+    uint split_k;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer PartialsBuf {
+    float partials[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer StatsBuf {
+    float stats[];
+};
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuf {
+    uint out_f16x2[];
+};
+
+void main() {
+    uint pair_idx = gl_GlobalInvocationID.x;
+    uint ih = gl_WorkGroupID.y;
+    uint ib_seq = gl_WorkGroupID.z;
+
+    if (head_dim == 0u || (head_dim & 1u) != 0u || split_k == 0u) {
+        return;
+    }
+
+    uint pair_count = head_dim / 2u;
+    if (pair_idx >= pair_count || ih >= num_heads || ib_seq >= batch * seq_q) {
+        return;
+    }
+
+    uint ib = ib_seq / seq_q;
+    uint iq = ib_seq % seq_q;
+
+    uint rows = batch * seq_q * num_heads;
+    uint row_idx = (ib * seq_q + iq) * num_heads + ih;
+
+    float m = -3.40282e+38;
+    for (uint s = 0u; s < split_k; s++) {
+        uint stats_base = (s * rows + row_idx) * 2u;
+        float l_s = stats[stats_base + 1u];
+        if (l_s > 0.0) {
+            float m_s = stats[stats_base + 0u];
+            m = max(m, m_s);
+        }
+    }
+
+    float o0 = 0.0;
+    float o1 = 0.0;
+
+    if (m > -3.0e+38) {
+        float denom = 0.0;
+        uint d0 = pair_idx * 2u;
+        uint d1 = d0 + 1u;
+
+        for (uint s = 0u; s < split_k; s++) {
+            uint stats_base = (s * rows + row_idx) * 2u;
+            float m_s = stats[stats_base + 0u];
+            float l_s = stats[stats_base + 1u];
+            if (l_s <= 0.0) {
+                continue;
+            }
+
+            float w = exp(m_s - m);
+            denom += l_s * w;
+
+            uint part_base = (s * rows + row_idx) * head_dim;
+            o0 += partials[part_base + d0] * w;
+            o1 += partials[part_base + d1] * w;
+        }
+
+        if (denom > 0.0) {
+            float inv = 1.0 / denom;
+            o0 *= inv;
+            o1 *= inv;
+        } else {
+            o0 = 0.0;
+            o1 = 0.0;
+        }
+    }
+
+    uint out_word_idx = row_idx * pair_count + pair_idx;
+    out_f16x2[out_word_idx] = packHalf2x16(vec2(o0, o1));
+}

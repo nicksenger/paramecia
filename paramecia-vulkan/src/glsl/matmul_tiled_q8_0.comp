@@ -1,0 +1,287 @@
+// Hierarchical Tiled Q8_0 Matrix Multiplication - 3-Level Tiling (Block → Warp → Thread)
+//
+// Computes: C[m,n] = A[m,k] * B[n,k]^T
+// Where B is Q8_0 quantized, A is f32
+//
+// Architecture:
+// - Block Level: BM×BN output tile, streaming K in BK chunks
+// - Warp Level: WM×WN subtile per warp
+// - Thread Level: TM×TN register tile per thread
+//
+// Key Optimizations:
+// - Shared memory staging with bank conflict avoidance (SHMEM_STRIDE padding)
+// - Dequantize-on-load: Q8_0 weights dequantized once during cooperative load
+// - Register tiling: Each thread maintains TM×TN accumulators (64 elements)
+// - Cooperative loading: All threads load tiles collaboratively
+// - Explicit FMA chaining for better ILP
+//
+// Tile Configuration (Decode-Optimized):
+// - BM=16, BN=64, BK=32 (11KB shared memory)
+// - WM=16, WN=32, TM=8, TN=8
+// - Workgroup: 64 threads = 2 warps (1×2 warp grid)
+//
+// Compile with:
+//   glslc -fshader-stage=compute -O matmul_tiled_q8_0.comp -o matmul_tiled_q8_0.spv
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Q8_0 constants
+#define QK8_0 32        // Elements per Q8_0 block (matches BK default)
+#define QK8_0_BYTES 34  // 2 bytes f16 scale + 32 bytes i8
+
+// Tile configuration (can be overridden via specialization constants)
+#define BM 16   // Block M (output rows per workgroup)
+#define BN 64   // Block N (output cols per workgroup)
+#define BK 32   // Block K (reduction tile size, matches Q8_0 block)
+#define WM 16   // Warp M (output rows per warp)
+#define WN 32   // Warp N (output cols per warp)
+#define TM 8    // Thread M (output rows per thread)
+#define TN 8    // Thread N (output cols per thread)
+#define WMITER 1 // Warp M iterations
+
+#include "matmul_tiled_common.glsl"
+
+// Workgroup layout: (WARP_SIZE, NWARPS, 1)
+// For decode config: (32, 2, 1) = 64 threads
+layout(local_size_x = WARP_SIZE, local_size_y = NWARPS, local_size_z = 1) in;
+
+// Push constants (32 bytes)
+layout(push_constant) uniform PushConstants {
+    uint params[8];
+    // [0]: m (rows of output)
+    // [1]: k (reduction dimension)
+    // [2]: n (columns of output)
+    // [3]: a_stride_batch
+    // [4]: a_offset
+    // [5]: a_stride_k
+    // [6]: a_stride_m
+    // [7]: unused
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+// Output buffer (f32)
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+// Input A buffer (f32) - the activations
+layout(set = 0, binding = 1, std430) readonly buffer InputA {
+    float v_input_a[];
+};
+
+// Input B buffer (Q8_0) - the quantized weights
+layout(set = 0, binding = 2, std430) readonly buffer InputB {
+    uint v_input_b[];
+};
+
+// Shared memory for tiles
+shared float shared_a[BM * SHMEM_STRIDE_A];  // A tile: BM×BK with padding
+shared float shared_b[BK * SHMEM_STRIDE_B];  // B tile: BK×BN with padding
+
+// ============================================================================
+// Helper functions (Q8_0 dequantization)
+// ============================================================================
+
+#include "dequant_helpers.glsl"
+
+// Load f16 scale from Q8_0 block at byte offset
+float load_q8_scale(uint block_byte) {
+    uint word_idx = block_byte / 4;
+    uint byte_in_word = block_byte % 4;
+    uint word = v_input_b[word_idx];
+
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return half_to_float_lo(word >> 16);
+    } else {
+        // Unaligned - straddle two words
+        uint word2 = v_input_b[word_idx + 1];
+        uint h = (byte_in_word == 1)
+            ? ((word >> 8) | (word2 << 24))
+            : ((word >> 24) | (word2 << 8));
+        return half_to_float_lo(h);
+    }
+}
+
+// Load single i8 from Q8_0 block and convert to float
+float load_q8_dequant(uint block_byte, uint qs_idx, float scale) {
+    uint byte_offset = block_byte + 2 + qs_idx;  // +2 to skip scale
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = v_input_b[word_idx];
+
+    // Extract and sign-extend i8
+    int val = int(word >> (byte_in_word * 8)) << 24 >> 24;
+    return scale * float(val);
+}
+
+// Dequantize Q8_0 element at [n_idx, k_idx] in weight matrix
+// Weights are stored [n, k] in row-major Q8_0 blocks
+float dequantize_q8_0(uint n_idx, uint k_idx, uint num_blocks) {
+    uint block_idx = k_idx / QK8_0;
+    uint block_offset = k_idx % QK8_0;
+    uint block_byte = n_idx * num_blocks * QK8_0_BYTES + block_idx * QK8_0_BYTES;
+
+    float scale = load_q8_scale(block_byte);
+    return load_q8_dequant(block_byte, block_offset, scale);
+}
+
+// ============================================================================
+// Main kernel
+// ============================================================================
+
+void main() {
+    // Thread identification
+    uint lane_id = gl_LocalInvocationID.x;      // 0-31 (within warp)
+    uint warp_id = gl_LocalInvocationID.y;      // 0-(NWARPS-1)
+    uint tid = lane_id + warp_id * WARP_SIZE;   // Flat thread ID (0-63)
+
+    // Workgroup tile base coordinates
+    uint wg_m = gl_WorkGroupID.y * BM;          // Note: swapped for better coalescing
+    uint wg_n = gl_WorkGroupID.x * BN;
+    uint batch = gl_WorkGroupID.z;
+
+    // Early exit if entire workgroup is out of bounds
+    if (wg_m >= op_m || wg_n >= op_n) {
+        return;
+    }
+
+    // Compute thread tile coordinates
+    uint thread_m, thread_n, warp_m_base, warp_n_base;
+    compute_tile_coords(warp_id, lane_id, wg_m, wg_n, thread_m, thread_n, warp_m_base, warp_n_base);
+
+    // Check if this lane is active for computation
+    // Only WM×WN / (TM×TN) threads per warp are active
+    uint threads_per_warp = (WM * WN) / (TM * TN);
+    bool is_active = lane_id < threads_per_warp;
+
+    // Initialize accumulator registers (TM×TN = 64 elements)
+    float acc[TM * TN];
+    for (uint i = 0; i < TM * TN; i++) {
+        acc[i] = 0.0;
+    }
+
+    // Input A offset for this batch
+    uint a_offset = op_a_offset + batch * op_a_stride_b;
+
+    // Number of Q8_0 blocks per weight row
+    uint num_blocks = op_k / QK8_0;
+
+    // ========================================================================
+    // OUTER K LOOP - Block Level Tiling
+    // ========================================================================
+    uint num_k_tiles = (op_k + BK - 1) / BK;
+
+    for (uint k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        uint k_base = k_tile * BK;
+        bool is_last_k_tile = (k_base + BK > op_k);
+        uint k_tile_size = is_last_k_tile ? (op_k - k_base) : BK;
+
+        // ====================================================================
+        // COOPERATIVE LOAD A TILE (Activations: BM×BK)
+        // ====================================================================
+        // Each thread loads multiple elements (strided by THREADS_PER_WG)
+        for (uint i = tid; i < BM * BK; i += THREADS_PER_WG) {
+            uint tile_m = i / BK;
+            uint tile_k = i % BK;
+            uint global_m = wg_m + tile_m;
+            uint global_k = k_base + tile_k;
+
+            float val = 0.0;
+            if (global_m < op_m && global_k < op_k) {
+                uint a_idx = a_offset + global_m * op_a_stride_m + global_k * op_a_stride_k;
+                val = v_input_a[a_idx];
+            }
+
+            shared_a[tile_m * SHMEM_STRIDE_A + tile_k] = val;
+        }
+
+        // ====================================================================
+        // COOPERATIVE LOAD & DEQUANTIZE B TILE (Weights: BK×BN)
+        // ====================================================================
+        // Dequantize Q8_0 weights during load, store f32 in shared memory
+        for (uint i = tid; i < BK * BN; i += THREADS_PER_WG) {
+            uint tile_k = i / BN;  // K dimension
+            uint tile_n = i % BN;  // N dimension
+            uint global_n = wg_n + tile_n;
+            uint global_k = k_base + tile_k;
+
+            float val = 0.0;
+            if (global_n < op_n && global_k < op_k) {
+                val = dequantize_q8_0(global_n, global_k, num_blocks);
+            }
+
+            shared_b[tile_k * SHMEM_STRIDE_B + tile_n] = val;
+        }
+
+        // Synchronize after loading tiles
+        barrier();
+
+        // ====================================================================
+        // INNER K LOOP - Thread Level Computation
+        // ====================================================================
+        // Each thread computes its TM×TN output tile by processing BK elements
+        // Only active lanes participate in computation
+        if (is_active) {
+            for (uint k_local = 0; k_local < k_tile_size; k_local++) {
+                // Load A fragment (TM elements) from shared memory
+                float a_frag[TM];
+                for (uint tm = 0; tm < TM; tm++) {
+                    uint a_row = (thread_m - wg_m) + tm;
+                    a_frag[tm] = shared_a[a_row * SHMEM_STRIDE_A + k_local];
+                }
+
+                // Load B fragment (TN elements) from shared memory
+                float b_frag[TN];
+                for (uint tn = 0; tn < TN; tn++) {
+                    uint b_col = (thread_n - wg_n) + tn;
+                    b_frag[tn] = shared_b[k_local * SHMEM_STRIDE_B + b_col];
+                }
+
+                // Outer product: accumulate TM×TN partial products using FMA
+                // Unroll for better ILP (instruction-level parallelism)
+                for (uint tm = 0; tm < TM; tm++) {
+                    for (uint tn = 0; tn < TN; tn++) {
+                        acc[tm * TN + tn] = fma(a_frag[tm], b_frag[tn], acc[tm * TN + tn]);
+                    }
+                }
+            }
+        }
+
+        // Synchronize before loading next K tile
+        barrier();
+    }
+
+    // ========================================================================
+    // WRITE RESULTS - Each thread writes its TM×TN tile
+    // ========================================================================
+    // Only active lanes write results
+    if (is_active) {
+        for (uint tm = 0; tm < TM; tm++) {
+            for (uint tn = 0; tn < TN; tn++) {
+                uint out_m = thread_m + tm;
+                uint out_n = thread_n + tn;
+
+                if (out_m < op_m && out_n < op_n) {
+                    uint out_idx = batch * op_m * op_n + out_m * op_n + out_n;
+                    v_dest[out_idx] = acc[tm * TN + tn];
+                }
+            }
+        }
+    }
+}

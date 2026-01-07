@@ -1,0 +1,8 @@
+[package]
+name = "paramecia-bridge"
+description = "Shared bridge types for paramecia interactive controller communication"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }

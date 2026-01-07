@@ -1,0 +1,52 @@
+// Depthwise 1D Convolution
+//
+// input:  [batch, channels, input_len]
+// weight: [channels, kernel_size]
+// output: [batch, channels, output_len] where output_len = input_len - kernel_size + 1
+//
+// Each thread computes one output element.
+// Dispatch: (ceil(output_len/256), channels, batch)
+
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint batch;
+    uint channels;
+    uint input_len;
+    uint kernel_size;
+    uint output_len;
+    uint _pad[3];
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuf {
+    float v_input[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuf {
+    float v_weight[];
+};
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuf {
+    float v_output[];
+};
+
+void main() {
+    uint o = gl_GlobalInvocationID.x;  // output position
+    uint c = gl_WorkGroupID.y;         // channel
+    uint b = gl_WorkGroupID.z;         // batch
+
+    if (o >= output_len || c >= channels || b >= batch) return;
+
+    float acc = 0.0;
+    uint input_base = b * channels * input_len + c * input_len;
+    uint weight_base = c * kernel_size;
+
+    for (uint k = 0; k < kernel_size; k++) {
+        acc += v_input[input_base + o + k] * v_weight[weight_base + k];
+    }
+
+    uint output_idx = b * channels * output_len + c * output_len + o;
+    v_output[output_idx] = acc;
+}

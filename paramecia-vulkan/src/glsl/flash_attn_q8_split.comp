@@ -1,0 +1,486 @@
+// Flash Attention with Q8_0 quantized K/V cache (split-K pass)
+//
+// This shader computes partial attention for one KV split chunk:
+// - partial numerators: sum(exp(score - m_split) * V)
+// - split stats: m_split, l_split
+//
+// A follow-up reduction shader combines all split chunks.
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#ifdef USE_INTEGER_DOT
+#extension GL_EXT_integer_dot_product : require
+#endif
+
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+
+#define WARP_SIZE 32
+#define NWARPS 4
+#define QK8_0 32
+#define QI8_0 8
+
+float warp_reduce_sum_32(float v) {
+    v += subgroupShuffleXor(v, 16);
+    v += subgroupShuffleXor(v, 8);
+    v += subgroupShuffleXor(v, 4);
+    v += subgroupShuffleXor(v, 2);
+    v += subgroupShuffleXor(v, 1);
+    return v;
+}
+
+float warp_reduce_max_32(float v) {
+    v = max(v, subgroupShuffleXor(v, 16));
+    v = max(v, subgroupShuffleXor(v, 8));
+    v = max(v, subgroupShuffleXor(v, 4));
+    v = max(v, subgroupShuffleXor(v, 2));
+    v = max(v, subgroupShuffleXor(v, 1));
+    return v;
+}
+
+#if HEAD_DIM == 64
+    #define INTS_PER_ROW 16
+    #define BLOCKS_PER_ROW 2
+    #define NTHREADS_V 16
+    #define ACC_PER_LANE 2
+#elif HEAD_DIM == 128
+    #define INTS_PER_ROW 32
+    #define BLOCKS_PER_ROW 4
+    #define NTHREADS_V 32
+    #define ACC_PER_LANE 2
+#elif HEAD_DIM == 256
+    #define INTS_PER_ROW 64
+    #define BLOCKS_PER_ROW 8
+    #define NTHREADS_V 32
+    #define ACC_PER_LANE 4
+#else
+    #error "Unsupported HEAD_DIM, must be 64, 128, or 256"
+#endif
+
+layout(local_size_x = WARP_SIZE, local_size_y = NWARPS, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint params[27];
+    // [0]: scale bits
+    // [1]: batch
+    // [2]: num_heads
+    // [3]: num_kv_heads
+    // [4]: head_dim
+    // [5]: seq_q
+    // [6]: seq_k
+    // [7]: q_offset
+    // [8]: causal
+    // [9-12]: q strides (elements)
+    // [13-16]: k strides (bytes)
+    // [17-20]: v strides (bytes)
+    // [21-24]: output strides (unused in split pass)
+    // [25]: split_k
+    // [26]: split_kv
+};
+
+#define op_scale        uintBitsToFloat(params[0])
+#define op_batch        params[1]
+#define op_num_heads    params[2]
+#define op_num_kv_heads params[3]
+#define op_head_dim     params[4]
+#define op_seq_q        params[5]
+#define op_seq_k        params[6]
+#define op_q_offset     params[7]
+#define op_causal       params[8]
+
+#define op_q_stride_b   params[9]
+#define op_q_stride_seq params[10]
+#define op_q_stride_h   params[11]
+#define op_q_stride_d   params[12]
+
+#define op_k_stride_b   params[13]
+#define op_k_stride_seq params[14]
+#define op_k_stride_h   params[15]
+#define op_k_stride_d   params[16]
+
+#define op_v_stride_b   params[17]
+#define op_v_stride_seq params[18]
+#define op_v_stride_h   params[19]
+#define op_v_stride_d   params[20]
+
+#define op_split_k      params[25]
+#define op_split_kv     params[26]
+
+// Partial numerators: [split_k, rows, HEAD_DIM]
+layout(set = 0, binding = 0, std430) writeonly buffer PartialsBuf {
+    float partials[];
+};
+
+// Split stats: [split_k, rows, 2] where 0=m_split, 1=l_split
+layout(set = 0, binding = 1, std430) writeonly buffer StatsBuf {
+    float stats[];
+};
+
+// Q input (F16 packed as u32)
+layout(set = 0, binding = 2, std430) readonly buffer QBuf {
+    uint v_q[];
+};
+
+struct block_q8_0_packed16 {
+    float16_t d;
+    int16_t qs[16];
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer KBuf {
+    block_q8_0_packed16 k_blocks[];
+};
+
+layout(set = 0, binding = 4, std430) readonly buffer VBuf {
+    block_q8_0_packed16 v_blocks[];
+};
+
+shared int q_q8[INTS_PER_ROW];
+shared float q_d[BLOCKS_PER_ROW];
+shared float tile_max_s;
+shared float tile_sum_s;
+shared float warp_red_s[NWARPS];
+shared float kq_w[NWARPS * WARP_SIZE];
+shared float acc_s[NWARPS][WARP_SIZE][ACC_PER_LANE * 2];
+
+float unpackHalf2x16_x(uint v) {
+    return unpackHalf2x16(v).x;
+}
+
+float unpackHalf2x16_y(uint v) {
+    return unpackHalf2x16(v).y;
+}
+
+float load_q_f16(uint idx) {
+    uint word_idx = idx / 2;
+    uint word = v_q[word_idx];
+    return ((idx % 2) == 0) ? unpackHalf2x16_x(word) : unpackHalf2x16_y(word);
+}
+
+float load_k_q8_scale(uint block_idx) {
+    return float(k_blocks[block_idx].d);
+}
+
+ivec4 load_k_q8_4xi8(uint block_idx, uint iqs) {
+    uint qs_idx = iqs / 2;
+    int val0 = int(k_blocks[block_idx].qs[qs_idx]);
+    int val1 = int(k_blocks[block_idx].qs[qs_idx + 1]);
+
+    int i0 = bitfieldExtract(val0, 0, 8);
+    int i1 = bitfieldExtract(val0, 8, 8);
+    int i2 = bitfieldExtract(val1, 0, 8);
+    int i3 = bitfieldExtract(val1, 8, 8);
+
+    return ivec4(i0, i1, i2, i3);
+}
+
+int load_k_q8_packed_i8x4(uint block_idx, uint iqs) {
+    uint qs_idx = iqs / 2u;
+    uint v0 = uint(int(k_blocks[block_idx].qs[qs_idx])) & 0xFFFFu;
+    uint v1 = uint(int(k_blocks[block_idx].qs[qs_idx + 1u])) & 0xFFFFu;
+    return int((v0 & 0xFFu) | ((v0 >> 8) << 8) | ((v1 & 0xFFu) << 16) | ((v1 >> 8) << 24));
+}
+
+float load_v_q8_scale(uint block_idx) {
+    return float(v_blocks[block_idx].d);
+}
+
+ivec4 load_v_q8_4xi8(uint block_idx, uint iqs) {
+    uint qs_idx = iqs / 2;
+    int val0 = int(v_blocks[block_idx].qs[qs_idx]);
+    int val1 = int(v_blocks[block_idx].qs[qs_idx + 1]);
+
+    int i0 = bitfieldExtract(val0, 0, 8);
+    int i1 = bitfieldExtract(val0, 8, 8);
+    int i2 = bitfieldExtract(val1, 0, 8);
+    int i3 = bitfieldExtract(val1, 8, 8);
+
+    return ivec4(i0, i1, i2, i3);
+}
+
+int dot4I8(ivec4 a, ivec4 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+}
+
+int dot4I8Packed(int a, int b) {
+#ifdef USE_INTEGER_DOT
+    return dotPacked4x8EXT(a, b);
+#else
+    return 0;
+#endif
+}
+
+ivec4 unpackI8x4(int packed) {
+    int i0 = (packed << 24) >> 24;
+    int i1 = (packed << 16) >> 24;
+    int i2 = (packed << 8) >> 24;
+    int i3 = packed >> 24;
+    return ivec4(i0, i1, i2, i3);
+}
+
+void main() {
+    uint ib_split = gl_WorkGroupID.x;
+    uint ih = gl_WorkGroupID.y;
+    uint iq_seq = gl_WorkGroupID.z;
+
+    uint batch = op_batch;
+    uint num_heads = op_num_heads;
+    uint num_kv_heads = op_num_kv_heads;
+    uint seq_q = op_seq_q;
+    uint seq_k = op_seq_k;
+    uint split_k = op_split_k;
+    uint split_kv = op_split_kv;
+    float scale = op_scale;
+    bool causal = op_causal != 0;
+    uint q_offset_base = op_q_offset;
+
+    if (split_k == 0u) {
+        return;
+    }
+
+    uint ib = ib_split / split_k;
+    uint split_idx = ib_split % split_k;
+
+    if (ib >= batch || ih >= num_heads || iq_seq >= seq_q) {
+        return;
+    }
+
+    uint start_k = split_idx * split_kv;
+    uint end_k = min(seq_k, start_k + split_kv);
+
+    uint lane = gl_LocalInvocationID.x;
+    uint warp = gl_LocalInvocationID.y;
+    uint tid = warp * WARP_SIZE + lane;
+
+    uint kv_head = (num_kv_heads != num_heads) ? (ih * num_kv_heads) / num_heads : ih;
+
+    uint q_row_offset = ib * op_q_stride_b + iq_seq * op_q_stride_seq + ih * op_q_stride_h;
+
+    if (warp == 0u) {
+        uint nthreads_quantize = min(uint(INTS_PER_ROW), uint(WARP_SIZE));
+
+        for (uint i0 = 0u; i0 < INTS_PER_ROW; i0 += nthreads_quantize) {
+            float vals[4] = float[4](0.0, 0.0, 0.0, 0.0);
+            if (lane < nthreads_quantize) {
+                uint base = 4u * (i0 + lane);
+                for (uint l = 0u; l < 4u; l++) {
+                    uint q_idx = q_row_offset + (base + l) * op_q_stride_d;
+                    vals[l] = scale * load_q_f16(q_idx);
+                }
+            }
+
+            float amax = abs(vals[0]);
+            amax = max(amax, abs(vals[1]));
+            amax = max(amax, abs(vals[2]));
+            amax = max(amax, abs(vals[3]));
+
+            amax = max(amax, subgroupShuffleXor(amax, 4));
+            amax = max(amax, subgroupShuffleXor(amax, 2));
+            amax = max(amax, subgroupShuffleXor(amax, 1));
+
+            float d = amax / 127.0;
+            int q32 = 0;
+
+            if (lane < nthreads_quantize) {
+                if (d != 0.0) {
+                    float inv_d = 1.0 / d;
+                    int q0 = int(roundEven(vals[0] * inv_d));
+                    int q1 = int(roundEven(vals[1] * inv_d));
+                    int q2 = int(roundEven(vals[2] * inv_d));
+                    int q3 = int(roundEven(vals[3] * inv_d));
+                    q32 = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+                }
+
+                q_q8[i0 + lane] = q32;
+                if ((lane % QI8_0) == 0u) {
+                    q_d[(i0 + lane) / QI8_0] = d;
+                }
+            }
+        }
+    }
+    barrier();
+
+    float kq_max = -3.40282e+38;
+    float kq_sum = 0.0;
+
+    float acc[ACC_PER_LANE * 2];
+    for (int i = 0; i < ACC_PER_LANE * 2; i++) {
+        acc[i] = 0.0;
+    }
+
+    uint q_abs = q_offset_base + iq_seq;
+
+    const uint KEYS_PER_TILE = NWARPS * WARP_SIZE;
+
+    for (uint tile0 = start_k; tile0 < end_k; tile0 += KEYS_PER_TILE) {
+        float score_reg = -3.40282e+38;
+        float warp_max = -3.40282e+38;
+
+        for (uint i_key = 0u; i_key < WARP_SIZE; i_key++) {
+            uint k_idx = tile0 + warp * WARP_SIZE + i_key;
+            float score = -3.40282e+38;
+
+            bool key_in_range = k_idx < end_k;
+            bool key_allowed = !causal || (k_idx <= q_abs);
+
+            if (key_in_range && key_allowed) {
+                uint k_row_byte = ib * op_k_stride_b + k_idx * op_k_stride_seq + kv_head * op_k_stride_h;
+                uint k_row_block = k_row_byte / 34u;
+
+                float sum = 0.0;
+                for (uint k_int_0 = 0u; k_int_0 < INTS_PER_ROW; k_int_0 += WARP_SIZE) {
+                    uint k_int = k_int_0 + lane;
+                    if (k_int < INTS_PER_ROW) {
+                        uint iblk = k_int / QI8_0;
+                        uint iqs_group = k_int % QI8_0;
+                        uint iqs = iqs_group * 4u;
+
+                        uint k_block_idx = k_row_block + iblk;
+                        float k_scale = load_k_q8_scale(k_block_idx);
+#ifdef USE_INTEGER_DOT
+                        int k_packed = load_k_q8_packed_i8x4(k_block_idx, iqs);
+#else
+                        ivec4 k_vals = load_k_q8_4xi8(k_block_idx, iqs);
+#endif
+
+                        int q_packed = q_q8[k_int];
+                        float q_scale = q_d[iblk];
+
+                        int dp;
+#ifdef USE_INTEGER_DOT
+                        dp = dot4I8Packed(k_packed, q_packed);
+#else
+                        ivec4 q_vals = unpackI8x4(q_packed);
+                        dp = dot4I8(k_vals, q_vals);
+#endif
+                        sum += (k_scale * q_scale) * float(dp);
+                    }
+                }
+
+                sum = warp_reduce_sum_32(sum);
+                score = sum;
+            }
+
+            warp_max = max(warp_max, score);
+            if (lane == i_key) {
+                score_reg = score;
+            }
+        }
+
+        warp_max = warp_reduce_max_32(warp_max);
+        if (lane == 0u) {
+            warp_red_s[warp] = warp_max;
+        }
+        barrier();
+
+        if (warp == 0u && lane == 0u) {
+            float tm = warp_red_s[0];
+            tm = max(tm, warp_red_s[1]);
+            tm = max(tm, warp_red_s[2]);
+            tm = max(tm, warp_red_s[3]);
+            tile_max_s = tm;
+        }
+        barrier();
+
+        float kq_max_new = max(kq_max, tile_max_s);
+        float kq_scale_old = (kq_max > -3.0e+38) ? exp(kq_max - kq_max_new) : 0.0;
+
+        kq_sum *= kq_scale_old;
+        for (int i = 0; i < ACC_PER_LANE * 2; i++) {
+            acc[i] *= kq_scale_old;
+        }
+        kq_max = kq_max_new;
+
+        float w = (score_reg > -3.0e+38) ? exp(score_reg - kq_max) : 0.0;
+        kq_w[tid] = w;
+
+        float warp_sum = warp_reduce_sum_32(w);
+        if (lane == 0u) {
+            warp_red_s[warp] = warp_sum;
+        }
+        barrier();
+
+        if (warp == 0u && lane == 0u) {
+            tile_sum_s = warp_red_s[0] + warp_red_s[1] + warp_red_s[2] + warp_red_s[3];
+        }
+        barrier();
+
+        kq_sum += tile_sum_s;
+
+        for (uint k0 = 0u; k0 < WARP_SIZE; k0++) {
+            uint k_idx = tile0 + warp * WARP_SIZE + k0;
+            float wk = kq_w[warp * WARP_SIZE + k0];
+
+            if (wk == 0.0 || k_idx >= end_k) {
+                continue;
+            }
+
+            uint v_row_byte = ib * op_v_stride_b + k_idx * op_v_stride_seq + kv_head * op_v_stride_h;
+            uint v_row_block = v_row_byte / 34u;
+
+            if (lane < NTHREADS_V) {
+                for (uint base_el = 0u; base_el < HEAD_DIM; base_el += NTHREADS_V * 4u) {
+                    uint i_el = base_el + lane * 4u;
+                    uint iblk = i_el / QK8_0;
+                    uint iqs = i_el % QK8_0;
+
+                    uint v_block_idx = v_row_block + iblk;
+                    float v_scale = load_v_q8_scale(v_block_idx);
+                    ivec4 v_vals = load_v_q8_4xi8(v_block_idx, iqs);
+
+                    float v0 = v_scale * float(v_vals.x);
+                    float v1 = v_scale * float(v_vals.y);
+                    float v2 = v_scale * float(v_vals.z);
+                    float v3 = v_scale * float(v_vals.w);
+
+                    uint out_i0 = base_el / (NTHREADS_V * 2u);
+                    acc[out_i0 * 2u + 0u] += wk * v0;
+                    acc[out_i0 * 2u + 1u] += wk * v1;
+                    acc[(out_i0 + 1u) * 2u + 0u] += wk * v2;
+                    acc[(out_i0 + 1u) * 2u + 1u] += wk * v3;
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    for (int i = 0; i < ACC_PER_LANE * 2; i++) {
+        acc_s[warp][lane][i] = acc[i];
+    }
+    barrier();
+
+    uint rows = batch * seq_q * num_heads;
+    uint row_idx = (ib * seq_q + iq_seq) * num_heads + ih;
+    uint split_row = split_idx * rows + row_idx;
+
+    if (warp == 0u && lane == 0u) {
+        uint stats_base = split_row * 2u;
+        stats[stats_base + 0u] = kq_max;
+        stats[stats_base + 1u] = kq_sum;
+    }
+
+    if (warp == 0u && lane < NTHREADS_V) {
+        uint part_base = split_row * HEAD_DIM;
+        for (uint i = 0u; i < ACC_PER_LANE; i++) {
+            float sx = acc_s[0][lane][i * 2u];
+            float sy = acc_s[0][lane][i * 2u + 1u];
+            sx += acc_s[1][lane][i * 2u];
+            sy += acc_s[1][lane][i * 2u + 1u];
+            sx += acc_s[2][lane][i * 2u];
+            sy += acc_s[2][lane][i * 2u + 1u];
+            sx += acc_s[3][lane][i * 2u];
+            sy += acc_s[3][lane][i * 2u + 1u];
+
+            uint base_el = (i / 2u) * (NTHREADS_V * 4u) + lane * 4u + (i % 2u) * 2u;
+            partials[part_base + base_el + 0u] = sx;
+            partials[part_base + base_el + 1u] = sy;
+        }
+    }
+}

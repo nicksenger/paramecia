@@ -1,0 +1,12 @@
+
+[package]
+name = "paramecia-arrow"
+version = "0.1.0"
+edition = "2021"
+description = "Arrow combinators for paramecia"
+
+[dependencies]
+glowstick = { workspace = true }
+inception = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

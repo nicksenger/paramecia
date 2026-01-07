@@ -1,0 +1,229 @@
+// Q8_0 Matrix-Vector Multiplication - Optimized for decode phase (m=1)
+//
+// Computes: out[n] = weights[n,k] * input[k]
+// Where weights are Q8_0 quantized (32 elements per block, 34 bytes each)
+//
+// Optimization strategy:
+// - Each thread processes one output element
+// - Workgroup size: 128 threads
+// - Each thread reduces across all K blocks for its output element
+// - Uses vectorized loads (2x vec4) and explicit FMA chaining for 8-way parallelism
+// - Processes 8 elements per iteration (K_PER_ITER=8) vs 4 in previous version
+//
+// Q8_0 block structure (34 bytes):
+// - Bytes 0-1: f16 scale
+// - Bytes 2-33: i8 qs[32]
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Q8_0 constants
+#define QK8_0 32        // Elements per Q8_0 block
+#define QK8_0_BYTES 34  // 2 bytes f16 scale + 32 bytes i8
+#define K_PER_ITER 8    // Process 8 elements per inner loop iteration
+
+// Workgroup: 128 threads, each processing one output element
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// Parameters via push constants (32 bytes)
+layout(push_constant) uniform PushConstants {
+    uint params[8];
+    // [0]: m (always 1 for mat-vec)
+    // [1]: k (reduction dimension - input size)
+    // [2]: n (output dimension)
+    // [3]: a_stride_batch
+    // [4]: a_offset
+    // [5]: a_stride_k (typically 1 for contiguous)
+    // [6]: a_stride_m (typically k for row-major)
+    // [7]: unused
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+// Output buffer (f32)
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+// Input buffer (f32) - the activation vector
+layout(set = 0, binding = 1, std430) readonly buffer InputA {
+    float v_input_a[];
+};
+
+// Weight buffer (Q8_0) - quantized weights
+layout(set = 0, binding = 2, std430) readonly buffer InputB {
+    uint v_input_b[];
+};
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+#include "dequant_helpers.glsl"
+
+// Load f16 scale from Q8_0 block at byte offset
+float load_q8_scale(uint block_byte) {
+    uint word_idx = block_byte / 4;
+    uint byte_in_word = block_byte % 4;
+    uint word = v_input_b[word_idx];
+
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return half_to_float_lo(word >> 16);
+    } else {
+        // Unaligned - straddle two words
+        uint word2 = v_input_b[word_idx + 1];
+        uint h = (byte_in_word == 1)
+            ? ((word >> 8) | (word2 << 24))
+            : ((word >> 24) | (word2 << 8));
+        return half_to_float_lo(h);
+    }
+}
+
+// Load 4 consecutive i8 values and convert to vec4
+vec4 load_q8_4xi8_as_vec4(uint block_byte, uint qs_idx) {
+    uint byte_offset = block_byte + 2 + qs_idx;  // +2 to skip scale
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+
+    uint word = v_input_b[word_idx];
+    ivec4 i8_vals;
+
+    if (byte_in_word == 0) {
+        // Aligned - all 4 bytes from one word
+        i8_vals.x = int(word << 24) >> 24;
+        i8_vals.y = int(word << 16) >> 24;
+        i8_vals.z = int(word << 8) >> 24;
+        i8_vals.w = int(word) >> 24;
+    } else {
+        // Unaligned - need two words
+        uint word2 = v_input_b[word_idx + 1];
+        if (byte_in_word == 1) {
+            i8_vals.x = int(word << 16) >> 24;
+            i8_vals.y = int(word << 8) >> 24;
+            i8_vals.z = int(word) >> 24;
+            i8_vals.w = int(word2 << 24) >> 24;
+        } else if (byte_in_word == 2) {
+            i8_vals.x = int(word << 8) >> 24;
+            i8_vals.y = int(word) >> 24;
+            i8_vals.z = int(word2 << 24) >> 24;
+            i8_vals.w = int(word2 << 16) >> 24;
+        } else { // byte_in_word == 3
+            i8_vals.x = int(word) >> 24;
+            i8_vals.y = int(word2 << 24) >> 24;
+            i8_vals.z = int(word2 << 16) >> 24;
+            i8_vals.w = int(word2 << 8) >> 24;
+        }
+    }
+
+    return vec4(i8_vals);
+}
+
+// ============================================================================
+// Main kernel
+// ============================================================================
+
+void main() {
+    // Global thread ID determines which output element we compute
+    uint out_idx = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+
+    // Batch offset for 3D inputs
+    uint batch_id = gl_GlobalInvocationID.y;
+
+    // Check bounds
+    if (out_idx >= op_n) {
+        return;
+    }
+
+    // Number of Q8_0 blocks per row
+    uint num_blocks = (op_k + QK8_0 - 1) / QK8_0;
+
+    // Weight row starts at block for this output element
+    // Weights are stored [n, k] in blocks: weights[out_idx] is stored as blocks along K
+    uint weight_row_start_byte = out_idx * num_blocks * QK8_0_BYTES;
+
+    // Input activation offset
+    uint a_offset = op_a_offset + batch_id * op_a_stride_b;
+
+    // Accumulate dot product across all blocks
+    float sum = 0.0;
+
+    // Process each Q8_0 block along K dimension
+    for (uint blk = 0; blk < num_blocks; blk++) {
+        uint k_start = blk * QK8_0;
+        uint block_byte = weight_row_start_byte + blk * QK8_0_BYTES;
+
+        // Load block scale
+        float d = load_q8_scale(block_byte);
+
+        // Process 32 elements in the block (4 iterations of 8 elements each)
+        // Use explicit FMA chaining for better instruction-level parallelism
+        float block_sum = 0.0;
+
+        for (uint i = 0; i < QK8_0; i += K_PER_ITER) {
+            uint k = k_start + i;
+            if (k + K_PER_ITER - 1 < op_k) {
+                // Load 8 quantized weights (2x vec4)
+                vec4 w0 = load_q8_4xi8_as_vec4(block_byte, i);
+                vec4 w1 = load_q8_4xi8_as_vec4(block_byte, i + 4);
+
+                // Load 8 activation values (2x vec4)
+                uint a_idx = a_offset + k * op_a_stride_k;
+                vec4 a0 = vec4(
+                    v_input_a[a_idx],
+                    v_input_a[a_idx + op_a_stride_k],
+                    v_input_a[a_idx + 2 * op_a_stride_k],
+                    v_input_a[a_idx + 3 * op_a_stride_k]
+                );
+                vec4 a1 = vec4(
+                    v_input_a[a_idx + 4 * op_a_stride_k],
+                    v_input_a[a_idx + 5 * op_a_stride_k],
+                    v_input_a[a_idx + 6 * op_a_stride_k],
+                    v_input_a[a_idx + 7 * op_a_stride_k]
+                );
+
+                // Explicit FMA chaining (8-deep pipeline)
+                block_sum = fma(w0.x, a0.x, block_sum);
+                block_sum = fma(w0.y, a0.y, block_sum);
+                block_sum = fma(w0.z, a0.z, block_sum);
+                block_sum = fma(w0.w, a0.w, block_sum);
+                block_sum = fma(w1.x, a1.x, block_sum);
+                block_sum = fma(w1.y, a1.y, block_sum);
+                block_sum = fma(w1.z, a1.z, block_sum);
+                block_sum = fma(w1.w, a1.w, block_sum);
+            } else {
+                // Handle partial block at end
+                for (uint j = 0; j < K_PER_ITER && k + j < op_k; j++) {
+                    uint byte_offset = block_byte + 2 + i + j;
+                    uint word_idx = byte_offset / 4;
+                    uint byte_in_word = byte_offset % 4;
+                    uint word = v_input_b[word_idx];
+                    int w_i8 = int(word >> (byte_in_word * 8)) << 24 >> 24;
+
+                    uint a_idx = a_offset + (k + j) * op_a_stride_k;
+                    block_sum += float(w_i8) * v_input_a[a_idx];
+                }
+            }
+        }
+
+        // Scale and accumulate
+        sum += d * block_sum;
+    }
+
+    // Write result
+    uint dest_idx = batch_id * op_n + out_idx;
+    v_dest[dest_idx] = sum;
+}

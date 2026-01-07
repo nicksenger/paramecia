@@ -1,0 +1,86 @@
+// Philox-4x32-10 Counter-Based RNG + Box-Muller Gaussian Transform
+//
+// Matches the CUDA implementation in quzo_fused.cu exactly.
+// Philox is ideal for GPU because it's stateless, deterministic,
+// and uses only simple arithmetic (no uint64 needed).
+
+#define PHILOX_M0 0xD2511F53u
+#define PHILOX_M1 0xCD9E8D57u
+#define PHILOX_W0 0x9E3779B9u
+#define PHILOX_W1 0xBB67AE85u
+
+// Emulate __umulhi (high 32 bits of 32x32 multiply) via 16-bit decomposition.
+// Vulkan GLSL has no native umulhi or uint64.
+uint umulhi(uint a, uint b) {
+    uint a_lo = a & 0xFFFFu;
+    uint a_hi = a >> 16;
+    uint b_lo = b & 0xFFFFu;
+    uint b_hi = b >> 16;
+
+    uint p0 = a_lo * b_lo;
+    uint p1 = a_lo * b_hi;
+    uint p2 = a_hi * b_lo;
+    uint p3 = a_hi * b_hi;
+
+    uint carry = ((p0 >> 16) + (p1 & 0xFFFFu) + (p2 & 0xFFFFu)) >> 16;
+    return p3 + (p1 >> 16) + (p2 >> 16) + carry;
+}
+
+// Single Philox round
+void philox_round(inout uint c0, inout uint c1,
+                  inout uint c2, inout uint c3,
+                  uint k0, uint k1) {
+    uint hi0 = umulhi(c0, PHILOX_M0);
+    uint lo0 = c0 * PHILOX_M0;
+    uint hi1 = umulhi(c2, PHILOX_M1);
+    uint lo1 = c2 * PHILOX_M1;
+
+    uint new_c0 = hi1 ^ c1 ^ k0;
+    uint new_c1 = lo1;
+    uint new_c2 = hi0 ^ c3 ^ k1;
+    uint new_c3 = lo0;
+
+    c0 = new_c0;
+    c1 = new_c1;
+    c2 = new_c2;
+    c3 = new_c3;
+}
+
+// Generate 4 random uint32 values from seed+index using Philox-4x32-10
+// seed is split into (seed_lo, seed_hi) since we have no uint64
+uvec4 philox4x32(uvec2 seed, uvec2 idx) {
+    // Initialize counter from index
+    uint c0 = idx.x;
+    uint c1 = idx.y;
+    uint c2 = 0u;
+    uint c3 = 0u;
+
+    // Initialize key from seed
+    uint k0 = seed.x;
+    uint k1 = seed.y;
+
+    // 10 rounds
+    for (int i = 0; i < 10; i++) {
+        philox_round(c0, c1, c2, c3, k0, k1);
+        k0 += PHILOX_W0;
+        k1 += PHILOX_W1;
+    }
+
+    return uvec4(c0, c1, c2, c3);
+}
+
+// Box-Muller: generate Gaussian-distributed float from seed+index
+// Matches CUDA: philox_gaussian(effective_seed, weight_idx)
+// index is uint (low 32 bits only, high 32 = 0, matching CUDA cast)
+float philox_gaussian(uvec2 seed, uint idx) {
+    uvec4 r = philox4x32(seed, uvec2(idx, 0u));
+
+    // Box-Muller transform (matches CUDA kernel exactly)
+    float u1 = float(r.x | 1u) * (1.0 / 4294967296.0);  // (0, 1]
+    float u2 = float(r.y) * (1.0 / 4294967296.0);        // [0, 1)
+
+    float radius = sqrt(-2.0 * log(u1));
+    float theta = 6.283185307179586 * u2;
+
+    return radius * cos(theta);
+}

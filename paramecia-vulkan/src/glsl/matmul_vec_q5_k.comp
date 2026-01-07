@@ -1,0 +1,240 @@
+// Q5_K Matrix-Vector Multiplication - Warp-optimized for decode phase (m=1)
+//
+// Computes: out[n] = weights[n,k] * input[k]
+// Where weights are Q5_K quantized (256 elements per block, 176 bytes each)
+//
+// Q5_K block structure (176 bytes):
+// - Bytes 0-1: f16 d (global scale)
+// - Bytes 2-3: f16 dmin (global min scale)
+// - Bytes 4-15: packed scales/mins (12 bytes)
+// - Bytes 16-47: u8 qh[32] (high bits, 1 bit per element)
+// - Bytes 48-175: u8 qs[128] (low 4 bits, packed nibbles)
+//
+// Optimizations:
+// - Warp-level reductions (subgroupShuffleXor) for fast reduction
+// - Shared memory caching of scales/mins (8 per block) to avoid redundant extraction
+// - Vec2 dequantization to process 2 elements per iteration
+// - Explicit FMA chaining for better instruction-level parallelism
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Q5_K constants
+#define Q5_K_K 256
+#define Q5_K_K_BYTES 176
+#define NUM_SCALES 8    // Number of scale groups per Q5_K block
+
+// Workgroup: 32 threads x 4 warps = 128 threads
+// Each warp processes 1 output element (4 outputs per workgroup)
+#define WARP_SIZE 32
+#define NWARPS 4
+
+layout(local_size_x = WARP_SIZE, local_size_y = NWARPS, local_size_z = 1) in;
+
+// Shared memory for caching scales/mins per warp (avoids redundant extraction)
+shared float shared_d_scaled[NWARPS][NUM_SCALES];
+shared float shared_m_scaled[NWARPS][NUM_SCALES];
+
+layout(push_constant) uniform PushConstants {
+    uint params[8];
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputA {
+    float v_input_a[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer InputB {
+    uint v_input_b[];
+};
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+#include "dequant_helpers.glsl"
+
+void get_q5k_scale_min(uint block_byte, uint is, out float d_scaled, out float m_scaled) {
+    float d = load_f16(block_byte + 0);
+    float dmin = load_f16(block_byte + 2);
+
+    uint sc_offset = block_byte + 4;
+    uint b0 = load_byte(sc_offset + 0);
+    uint b1 = load_byte(sc_offset + 1);
+    uint b2 = load_byte(sc_offset + 2);
+    uint b3 = load_byte(sc_offset + 3);
+    uint b4 = load_byte(sc_offset + 4);
+    uint b5 = load_byte(sc_offset + 5);
+    uint b6 = load_byte(sc_offset + 6);
+    uint b7 = load_byte(sc_offset + 7);
+    uint b8 = load_byte(sc_offset + 8);
+    uint b9 = load_byte(sc_offset + 9);
+    uint b10 = load_byte(sc_offset + 10);
+    uint b11 = load_byte(sc_offset + 11);
+
+    uint sc, mn;
+    if (is < 4) {
+        uint[4] b_lo = uint[](b0, b1, b2, b3);
+        uint[4] b_hi = uint[](b4, b5, b6, b7);
+        sc = b_lo[is] & 0x3F;
+        mn = b_hi[is] & 0x3F;
+    } else {
+        uint[4] b_hi2 = uint[](b8, b9, b10, b11);
+        uint[4] b_lo = uint[](b0, b1, b2, b3);
+        uint[4] b_mid = uint[](b4, b5, b6, b7);
+        uint idx = is - 4;
+        uint q_is4 = b_hi2[idx];
+        uint q_is4n = b_lo[idx];
+        uint q_is = b_mid[idx];
+        sc = (q_is4 & 0xF) | (((q_is4n >> 6) & 0x3) << 4);
+        mn = ((q_is4 >> 4) & 0xF) | (((q_is >> 6) & 0x3) << 4);
+    }
+
+    d_scaled = d * float(sc);
+    m_scaled = dmin * float(mn);
+}
+
+// Load 5-bit quantized value using correct Q5K layout
+uint load_q5_value(uint block_byte, uint off) {
+    uint l = off % 32;
+    uint group = off / 32;
+    bool is_upper_nibble = (group % 2) == 1;
+    uint qs_idx = (group / 2) * 32 + l;
+    uint qh_idx = l;
+    uint qh_mask = 1u << group;
+
+    uint qs_byte = load_byte(block_byte + 48 + qs_idx);
+    uint qh_byte = load_byte(block_byte + 16 + qh_idx);
+
+    uint q_nibble = is_upper_nibble ? (qs_byte >> 4) : (qs_byte & 0xF);
+    uint q_high_bit = ((qh_byte & qh_mask) != 0) ? 16u : 0u;
+    uint q5 = q_nibble + q_high_bit;
+
+    return q5;
+}
+
+// Dequantize 2 consecutive Q5K elements at once
+vec2 dequantize_q5_vec2(uint block_byte, uint elem_idx0,
+                        float cached_d_scaled[NUM_SCALES],
+                        float cached_m_scaled[NUM_SCALES]) {
+    // Load two quantized values
+    uint q0 = load_q5_value(block_byte, elem_idx0);
+    uint q1 = load_q5_value(block_byte, elem_idx0 + 1);
+
+    // Get scales from cached values (8 groups of 32 elements each)
+    uint group0 = elem_idx0 / 32;
+    uint group1 = (elem_idx0 + 1) / 32;
+
+    float d_scaled0 = cached_d_scaled[group0];
+    float m_scaled0 = cached_m_scaled[group0];
+    float d_scaled1 = cached_d_scaled[group1];
+    float m_scaled1 = cached_m_scaled[group1];
+
+    // Dequantize: weight = d_scaled * q - m_scaled
+    return vec2(
+        d_scaled0 * float(q0) - m_scaled0,
+        d_scaled1 * float(q1) - m_scaled1
+    );
+}
+
+// ============================================================================
+// Main kernel
+// ============================================================================
+// Dispatch: (ceil(n/4), batch, 1)
+// Each workgroup processes 4 output elements (1 per warp)
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint warp = gl_LocalInvocationID.y;
+    uint out_n = gl_WorkGroupID.x * NWARPS + warp;
+    uint batch = gl_WorkGroupID.y;
+
+    if (out_n >= op_n) {
+        return;
+    }
+
+    uint a_offset = op_a_offset + batch * op_a_stride_b;
+    uint num_blocks = (op_k + Q5_K_K - 1) / Q5_K_K;
+    uint weight_row_start = out_n * num_blocks * Q5_K_K_BYTES;
+
+    float sum = 0.0;
+
+    // Each Q5_K block has 256 elements in 8 groups of 32 elements
+    // Distribute work: 32 threads process 256 elements (8 elements per thread)
+    for (uint blk = 0; blk < num_blocks; blk++) {
+        uint k_start = blk * Q5_K_K;
+        uint block_byte = weight_row_start + blk * Q5_K_K_BYTES;
+
+        // Cache scales in shared memory: first 8 threads load all 8 scales
+        if (lane < NUM_SCALES) {
+            float d_scaled, m_scaled;
+            get_q5k_scale_min(block_byte, lane, d_scaled, m_scaled);
+            shared_d_scaled[warp][lane] = d_scaled;
+            shared_m_scaled[warp][lane] = m_scaled;
+        }
+        subgroupBarrier();
+
+        // All threads read cached scales into registers
+        float cached_d_scaled[NUM_SCALES];
+        float cached_m_scaled[NUM_SCALES];
+        for (uint s = 0; s < NUM_SCALES; s++) {
+            cached_d_scaled[s] = shared_d_scaled[warp][s];
+            cached_m_scaled[s] = shared_m_scaled[warp][s];
+        }
+
+        // Each thread processes 8 elements in 4 iterations of 2 elements each
+        for (uint i = 0; i < 8; i += 2) {
+            uint elem_idx0 = lane * 8 + i;  // 0-255
+            uint k0 = k_start + elem_idx0;
+
+            if (k0 + 1 < op_k) {
+                // Dequantize 2 elements at once
+                vec2 weights = dequantize_q5_vec2(block_byte, elem_idx0,
+                                                  cached_d_scaled, cached_m_scaled);
+
+                // Load 2 activations
+                uint a_idx0 = a_offset + k0 * op_a_stride_k;
+                vec2 a_vals = vec2(
+                    v_input_a[a_idx0],
+                    v_input_a[a_idx0 + op_a_stride_k]
+                );
+
+                // Accumulate with explicit FMA
+                sum = fma(weights.x, a_vals.x, sum);
+                sum = fma(weights.y, a_vals.y, sum);
+            } else if (k0 < op_k) {
+                // Handle last element if odd number of elements
+                uint q = load_q5_value(block_byte, elem_idx0);
+                uint group = elem_idx0 / 32;
+                float weight = cached_d_scaled[group] * float(q) - cached_m_scaled[group];
+                uint a_idx = a_offset + k0 * op_a_stride_k;
+                sum += weight * v_input_a[a_idx];
+            }
+        }
+    }
+
+    // Warp-level reduction
+    sum = warp_reduce_sum(sum);
+
+    // Lane 0 writes result
+    if (lane == 0) {
+        v_dest[batch * op_n + out_n] = sum;
+    }
+}

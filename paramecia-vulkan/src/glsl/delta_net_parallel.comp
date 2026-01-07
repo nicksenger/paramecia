@@ -1,0 +1,174 @@
+// DeltaNet Parallel (Prefill) - GLSL/SPIR-V version
+//
+// Processes multiple tokens in parallel for prefill, modeled after CUDA kernel.
+// Each workgroup handles one (batch, head) pair, processing tokens sequentially
+// (due to state dependency) but with parallel computation within each token.
+//
+// Algorithm per token:
+//   1. Decay state: state[i,j] *= exp(gate)
+//   2. Compute kv_mem: kv_mem[i] = sum_j(state[i,j] * k[j])
+//   3. Compute delta: delta[i] = (v[i] - kv_mem[i]) * beta
+//   4. Update state: state[i,j] += k[j] * delta[i]
+//   5. Compute output: output[i] = sum_j(state[i,j] * q[j])
+//   6. Save intermediate state
+//
+// Bindings:
+//   binding 0: Q [batch, heads, tokens, dim]
+//   binding 1: K [batch, heads, tokens, dim]
+//   binding 2: V [batch, heads, tokens, dim]
+//   binding 3: Gate [batch, heads, tokens]
+//   binding 4: Beta [batch, heads, tokens]
+//   binding 5: State (input) [batch, heads, dim, dim]
+//   binding 6: Output [batch, heads, tokens, dim]
+//   binding 7: New state [batch, heads, dim, dim]
+//   binding 8: Intermediate states [batch, heads, tokens, dim, dim]
+//
+// Dispatch: (batch, num_heads, 1) with workgroup size (HEAD_DIM, 1, 1)
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+
+layout(local_size_x = HEAD_DIM, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint batch;
+    uint num_heads;
+    uint num_tokens;
+    uint head_dim;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer QBuf {
+    float v_q[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer KBuf {
+    float v_k[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer VBuf {
+    float v_v[];
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer GateBuf {
+    float v_gate[];
+};
+
+layout(set = 0, binding = 4, std430) readonly buffer BetaBuf {
+    float v_beta[];
+};
+
+// Input state: [batch, heads, dim, dim]
+layout(set = 0, binding = 5, std430) readonly buffer StateBuf {
+    float v_state[];
+};
+
+// Output: [batch, heads, tokens, dim]
+layout(set = 0, binding = 6, std430) writeonly buffer OutputBuf {
+    float v_output[];
+};
+
+// New state: [batch, heads, dim, dim]
+layout(set = 0, binding = 7, std430) buffer NewStateBuf {
+    float v_new_state[];
+};
+
+// Intermediate states: [batch, heads, tokens, dim, dim]
+layout(set = 0, binding = 8, std430) writeonly buffer InterStateBuf {
+    float inter_states[];
+};
+
+// Shared memory for per-token vectors
+shared float s_k[HEAD_DIM];
+shared float s_v[HEAD_DIM];
+shared float s_delta[HEAD_DIM];
+shared float s_kv_mem[HEAD_DIM];
+
+void main() {
+    uint b = gl_WorkGroupID.x;   // batch index
+    uint h = gl_WorkGroupID.y;   // head index
+    uint tid = gl_LocalInvocationID.x;  // thread id = dimension index
+
+    if (b >= batch || h >= num_heads || tid >= head_dim) return;
+
+    // Base indices for this (batch, head) pair
+    uint qkv_base = b * num_heads * num_tokens * head_dim + h * num_tokens * head_dim;
+    uint gate_base = b * num_heads * num_tokens + h * num_tokens;
+    uint state_base = b * num_heads * head_dim * head_dim + h * head_dim * head_dim;
+    uint inter_state_base = b * num_heads * num_tokens * head_dim * head_dim
+                          + h * num_tokens * head_dim * head_dim;
+
+    uint output_base = b * num_heads * num_tokens * head_dim + h * num_tokens * head_dim;
+    uint new_state_base = state_base;
+
+    // Copy initial state to new-state buffer.
+    for (uint idx = tid; idx < head_dim * head_dim; idx += HEAD_DIM) {
+        v_new_state[new_state_base + idx] = v_state[state_base + idx];
+    }
+    barrier();
+
+    // Process tokens sequentially (state dependency) but with parallel computation within
+    for (uint t = 0; t < num_tokens; t++) {
+        uint token_offset = t * head_dim;
+        uint inter_state_offset = t * head_dim * head_dim;
+
+        // Load k, v for this token into shared memory
+        for (uint i = tid; i < head_dim; i += HEAD_DIM) {
+            s_k[i] = v_k[qkv_base + token_offset + i];
+            s_v[i] = v_v[qkv_base + token_offset + i];
+        }
+        barrier();
+
+        // Load gate and beta for this token
+        float g = exp(v_gate[gate_base + t]);
+        float beta_val = v_beta[gate_base + t];  // Already sigmoided
+
+        // Step 1: Decay state
+        for (uint i = tid; i < head_dim; i += HEAD_DIM) {
+            for (uint j = 0; j < head_dim; j++) {
+                v_new_state[new_state_base + i * head_dim + j] *= g;
+            }
+        }
+        barrier();
+
+        // Step 2: Compute kv_mem from decayed state
+        for (uint i = tid; i < head_dim; i += HEAD_DIM) {
+            float acc = 0.0;
+            for (uint j = 0; j < head_dim; j++) {
+                acc += v_new_state[new_state_base + i * head_dim + j] * s_k[j];
+            }
+            s_kv_mem[i] = acc;
+        }
+        barrier();
+
+        // Step 3: Compute delta = (v - kv_mem) * beta
+        for (uint i = tid; i < head_dim; i += HEAD_DIM) {
+            s_delta[i] = (s_v[i] - s_kv_mem[i]) * beta_val;
+        }
+        barrier();
+
+        // Step 4: Update decayed state, compute output, AND save intermediate state
+        for (uint i = tid; i < head_dim; i += HEAD_DIM) {
+            float out_acc = 0.0;
+
+            for (uint j = 0; j < head_dim; j++) {
+                float decayed_val = v_new_state[new_state_base + i * head_dim + j];
+                float updated_val = decayed_val + s_k[j] * s_delta[i];
+                v_new_state[new_state_base + i * head_dim + j] = updated_val;
+
+                // Save to intermediate state buffer
+                inter_states[inter_state_base + inter_state_offset + i * head_dim + j] = updated_val;
+
+                // Accumulate output
+                out_acc += updated_val * v_q[qkv_base + token_offset + j];
+            }
+
+            v_output[output_base + token_offset + i] = out_acc;
+        }
+        barrier();
+    }
+}

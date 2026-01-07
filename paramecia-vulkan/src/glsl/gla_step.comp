@@ -1,0 +1,137 @@
+// Gated Linear Attention (GLA) Single-Token Step - GLSL/SPIR-V version
+//
+// Computes single-token autoregressive GLA step:
+//   1. L2 normalize Q (with scale) and K
+//   2. Decay state: new_state = state * exp(gate)
+//   3. Compute kv_mem: kv_mem[i] = sum_j(new_state[i,j] * k[j])
+//   4. Compute delta: delta[i] = (v[i] - kv_mem[i]) * sigmoid(beta)
+//   5. Update state: new_state[i,j] += k[j] * delta[i]
+//   6. Output: out[i] = sum_j(new_state[i,j] * q[j])
+//
+// Each buffer is bound separately (no packing):
+//   binding 0: Q [batch_heads * d]
+//   binding 1: K [batch_heads * d]
+//   binding 2: V [batch_heads * d]
+//   binding 3: Gate [batch_heads]
+//   binding 4: Beta [batch_heads]
+//   binding 5: State (input) [batch_heads * d * d]
+//   binding 6: New State (output) [batch_heads * d * d]
+//   binding 7: Output [batch_heads * d]
+//
+// Push constants: batch_heads (uint), d (uint), scale (float), eps (float)
+//
+// Each thread handles one ROW of the state matrix (tid = row index i).
+// Dispatch: (batch_heads, 1, 1) with workgroup size (HEAD_DIM, 1, 1)
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+
+layout(local_size_x = HEAD_DIM, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint batch_heads;
+    uint d;
+    float scale;
+    float eps;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer QBuf { float v_q[]; };
+layout(set = 0, binding = 1, std430) readonly buffer KBuf { float v_k[]; };
+layout(set = 0, binding = 2, std430) readonly buffer VBuf { float v_v[]; };
+layout(set = 0, binding = 3, std430) readonly buffer GateBuf { float v_gate[]; };
+layout(set = 0, binding = 4, std430) readonly buffer BetaBuf { float v_beta[]; };
+layout(set = 0, binding = 5, std430) readonly buffer StateBuf { float v_state[]; };
+layout(set = 0, binding = 6, std430) buffer NewStateBuf { float v_new_state[]; };
+layout(set = 0, binding = 7, std430) writeonly buffer OutBuf { float v_out[]; };
+
+shared float s_q[HEAD_DIM];
+shared float s_k[HEAD_DIM];
+shared float s_v[HEAD_DIM];
+shared float s_norm[2]; // [q_rsqrt_norm, k_rsqrt_norm]
+shared float s_partial_q[32]; // subgroup partial sums
+shared float s_partial_k[32];
+
+void main() {
+    uint bh = gl_WorkGroupID.x;  // batch_head index
+    uint tid = gl_LocalInvocationID.x;  // thread id = ROW index
+
+    if (bh >= batch_heads || tid >= d) return;
+
+    // Load q, k, v into shared memory (raw, un-normalized)
+    uint qkv_idx = bh * d + tid;
+    float q_val = v_q[qkv_idx];
+    float k_val = v_k[qkv_idx];
+    s_v[tid] = v_v[qkv_idx];
+
+    // Compute partial L2 norm squared via subgroup reduction
+    float q_sq = subgroupAdd(q_val * q_val);
+    float k_sq = subgroupAdd(k_val * k_val);
+
+    // Store subgroup partials
+    if (gl_SubgroupInvocationID == 0) {
+        s_partial_q[gl_SubgroupID] = q_sq;
+        s_partial_k[gl_SubgroupID] = k_sq;
+    }
+    barrier();
+
+    // Thread 0 reduces across subgroups
+    if (tid == 0) {
+        float total_q = 0.0;
+        float total_k = 0.0;
+        for (uint i = 0; i < gl_NumSubgroups; ++i) {
+            total_q += s_partial_q[i];
+            total_k += s_partial_k[i];
+        }
+        s_norm[0] = inversesqrt(total_q + eps);
+        s_norm[1] = inversesqrt(total_k + eps);
+    }
+    barrier();
+
+    // Normalize: q *= scale * rsqrt(||q||^2 + eps), k *= rsqrt(||k||^2 + eps)
+    s_q[tid] = q_val * scale * s_norm[0];
+    s_k[tid] = k_val * s_norm[1];
+    barrier();
+
+    // Load gate and beta
+    float g = exp(v_gate[bh]);
+    float beta_val = v_beta[bh];
+    float b = 1.0 / (1.0 + exp(-beta_val));  // sigmoid
+
+    // State pointers for this batch_head
+    uint state_base = bh * d * d;
+
+    // Step 1: Decay state and copy to new_state
+    for (uint j = 0; j < d; ++j) {
+        uint idx = state_base + tid * d + j;
+        v_new_state[idx] = v_state[idx] * g;
+    }
+    barrier();
+
+    // Step 2: Compute kv_mem = (new_state @ k)[tid]
+    float kv_mem = 0.0;
+    for (uint j = 0; j < d; ++j) {
+        kv_mem += v_new_state[state_base + tid * d + j] * s_k[j];
+    }
+
+    // Step 3: Compute delta[tid] = (v[tid] - kv_mem[tid]) * sigmoid(beta)
+    float delta = (s_v[tid] - kv_mem) * b;
+
+    // Step 4: Update new_state: new_state[tid, j] += k[j] * delta[tid]
+    for (uint j = 0; j < d; ++j) {
+        v_new_state[state_base + tid * d + j] += s_k[j] * delta;
+    }
+    barrier();
+
+    // Step 5: Compute output: out[tid] = sum_j(new_state[tid, j] * q[j])
+    float out_val = 0.0;
+    for (uint j = 0; j < d; ++j) {
+        out_val += v_new_state[state_base + tid * d + j] * s_q[j];
+    }
+
+    v_out[bh * d + tid] = out_val;
+}

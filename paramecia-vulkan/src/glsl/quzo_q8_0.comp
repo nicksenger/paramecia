@@ -1,0 +1,96 @@
+// QuZO Q8_0 perturbation / restore+update kernel
+//
+// Q8_0 block: [f16 d (2 bytes)][i8 qs[32] (32 bytes)] = 34 bytes
+// Process 2 blocks per workgroup (68 bytes = 17 u32 words, aligned)
+// 64 threads: 32 per sub-block
+//
+// Compile with: -DMODE_PERTURB=1 or -DMODE_RESTORE_UPDATE=1
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer DataBuf { uint data_buf[]; };
+layout(set = 0, binding = 1) buffer PerturbBuf { float perturbation[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint count;       // num_blocks
+    float param1;     // epsilon or restore_epsilon
+    float param2;     // unused or update_scale
+    uint seed1_lo;
+    uint seed1_hi;
+    uint seed2_lo;
+    uint seed2_hi;
+    uint flags;       // bit 0 = add (perturb only)
+};
+
+shared uint s_data[17]; // 2 blocks = 68 bytes = 17 words
+
+#include "quzo_common.comp"
+
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint sub_block = tid >> 5; // 0 or 1
+    uint elem = tid & 31u;    // element within sub-block
+    uint block_idx = wg * 2u + sub_block;
+
+    // Load 2 blocks into shared memory
+    uint global_word_base = wg * 17u;
+    if (tid < 17u) {
+        s_data[tid] = data_buf[global_word_base + tid];
+    }
+    barrier();
+
+    if (block_idx >= count) return;
+
+    // Block byte offset within shared memory
+    uint block_byte = sub_block * 34u;
+
+    // Read scale (f16 at block_byte)
+    float d = read_f16_shared(block_byte);
+
+    if (abs(d) < 1e-10) return; // zero scale, nothing to do
+
+    // Read quant value (i8 at block_byte + 2 + elem)
+    uint qs_byte = block_byte + 2u + elem;
+    int qs_val = read_sbyte(qs_byte);
+
+    // Dequantize
+    float val = d * float(qs_val);
+
+    // Global element index for perturbation lookup
+    uint global_elem = block_idx * 32u + elem;
+    float perturb = perturbation[global_elem];
+
+    // Initialize RNG
+    uint64_t seed = (uint64_t(seed1_hi) << 32) | uint64_t(seed1_lo);
+
+#ifdef MODE_PERTURB
+    float sign = ((flags & 1u) != 0u) ? 1.0 : -1.0;
+    val += sign * param1 * perturb;
+    uint64_t rng = init_rng(seed, global_elem);
+#else // MODE_RESTORE_UPDATE
+    val += param1 * perturb; // restore
+    val -= param2 * perturb; // update
+    uint64_t update_seed = (uint64_t(seed2_hi) << 32) | uint64_t(seed2_lo);
+    uint64_t rng = init_rng(update_seed, global_elem);
+#endif
+
+    // Re-quantize with stochastic rounding
+    float q_float = val / d;
+    int new_q = stochastic_round_i8(q_float, rng);
+
+    // Write back to shared memory
+    uint qs_word_idx = qs_byte >> 2;
+    uint qs_byte_pos = qs_byte & 3u;
+    write_byte_shared(qs_word_idx, qs_byte_pos, uint(new_q) & 0xFFu);
+
+    barrier();
+
+    // Write shared memory back to global
+    if (tid < 17u) {
+        data_buf[global_word_base + tid] = s_data[tid];
+    }
+}

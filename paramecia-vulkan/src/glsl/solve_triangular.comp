@@ -1,0 +1,80 @@
+// Triangular Solve: X = B + L * X (forward substitution)
+//
+// Solves (I - L) * X = B where L is strictly lower triangular
+// Equivalent to: X = B + L * X via forward substitution
+//
+// Algorithm (sequential in i, parallel in k):
+//   for i = 0 to n-1:
+//     X[i, :] = B[i, :] + sum_{j<i} L[i,j] * X[j, :]
+//
+// Input shapes:
+//   L: [batch, n, n] - strictly lower triangular matrix
+//   B: [batch, n, k] - right-hand side matrix
+// Output:
+//   X: [batch, n, k] - solution matrix
+//
+// This shader processes one batch at a time, one row i at a time.
+// Within each row, threads parallelize across the k columns.
+//
+// Dispatch: (batch, n, 1) with workgroup size (min(k, 256), 1, 1)
+
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint batch_size;  // Number of batches
+    uint n;           // Matrix dimension (rows/cols of L, rows of B/X)
+    uint k;           // Number of columns in B/X
+    uint row;         // Current row being processed (0 to n-1)
+};
+
+// Input: L matrix [batch, n, n]
+layout(set = 0, binding = 0, std430) readonly buffer LBuf {
+    float l_data[];
+};
+
+// Input: B matrix [batch, n, k]
+layout(set = 0, binding = 1, std430) readonly buffer BBuf {
+    float b_data[];
+};
+
+// Output: X matrix [batch, n, k] (also used as input for previously computed rows)
+layout(set = 0, binding = 2, std430) buffer XBuf {
+    float x_data[];
+};
+
+void main() {
+    uint batch_idx = gl_GlobalInvocationID.x / k;  // Which batch
+    uint col_idx = gl_GlobalInvocationID.x % k;    // Which column of X/B
+
+    // Bounds check
+    if (batch_idx >= batch_size || col_idx >= k) {
+        return;
+    }
+
+    uint i = row;  // Current row from push constant
+
+    // Strides
+    uint l_stride = n * n;
+    uint x_stride = n * k;
+
+    // Start with B[batch, i, col]
+    uint b_idx = batch_idx * x_stride + i * k + col_idx;
+    float result = b_data[b_idx];
+
+    // Add sum_{j=0}^{i-1} L[batch, i, j] * X[batch, j, col]
+    for (uint j = 0; j < i; j++) {
+        uint l_idx = batch_idx * l_stride + i * n + j;
+        uint x_idx = batch_idx * x_stride + j * k + col_idx;
+
+        float l_ij = l_data[l_idx];
+        float x_j = x_data[x_idx];
+
+        result += l_ij * x_j;
+    }
+
+    // Write result to X[batch, i, col]
+    uint x_out_idx = batch_idx * x_stride + i * k + col_idx;
+    x_data[x_out_idx] = result;
+}

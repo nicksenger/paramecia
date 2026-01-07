@@ -1,0 +1,191 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#ifndef ACT_DTYPE
+// 0=f32, 1=f16, 2=bf16
+#define ACT_DTYPE 0
+#endif
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint logits_base;
+    uint n_tokens;
+    uint n_experts;
+    uint topk;
+    uint x_groups;
+} pc;
+
+#if ACT_DTYPE == 0
+layout(set = 0, binding = 0) readonly buffer LogitsBuffer {
+    float logits[];
+};
+#else
+layout(set = 0, binding = 0) readonly buffer LogitsBuffer {
+    uint16_t logits[];
+};
+#endif
+
+layout(set = 0, binding = 1) writeonly buffer WeightsBuffer {
+    float weights[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer IndicesBuffer {
+    uint indices[];
+};
+
+const uint WG_SIZE = 32u;
+const uint MAX_TOPK = 32u;
+const float NEG_INF = -3.402823466e+38;
+
+shared float s_val[WG_SIZE];
+shared uint s_idx[WG_SIZE];
+shared uint s_top_idx[MAX_TOPK];
+shared float s_top_logit[MAX_TOPK];
+shared float s_max_logit;
+shared float s_sum_exp;
+
+float load_activation(uint idx) {
+#if ACT_DTYPE == 1
+    return unpackHalf2x16(uint(logits[idx])).x;
+#elif ACT_DTYPE == 2
+    return uintBitsToFloat(uint(logits[idx]) << 16);
+#else
+    return logits[idx];
+#endif
+}
+
+bool is_selected(uint expert, uint used_topk) {
+    for (uint i = 0u; i < used_topk; ++i) {
+        if (s_top_idx[i] == expert) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void main() {
+    uint token_idx = gl_WorkGroupID.x + gl_WorkGroupID.y * pc.x_groups;
+    if (token_idx >= pc.n_tokens) {
+        return;
+    }
+
+    uint lane = gl_LocalInvocationID.x;
+    uint row_base = pc.logits_base + token_idx * pc.n_experts;
+
+    // Pass 1: row max for numerically stable softmax.
+    float local_max = NEG_INF;
+    for (uint expert = lane; expert < pc.n_experts; expert += WG_SIZE) {
+        float v = load_activation(row_base + expert);
+        if (v > local_max) {
+            local_max = v;
+        }
+    }
+    s_val[lane] = local_max;
+    barrier();
+
+    for (uint offset = WG_SIZE / 2u; offset > 0u; offset >>= 1u) {
+        if (lane < offset) {
+            float other = s_val[lane + offset];
+            if (other > s_val[lane]) {
+                s_val[lane] = other;
+            }
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        s_max_logit = s_val[0];
+    }
+    barrier();
+
+    // Pass 2: sum(exp(logit - max)).
+    float local_sum = 0.0;
+    for (uint expert = lane; expert < pc.n_experts; expert += WG_SIZE) {
+        float v = load_activation(row_base + expert);
+        local_sum += exp(v - s_max_logit);
+    }
+    s_val[lane] = local_sum;
+    barrier();
+
+    for (uint offset = WG_SIZE / 2u; offset > 0u; offset >>= 1u) {
+        if (lane < offset) {
+            s_val[lane] += s_val[lane + offset];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        s_sum_exp = s_val[0];
+    }
+    barrier();
+
+    uint capped_topk = min(pc.topk, min(pc.n_experts, MAX_TOPK));
+    if (capped_topk == 0u) {
+        return;
+    }
+
+    // Repeated argmax on logits (same ordering as softmax probabilities).
+    for (uint k = 0u; k < capped_topk; ++k) {
+        float best_val = NEG_INF;
+        uint best_expert = 0xffffffffu;
+
+        for (uint expert = lane; expert < pc.n_experts; expert += WG_SIZE) {
+            if (is_selected(expert, k)) {
+                continue;
+            }
+            float v = load_activation(row_base + expert);
+            if (v > best_val || (v == best_val && expert < best_expert)) {
+                best_val = v;
+                best_expert = expert;
+            }
+        }
+
+        s_val[lane] = best_val;
+        s_idx[lane] = best_expert;
+        barrier();
+
+        for (uint offset = WG_SIZE / 2u; offset > 0u; offset >>= 1u) {
+            if (lane < offset) {
+                float other_val = s_val[lane + offset];
+                uint other_idx = s_idx[lane + offset];
+                float cur_val = s_val[lane];
+                uint cur_idx = s_idx[lane];
+                if (other_val > cur_val || (other_val == cur_val && other_idx < cur_idx)) {
+                    s_val[lane] = other_val;
+                    s_idx[lane] = other_idx;
+                }
+            }
+            barrier();
+        }
+
+        if (lane == 0u) {
+            s_top_logit[k] = s_val[0];
+            s_top_idx[k] = s_idx[0];
+        }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        float inv_sum = 1.0 / max(s_sum_exp, 1e-20);
+        float selected_sum = 0.0;
+        for (uint k = 0u; k < capped_topk; ++k) {
+            float w = exp(s_top_logit[k] - s_max_logit) * inv_sum;
+            s_top_logit[k] = w;
+            selected_sum += w;
+        }
+
+        float inv_selected = 1.0 / max(selected_sum, 1e-20);
+        uint out_base = token_idx * pc.topk;
+        for (uint k = 0u; k < capped_topk; ++k) {
+            weights[out_base + k] = s_top_logit[k] * inv_selected;
+            indices[out_base + k] = s_top_idx[k];
+        }
+
+        // Fill any remaining entries if host asked for topk > MAX_TOPK.
+        for (uint k = capped_topk; k < pc.topk; ++k) {
+            weights[out_base + k] = 0.0;
+            indices[out_base + k] = 0u;
+        }
+    }
+}

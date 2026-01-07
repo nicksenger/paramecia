@@ -1,0 +1,210 @@
+// QuZO Q5K perturbation / restore+update kernel
+//
+// Q5K block: [half2 dm (4)][scales[12] (12)][qh[32] (32)][qs[128] (128)] = 176 bytes = 44 words (aligned)
+// 64 threads, each handles 4 elements
+// 256 elements per block
+//
+// Compile with: -DMODE_PERTURB=1 or -DMODE_RESTORE_UPDATE=1
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer DataBuf { uint data_buf[]; };
+layout(set = 0, binding = 1) buffer PerturbBuf { float perturbation[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint count;
+    float param1;
+    float param2;
+    uint seed1_lo;
+    uint seed1_hi;
+    uint seed2_lo;
+    uint seed2_hi;
+    uint flags;
+};
+
+shared uint s_data[44]; // 176 bytes = 44 words
+
+#include "quzo_common.comp"
+
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (wg >= count) return;
+
+    // Load block into shared memory
+    uint global_word_base = wg * 44u;
+    if (tid < 44u) {
+        s_data[tid] = data_buf[global_word_base + tid];
+    }
+    barrier();
+
+    // Block layout offsets (bytes):
+    // dm: 0-3, scales: 4-15, qh: 16-47, qs: 48-175
+    uint dm_byte = 0u;
+    uint scales_byte = 4u;
+    uint qh_byte = 16u;
+    uint qs_byte = 48u;
+
+    // Read dm
+    vec2 dm = unpackHalf2x16(s_data[0]);
+    float dall = dm.x;
+    float dmin = dm.y;
+
+    if (abs(dall) < 1e-10) return;
+
+    // Thread mapping
+    uint il = tid >> 4;     // 0-3 (sub-block pair)
+    uint ir = tid & 15u;
+    uint is_idx = 2u * il;
+
+    uint global_base = wg * 256u;
+    uint64_t seed = (uint64_t(seed1_hi) << 32) | uint64_t(seed1_lo);
+#ifndef MODE_PERTURB
+    uint64_t update_seed = (uint64_t(seed2_hi) << 32) | uint64_t(seed2_lo);
+#endif
+
+    // Process 4 elements per thread
+    // Element 0: low nibble of qs[32*il + 2*ir], scale is_idx, qh bit at 2*il
+    // Element 1: low nibble of qs[32*il + 2*ir+1], scale is_idx, qh bit at 2*il
+    // Element 2: high nibble of qs[32*il + 2*ir], scale is_idx+1, qh bit at 2*il+1
+    // Element 3: high nibble of qs[32*il + 2*ir+1], scale is_idx+1, qh bit at 2*il+1
+
+    uint qs_off0 = qs_byte + 32u * il + 2u * ir;
+    uint qs_off1 = qs_off0 + 1u;
+
+    uint qh_off0 = qh_byte + 2u * ir;
+    uint qh_off1 = qh_off0 + 1u;
+
+    // Read qs bytes
+    uint qs0_w = qs_off0 >> 2; uint qs0_bp = qs_off0 & 3u;
+    uint qs1_w = qs_off1 >> 2; uint qs1_bp = qs_off1 & 3u;
+    uint qs0_packed = (s_data[qs0_w] >> (qs0_bp * 8u)) & 0xFFu;
+    uint qs1_packed = (s_data[qs1_w] >> (qs1_bp * 8u)) & 0xFFu;
+
+    // Read qh bytes
+    uint qh0_w = qh_off0 >> 2; uint qh0_bp = qh_off0 & 3u;
+    uint qh1_w = qh_off1 >> 2; uint qh1_bp = qh_off1 & 3u;
+    uint qh0_val = (s_data[qh0_w] >> (qh0_bp * 8u)) & 0xFFu;
+    uint qh1_val = (s_data[qh1_w] >> (qh1_bp * 8u)) & 0xFFu;
+
+    uint hm = 1u << (2u * il); // bit mask for element 0,1
+    uint hm2 = hm << 1;        // bit mask for element 2,3
+
+    // Get scales
+    float sc0, m0, sc1, m1;
+    get_scale_min_k4(scales_byte, is_idx, sc0, m0);
+    get_scale_min_k4(scales_byte, is_idx + 1u, sc1, m1);
+
+    float d1 = dall * sc0;
+    float dm1 = dmin * m0;
+    float d2 = dall * sc1;
+    float dm2 = dmin * m1;
+
+    // -- Element 0: low nibble qs0, qh0 bit hm --
+    {
+        uint q4 = qs0_packed & 0xFu;
+        uint q5 = q4 + ((qh0_val & hm) != 0u ? 16u : 0u);
+        uint elem = 64u * il + 2u * ir;
+        uint global_elem = global_base + elem;
+        float val = d1 * float(q5) - dm1;
+        float perturb = perturbation[global_elem];
+
+#ifdef MODE_PERTURB
+        float sign_f = ((flags & 1u) != 0u) ? 1.0 : -1.0;
+        val += sign_f * param1 * perturb;
+        uint64_t rng = init_rng(seed, global_elem);
+#else
+        val += param1 * perturb; val -= param2 * perturb;
+        uint64_t rng = init_rng(update_seed, global_elem);
+#endif
+        float q_float = abs(d1) > 1e-10 ? (val + dm1) / d1 : 0.0;
+        uint new_q5 = stochastic_round_u5(q_float, rng);
+        qs0_packed = (qs0_packed & 0xF0u) | (new_q5 & 0xFu);
+        if (new_q5 >= 16u) qh0_val |= hm; else qh0_val &= ~hm;
+    }
+
+    // -- Element 1: low nibble qs1, qh1 bit hm --
+    {
+        uint q4 = qs1_packed & 0xFu;
+        uint q5 = q4 + ((qh1_val & hm) != 0u ? 16u : 0u);
+        uint elem = 64u * il + 2u * ir + 1u;
+        uint global_elem = global_base + elem;
+        float val = d1 * float(q5) - dm1;
+        float perturb = perturbation[global_elem];
+
+#ifdef MODE_PERTURB
+        float sign_f = ((flags & 1u) != 0u) ? 1.0 : -1.0;
+        val += sign_f * param1 * perturb;
+        uint64_t rng = init_rng(seed, global_elem);
+#else
+        val += param1 * perturb; val -= param2 * perturb;
+        uint64_t rng = init_rng(update_seed, global_elem);
+#endif
+        float q_float = abs(d1) > 1e-10 ? (val + dm1) / d1 : 0.0;
+        uint new_q5 = stochastic_round_u5(q_float, rng);
+        qs1_packed = (qs1_packed & 0xF0u) | (new_q5 & 0xFu);
+        if (new_q5 >= 16u) qh1_val |= hm; else qh1_val &= ~hm;
+    }
+
+    // -- Element 2: high nibble qs0, qh0 bit hm2 --
+    {
+        uint q4 = (qs0_packed >> 4) & 0xFu;
+        uint q5 = q4 + ((qh0_val & hm2) != 0u ? 16u : 0u);
+        uint elem = 64u * il + 2u * ir + 32u;
+        uint global_elem = global_base + elem;
+        float val = d2 * float(q5) - dm2;
+        float perturb = perturbation[global_elem];
+
+#ifdef MODE_PERTURB
+        float sign_f = ((flags & 1u) != 0u) ? 1.0 : -1.0;
+        val += sign_f * param1 * perturb;
+        uint64_t rng = init_rng(seed, global_elem);
+#else
+        val += param1 * perturb; val -= param2 * perturb;
+        uint64_t rng = init_rng(update_seed, global_elem);
+#endif
+        float q_float = abs(d2) > 1e-10 ? (val + dm2) / d2 : 0.0;
+        uint new_q5 = stochastic_round_u5(q_float, rng);
+        qs0_packed = (qs0_packed & 0x0Fu) | ((new_q5 & 0xFu) << 4);
+        if (new_q5 >= 16u) qh0_val |= hm2; else qh0_val &= ~hm2;
+    }
+
+    // -- Element 3: high nibble qs1, qh1 bit hm2 --
+    {
+        uint q4 = (qs1_packed >> 4) & 0xFu;
+        uint q5 = q4 + ((qh1_val & hm2) != 0u ? 16u : 0u);
+        uint elem = 64u * il + 2u * ir + 33u;
+        uint global_elem = global_base + elem;
+        float val = d2 * float(q5) - dm2;
+        float perturb = perturbation[global_elem];
+
+#ifdef MODE_PERTURB
+        float sign_f = ((flags & 1u) != 0u) ? 1.0 : -1.0;
+        val += sign_f * param1 * perturb;
+        uint64_t rng = init_rng(seed, global_elem);
+#else
+        val += param1 * perturb; val -= param2 * perturb;
+        uint64_t rng = init_rng(update_seed, global_elem);
+#endif
+        float q_float = abs(d2) > 1e-10 ? (val + dm2) / d2 : 0.0;
+        uint new_q5 = stochastic_round_u5(q_float, rng);
+        qs1_packed = (qs1_packed & 0x0Fu) | ((new_q5 & 0xFu) << 4);
+        if (new_q5 >= 16u) qh1_val |= hm2; else qh1_val &= ~hm2;
+    }
+
+    // Write back all modified bytes
+    write_byte_shared(qs0_w, qs0_bp, qs0_packed);
+    write_byte_shared(qs1_w, qs1_bp, qs1_packed);
+    write_byte_shared(qh0_w, qh0_bp, qh0_val);
+    write_byte_shared(qh1_w, qh1_bp, qh1_val);
+
+    barrier();
+
+    if (tid < 44u) {
+        data_buf[global_word_base + tid] = s_data[tid];
+    }
+}

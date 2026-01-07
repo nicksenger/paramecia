@@ -1,0 +1,31 @@
+[package]
+name = "paramecia-nn"
+version = "0.1.0"
+edition = "2021"
+description = "Neural network utilities for Paramecia"
+license = "Apache-2.0"
+
+[dependencies]
+accelerate-src = { version = "0.3.2", optional = true }
+paramecia-core = { workspace = true }
+half = { workspace = true }
+intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"], optional = true }
+num-traits = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+paramecia-metal = { path = "../paramecia-metal", optional = true }
+
+[dev-dependencies]
+anyhow = { version = "1", features = ["backtrace"] }
+clap = { version = "4.2.4", features = ["derive"] }
+rand = "0.9.0"
+rand_distr = "0.5.1"
+
+[features]
+default = []
+accelerate = ["dep:accelerate-src", "paramecia-core/accelerate"]
+cuda = ["paramecia-core/cuda"]
+cudnn = ["paramecia-core/cudnn"]
+mkl = ["dep:intel-mkl-src", "paramecia-core/mkl"]
+metal = ["paramecia-core/metal", "dep:paramecia-metal"]
+vulkan = ["paramecia-core/vulkan"]

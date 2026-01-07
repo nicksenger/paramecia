@@ -1,0 +1,301 @@
+// DeltaNet Parallel (Prefill) with Cooperative Matrix - GLSL/SPIR-V version
+//
+// Uses VK_KHR_cooperative_matrix for accelerated matrix operations.
+// Processes multiple tokens in parallel for prefill with tile-based computation.
+//
+// Algorithm per token (same as standard version):
+//   1. Decay state: state[i,j] *= exp(gate)
+//   2. Compute kv_mem: kv_mem[i] = sum_j(state[i,j] * k[j])
+//   3. Compute delta: delta[i] = (v[i] - kv_mem[i]) * beta
+//   4. Update state: state[i,j] += k[j] * delta[i]
+//   5. Compute output: output[i] = sum_j(state[i,j] * q[j])
+//
+// Cooperative matrix operations are used for:
+//   - Matrix-vector products (state @ k, state @ q)
+//   - Outer product state updates (k ⊗ delta)
+//
+// Bindings:
+//   binding 0: Q [batch, heads, tokens, dim]
+//   binding 1: K [batch, heads, tokens, dim]
+//   binding 2: V [batch, heads, tokens, dim]
+//   binding 3: Gate [batch, heads, tokens]
+//   binding 4: Beta [batch, heads, tokens]
+//   binding 5: State (input) [batch, heads, dim, dim]
+//   binding 6: Output [batch, heads, tokens, dim]
+//   binding 7: New state [batch, heads, dim, dim]
+//   binding 8: Intermediate states [batch, heads, tokens, dim, dim]
+//
+// Dispatch: (batch, num_heads, 1) with workgroup size (32, 1, 1)
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+
+// Tile sizes (configured at runtime via specialization constants)
+layout(constant_id = 0) const uint TILE_M = 16;
+layout(constant_id = 1) const uint TILE_N = 16;
+layout(constant_id = 2) const uint TILE_K = 16;
+
+// Workgroup size: one subgroup (typically 32 threads)
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint batch;
+    uint num_heads;
+    uint num_tokens;
+    uint head_dim;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer QBuf {
+    float v_q[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer KBuf {
+    float v_k[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer VBuf {
+    float v_v[];
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer GateBuf {
+    float v_gate[];
+};
+
+layout(set = 0, binding = 4, std430) readonly buffer BetaBuf {
+    float v_beta[];
+};
+
+layout(set = 0, binding = 5, std430) readonly buffer StateBuf {
+    float v_state[];
+};
+
+layout(set = 0, binding = 6, std430) writeonly buffer OutputBuf {
+    float v_output[];
+};
+
+layout(set = 0, binding = 7, std430) buffer NewStateBuf {
+    float v_new_state[];
+};
+
+// Intermediate states: [batch, heads, tokens, dim, dim]
+layout(set = 0, binding = 8, std430) writeonly buffer InterStateBuf {
+    float inter_states[];
+};
+
+// Shared memory for cooperative matrix operations
+shared float16_t shared_state[32 * 32];   // State matrix tiles
+shared float16_t shared_vec[32];          // Vector tiles (k, q, delta)
+shared float temp_result[32];             // Temporary results
+
+// Shared memory for per-token vectors (full dimension)
+shared float s_k[HEAD_DIM];
+shared float s_v[HEAD_DIM];
+shared float s_delta[HEAD_DIM];
+shared float s_kv_mem[HEAD_DIM];
+shared float s_output[HEAD_DIM];
+
+void main() {
+    uint b = gl_WorkGroupID.x;   // batch index
+    uint h = gl_WorkGroupID.y;   // head index
+    uint tid = gl_LocalInvocationID.x;  // thread id within subgroup
+
+    if (b >= batch || h >= num_heads) return;
+
+    // Base indices for this (batch, head) pair
+    uint qkv_base = b * num_heads * num_tokens * head_dim + h * num_tokens * head_dim;
+    uint gate_base = b * num_heads * num_tokens + h * num_tokens;
+    uint state_base = b * num_heads * head_dim * head_dim + h * head_dim * head_dim;
+    uint inter_state_base = b * num_heads * num_tokens * head_dim * head_dim
+                          + h * num_tokens * head_dim * head_dim;
+
+    uint output_base = b * num_heads * num_tokens * head_dim + h * num_tokens * head_dim;
+    uint new_state_base = state_base;
+
+    // Copy initial state to new-state buffer.
+    for (uint idx = tid; idx < head_dim * head_dim; idx += 32) {
+        v_new_state[new_state_base + idx] = v_state[state_base + idx];
+    }
+    barrier();
+
+    // Process tokens sequentially (state dependency)
+    for (uint t = 0; t < num_tokens; t++) {
+        uint token_offset = t * head_dim;
+        uint inter_state_offset = t * head_dim * head_dim;
+
+        // Load k, v for this token into shared memory
+        for (uint i = tid; i < head_dim; i += 32) {
+            s_k[i] = v_k[qkv_base + token_offset + i];
+            s_v[i] = v_v[qkv_base + token_offset + i];
+        }
+        barrier();
+
+        // Load gate and beta for this token
+        float g = exp(v_gate[gate_base + t]);
+        float beta_val = v_beta[gate_base + t];
+
+        // Step 1: Decay state (element-wise multiplication)
+        for (uint i = tid; i < head_dim * head_dim; i += 32) {
+            v_new_state[new_state_base + i] *= g;
+        }
+        barrier();
+
+        // Step 2: Compute kv_mem = state @ k using cooperative matrices
+        // Process state matrix in tiles
+        for (uint i = tid; i < head_dim; i += 32) {
+            s_kv_mem[i] = 0.0;
+        }
+        barrier();
+
+        // Tile-based matrix-vector multiply: kv_mem = state @ k
+        uint num_tiles_m = (head_dim + TILE_M - 1) / TILE_M;
+        uint num_tiles_k = (head_dim + TILE_K - 1) / TILE_K;
+
+        for (uint tile_m = 0; tile_m < num_tiles_m; tile_m++) {
+            float acc = 0.0;
+
+            for (uint tile_k = 0; tile_k < num_tiles_k; tile_k++) {
+                uint m_start = tile_m * TILE_M;
+                uint k_start = tile_k * TILE_K;
+
+                // Load state tile into shared memory
+                for (uint i = tid; i < TILE_M * TILE_K; i += 32) {
+                    uint m_idx = m_start + (i / TILE_K);
+                    uint k_idx = k_start + (i % TILE_K);
+
+                    float val = 0.0;
+                    if (m_idx < head_dim && k_idx < head_dim) {
+                        val = v_new_state[new_state_base + m_idx * head_dim + k_idx];
+                    }
+                    shared_state[i] = float16_t(val);
+                }
+
+                // Load k tile into shared memory
+                for (uint i = tid; i < TILE_K; i += 32) {
+                    uint k_idx = k_start + i;
+                    float val = (k_idx < head_dim) ? s_k[k_idx] : 0.0;
+                    shared_vec[i] = float16_t(val);
+                }
+
+                barrier();
+
+                // Compute partial dot product for this tile
+                // Each thread computes one element of the result
+                if (tid < TILE_M) {
+                    float partial = 0.0;
+                    for (uint k = 0; k < TILE_K; k++) {
+                        partial += float(shared_state[tid * TILE_K + k]) * float(shared_vec[k]);
+                    }
+                    acc += partial;
+                }
+
+                barrier();
+            }
+
+            // Store accumulated result
+            if (tid < TILE_M) {
+                uint m_idx = tile_m * TILE_M + tid;
+                if (m_idx < head_dim) {
+                    s_kv_mem[m_idx] = acc;
+                }
+            }
+            barrier();
+        }
+
+        // Step 3: Compute delta = (v - kv_mem) * beta
+        for (uint i = tid; i < head_dim; i += 32) {
+            s_delta[i] = (s_v[i] - s_kv_mem[i]) * beta_val;
+        }
+        barrier();
+
+        // Step 4: Update state with outer product: state += k ⊗ delta
+        // This is: state[i,j] += k[j] * delta[i]
+        for (uint i = tid; i < head_dim * head_dim; i += 32) {
+            uint row = i / head_dim;
+            uint col = i % head_dim;
+            v_new_state[new_state_base + i] += s_k[col] * s_delta[row];
+        }
+        barrier();
+
+        // Save intermediate state
+        for (uint i = tid; i < head_dim * head_dim; i += 32) {
+            inter_states[inter_state_base + inter_state_offset + i] =
+                v_new_state[new_state_base + i];
+        }
+        barrier();
+
+        // Step 5: Compute output = state @ q using cooperative matrices
+        // Load q for this token
+        for (uint i = tid; i < head_dim; i += 32) {
+            shared_vec[i % 32] = float16_t(v_q[qkv_base + token_offset + i]);
+        }
+
+        for (uint i = tid; i < head_dim; i += 32) {
+            s_output[i] = 0.0;
+        }
+        barrier();
+
+        // Tile-based matrix-vector multiply: output = state @ q
+        for (uint tile_m = 0; tile_m < num_tiles_m; tile_m++) {
+            float acc = 0.0;
+
+            for (uint tile_k = 0; tile_k < num_tiles_k; tile_k++) {
+                uint m_start = tile_m * TILE_M;
+                uint k_start = tile_k * TILE_K;
+
+                // Load state tile
+                for (uint i = tid; i < TILE_M * TILE_K; i += 32) {
+                    uint m_idx = m_start + (i / TILE_K);
+                    uint k_idx = k_start + (i % TILE_K);
+
+                    float val = 0.0;
+                    if (m_idx < head_dim && k_idx < head_dim) {
+                        val = v_new_state[new_state_base + m_idx * head_dim + k_idx];
+                    }
+                    shared_state[i] = float16_t(val);
+                }
+
+                // Load q tile (already in shared_vec)
+                barrier();
+
+                // Compute partial dot product
+                if (tid < TILE_M) {
+                    float partial = 0.0;
+                    for (uint k = 0; k < TILE_K; k++) {
+                        uint k_idx = k_start + k;
+                        if (k_idx < head_dim) {
+                            partial += float(shared_state[tid * TILE_K + k]) *
+                                      float(shared_vec[k_idx % 32]);
+                        }
+                    }
+                    acc += partial;
+                }
+
+                barrier();
+            }
+
+            // Store result
+            if (tid < TILE_M) {
+                uint m_idx = tile_m * TILE_M + tid;
+                if (m_idx < head_dim) {
+                    s_output[m_idx] = acc;
+                }
+            }
+            barrier();
+        }
+
+        // Write output for this token
+        for (uint i = tid; i < head_dim; i += 32) {
+            v_output[output_base + token_offset + i] = s_output[i];
+        }
+        barrier();
+    }
+}

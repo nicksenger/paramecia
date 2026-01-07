@@ -1,0 +1,222 @@
+// Q8_0 Quantized Matrix Multiplication - Cooperative Matrix version
+//
+// Computes: C[m,n] = A[m,k] * B[n,k]^T
+// Where B is Q8_0 quantized, stored row-major (each row is one output column)
+//
+// Uses VK_KHR_cooperative_matrix (Tensor Cores / WMMA / XMX) for acceleration
+//
+// Tile sizes are provided via specialization constants and must match
+// hardware capabilities queried from VkPhysicalDevice.
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Q8_0 constants
+#define QK8_0 32        // Elements per Q8_0 block
+#define QK8_0_BYTES 34  // 2 bytes f16 scale + 32 bytes i8
+
+// Tile sizes (configured at runtime via specialization constants)
+layout(constant_id = 0) const uint TILE_M = 16;
+layout(constant_id = 1) const uint TILE_N = 16;
+layout(constant_id = 2) const uint TILE_K = 16;
+
+// Workgroup size: one subgroup (typically 32 threads for NVIDIA/AMD)
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// Parameters via push constants
+layout(push_constant) uniform PushConstants {
+    uint params[8];
+    // [0]: m (rows of output)
+    // [1]: k (reduction dimension)
+    // [2]: n (columns of output)
+    // [3]: a_stride_batch
+    // [4]: a_offset
+    // [5]: a_stride_k
+    // [6]: a_stride_m
+    // [7]: unused
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+// Output buffer (f32)
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+// Input A buffer (f32) - the activations
+layout(set = 0, binding = 1, std430) readonly buffer InputA {
+    float v_input_a[];
+};
+
+// Input B buffer (Q8_0) - the quantized weights
+layout(set = 0, binding = 2, std430) readonly buffer InputB {
+    uint v_input_b[];
+};
+
+// Shared memory for dequantized tiles
+shared float16_t shared_a[16 * 16];  // Max tile for A
+shared float16_t shared_b[16 * 16];  // Max tile for B (dequantized)
+shared float temp_c[16 * 16];        // Temporary storage for result
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+// Convert packed f16 to f32 (using the low 16 bits)
+float half_to_float_lo(uint packed) {
+    return unpackHalf2x16(packed).x;
+}
+
+// Load f16 scale from Q8_0 block given byte offset
+float load_q8_scale(uint block_byte) {
+    uint word_idx = block_byte / 4;
+    uint byte_in_word = block_byte % 4;
+    uint word = v_input_b[word_idx];
+
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return half_to_float_lo(word >> 16);
+    } else {
+        // Unaligned access
+        uint word2 = v_input_b[word_idx + 1];
+        uint h;
+        if (byte_in_word == 1) {
+            h = (word >> 8) | (word2 << 24);
+        } else {
+            h = (word >> 24) | (word2 << 8);
+        }
+        return half_to_float_lo(h);
+    }
+}
+
+// Load single i8 from Q8_0 block
+int load_q8_i8(uint block_byte, uint qs_idx) {
+    uint byte_offset = block_byte + 2 + qs_idx;  // +2 to skip scale
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = v_input_b[word_idx];
+
+    // Extract and sign-extend
+    int val = int(word >> (byte_in_word * 8)) << 24 >> 24;
+    return val;
+}
+
+// ============================================================================
+// Main kernel
+// ============================================================================
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_m = gl_WorkGroupID.x * TILE_M;  // M tile start
+    uint wg_n = gl_WorkGroupID.y * TILE_N;  // N tile start
+    uint batch = gl_WorkGroupID.z;
+
+    // Early exit if out of bounds
+    if (wg_m >= op_m || wg_n >= op_n) {
+        return;
+    }
+
+    // Define cooperative matrix types
+    // MatA: TILE_M x TILE_K, row-major
+    // MatB: TILE_K x TILE_N, row-major
+    // MatC: TILE_M x TILE_N, accumulator
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> matA;
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> matC;
+
+    // Initialize accumulator to zero
+    matC = coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(0.0);
+
+    // Number of K tiles
+    uint num_k_tiles = (op_k + TILE_K - 1) / TILE_K;
+
+    // Loop over K dimension in TILE_K chunks
+    for (uint k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        uint k_start = k_tile * TILE_K;
+        uint k_end = min(k_start + TILE_K, op_k);
+        uint k_count = k_end - k_start;
+
+        // Load A tile cooperatively into shared memory
+        // Each thread loads multiple elements if needed
+        for (uint i = tid; i < TILE_M * TILE_K; i += 32) {
+            uint m_idx = wg_m + (i / TILE_K);
+            uint k_idx = k_start + (i % TILE_K);
+
+            float val = 0.0;
+            if (m_idx < op_m && k_idx < op_k) {
+                uint a_offset = op_a_offset + batch * op_a_stride_b +
+                               m_idx * op_a_stride_m + k_idx * op_a_stride_k;
+                val = v_input_a[a_offset];
+            }
+            shared_a[i] = float16_t(val);
+        }
+
+        // Dequantize B tile cooperatively into shared memory
+        // B is stored as Q8_0 blocks, each column is a row in B
+        for (uint i = tid; i < TILE_K * TILE_N; i += 32) {
+            uint k_idx = k_start + (i / TILE_N);
+            uint n_idx = wg_n + (i % TILE_N);
+
+            float val = 0.0;
+            if (k_idx < op_k && n_idx < op_n) {
+                // Find which Q8_0 block and offset within block
+                uint block_idx = k_idx / QK8_0;
+                uint block_offset = k_idx % QK8_0;
+
+                // B column n_idx is stored contiguously
+                uint num_blocks = (op_k + QK8_0 - 1) / QK8_0;
+                uint b_row_bytes = num_blocks * QK8_0_BYTES;
+                uint b_byte_offset = n_idx * b_row_bytes;
+                uint block_byte = b_byte_offset + block_idx * QK8_0_BYTES;
+
+                // Load scale and quantized value
+                float scale = load_q8_scale(block_byte);
+                int q = load_q8_i8(block_byte, block_offset);
+
+                // Dequantize
+                val = scale * float(q);
+            }
+            shared_b[i] = float16_t(val);
+        }
+
+        barrier();
+
+        // Load tiles into cooperative matrices
+        coopMatLoad(matA, shared_a, 0, TILE_K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, shared_b, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+
+        // Multiply-accumulate
+        matC = coopMatMulAdd(matA, matB, matC);
+
+        barrier();
+    }
+
+    // Store result
+    // Convert accumulator back to f32 and write to output
+    coopMatStore(matC, temp_c, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+
+    barrier();
+
+    // Write results to global memory
+    for (uint i = tid; i < TILE_M * TILE_N; i += 32) {
+        uint m_idx = wg_m + (i / TILE_N);
+        uint n_idx = wg_n + (i % TILE_N);
+
+        if (m_idx < op_m && n_idx < op_n) {
+            uint out_idx = batch * op_m * op_n + m_idx * op_n + n_idx;
+            v_dest[out_idx] = temp_c[i];
+        }
+    }
+}

@@ -1,0 +1,209 @@
+// Hierarchical Tiled Q8_0 Matrix Multiplication - PREFILL-OPTIMIZED (Phase 4)
+// Q8_0: 32 elements per block, 34 bytes each
+//
+// Configuration: BM=64, BN=64, BK=32, WM=32, WN=32
+// Phase 4 Optimizations:
+//   - K-loop unrolling (4× per iteration)
+//   - Reduced loop overhead
+// Optimized for prefill workloads (m > 8)
+// Workgroup: 128 threads = 4 warps = 2×2 warp grid
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Prefill-optimized tile configuration
+#define QK8_0 32
+#define QK8_0_BYTES 34
+#define BM 64   // Larger M for prefill
+#define BN 64   // Balanced N
+#define BK 32   // K alignment
+#define WM 32   // Larger warps
+#define WN 32
+#define TM 8    // Same thread tiles
+#define TN 8
+#define WMITER 1
+#define KUNROLL 2  // K-loop unroll factor (reduced from 4 to reduce register pressure)
+
+#include "matmul_tiled_common.glsl"
+
+layout(local_size_x = WARP_SIZE, local_size_y = NWARPS, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint params[8];
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputA {
+    float v_input_a[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer InputB {
+    uint v_input_b[];
+};
+
+shared float shared_a[BM * SHMEM_STRIDE_A];
+shared float shared_b[BK * SHMEM_STRIDE_B];
+
+#include "dequant_helpers.glsl"
+
+// Dequantize Q8_0 element at [n_idx, k_idx]
+float dequantize_q8_0(uint n_idx, uint k_idx, uint num_blocks) {
+    uint block_idx = k_idx / QK8_0;
+    uint elem_in_block = k_idx % QK8_0;
+    uint block_byte = n_idx * num_blocks * QK8_0_BYTES + block_idx * QK8_0_BYTES;
+
+    float scale = load_f16(block_byte + 0);
+    uint q_byte_offset = block_byte + 2 + elem_in_block;
+    int8_t q = int8_t(load_byte(q_byte_offset));
+
+    return scale * float(q);
+}
+
+void main() {
+    uint lane_id = gl_LocalInvocationID.x;
+    uint warp_id = gl_LocalInvocationID.y;
+    uint tid = lane_id + warp_id * WARP_SIZE;
+
+    uint wg_m = gl_WorkGroupID.y * BM;
+    uint wg_n = gl_WorkGroupID.x * BN;
+    uint batch = gl_WorkGroupID.z;
+
+    if (wg_m >= op_m || wg_n >= op_n) return;
+
+    uint thread_m, thread_n, warp_m_base, warp_n_base;
+    compute_tile_coords(warp_id, lane_id, wg_m, wg_n, thread_m, thread_n, warp_m_base, warp_n_base);
+
+    uint threads_per_warp = (WM * WN) / (TM * TN);
+    bool is_active = lane_id < threads_per_warp;
+
+    float acc[TM * TN];
+    for (uint i = 0; i < TM * TN; i++) acc[i] = 0.0;
+
+    uint a_offset = op_a_offset + batch * op_a_stride_b;
+    uint num_blocks = (op_k + QK8_0 - 1) / QK8_0;
+    uint num_k_tiles = (op_k + BK - 1) / BK;
+
+    for (uint k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        uint k_base = k_tile * BK;
+        uint k_tile_size = min(BK, op_k - k_base);
+
+        // Cooperative load A tile
+        for (uint i = tid; i < BM * BK; i += THREADS_PER_WG) {
+            uint tile_m = i / BK;
+            uint tile_k = i % BK;
+            uint global_m = wg_m + tile_m;
+            uint global_k = k_base + tile_k;
+
+            float val = 0.0;
+            if (global_m < op_m && global_k < op_k) {
+                val = v_input_a[a_offset + global_m * op_a_stride_m + global_k * op_a_stride_k];
+            }
+            shared_a[tile_m * SHMEM_STRIDE_A + tile_k] = val;
+        }
+
+        // Cooperative load & dequantize B tile
+        for (uint i = tid; i < BK * BN; i += THREADS_PER_WG) {
+            uint tile_k = i / BN;
+            uint tile_n = i % BN;
+            uint global_n = wg_n + tile_n;
+            uint global_k = k_base + tile_k;
+
+            float val = 0.0;
+            if (global_n < op_n && global_k < op_k) {
+                val = dequantize_q8_0(global_n, global_k, num_blocks);
+            }
+            shared_b[tile_k * SHMEM_STRIDE_B + tile_n] = val;
+        }
+
+        barrier();
+
+        // Compute with K-loop unrolling (Phase 4 optimization)
+        if (is_active) {
+            uint k_local = 0;
+
+            // Main unrolled loop: process KUNROLL K elements per iteration
+            for (; k_local + KUNROLL <= k_tile_size; k_local += KUNROLL) {
+                // Load all fragments first (enables better ILP)
+                float a_frag[KUNROLL][TM];
+                float b_frag[KUNROLL][TN];
+
+                #pragma unroll
+                for (uint ku = 0; ku < KUNROLL; ku++) {
+                    uint k_idx = k_local + ku;
+                    #pragma unroll
+                    for (uint tm = 0; tm < TM; tm++) {
+                        a_frag[ku][tm] = shared_a[(thread_m - wg_m + tm) * SHMEM_STRIDE_A + k_idx];
+                    }
+                    #pragma unroll
+                    for (uint tn = 0; tn < TN; tn++) {
+                        b_frag[ku][tn] = shared_b[k_idx * SHMEM_STRIDE_B + (thread_n - wg_n + tn)];
+                    }
+                }
+
+                // Compute all outer products (independent FMAs enable ILP)
+                #pragma unroll
+                for (uint ku = 0; ku < KUNROLL; ku++) {
+                    #pragma unroll
+                    for (uint tm = 0; tm < TM; tm++) {
+                        #pragma unroll
+                        for (uint tn = 0; tn < TN; tn++) {
+                            acc[tm * TN + tn] = fma(a_frag[ku][tm], b_frag[ku][tn], acc[tm * TN + tn]);
+                        }
+                    }
+                }
+            }
+
+            // Remainder loop: process remaining K elements (0-3)
+            for (; k_local < k_tile_size; k_local++) {
+                float a_frag[TM];
+                for (uint tm = 0; tm < TM; tm++) {
+                    a_frag[tm] = shared_a[(thread_m - wg_m + tm) * SHMEM_STRIDE_A + k_local];
+                }
+
+                float b_frag[TN];
+                for (uint tn = 0; tn < TN; tn++) {
+                    b_frag[tn] = shared_b[k_local * SHMEM_STRIDE_B + (thread_n - wg_n + tn)];
+                }
+
+                for (uint tm = 0; tm < TM; tm++) {
+                    for (uint tn = 0; tn < TN; tn++) {
+                        acc[tm * TN + tn] = fma(a_frag[tm], b_frag[tn], acc[tm * TN + tn]);
+                    }
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Write results
+    if (is_active) {
+        for (uint tm = 0; tm < TM; tm++) {
+            for (uint tn = 0; tn < TN; tn++) {
+                uint out_m = thread_m + tm;
+                uint out_n = thread_n + tn;
+
+                if (out_m < op_m && out_n < op_n) {
+                    v_dest[batch * op_m * op_n + out_m * op_n + out_n] = acc[tm * TN + tn];
+                }
+            }
+        }
+    }
+}

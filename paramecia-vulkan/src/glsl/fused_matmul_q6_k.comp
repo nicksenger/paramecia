@@ -1,0 +1,241 @@
+// Fused Q6_K Matmul + Perturbation - GLSL/SPIR-V version
+//
+// Computes: C[m,n] = A[m,k] * (B_dequant[n,k] + epsilon * z[n,k])^T
+// Where B is Q6_K quantized and z is generated on-the-fly via Philox RNG.
+//
+// Based on matmul_q6_k.comp with fused perturbation during dequantization.
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "philox.comp"
+
+// Q6_K constants
+#define QK6_K 256
+#define QK6_K_BYTES 210
+#define QL_OFFSET 0
+#define QL_SIZE 128
+#define QH_OFFSET 128
+#define QH_SIZE 64
+#define SCALES_OFFSET 192
+#define SCALES_SIZE 16
+#define D_OFFSET 208
+
+#define WARP_SIZE 32
+#define NWARPS 4
+
+layout(local_size_x = WARP_SIZE, local_size_y = NWARPS, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint params[12];
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+#define op_seed_lo    params[7]
+#define op_seed_hi    params[8]
+#define op_epsilon_bits params[9]
+#define op_tid_lo     params[10]
+#define op_tid_hi     params[11]
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputA {
+    float v_input_a[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer InputB {
+    uint v_input_b[];
+};
+
+float half_to_float_lo(uint packed) {
+    return unpackHalf2x16(packed).x;
+}
+
+uint load_byte(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = v_input_b[word_idx];
+    return (word >> (byte_in_word * 8)) & 0xFF;
+}
+
+int load_i8(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = v_input_b[word_idx];
+    int val = int(word >> (byte_in_word * 8)) << 24 >> 24;
+    return val;
+}
+
+float load_f16(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = v_input_b[word_idx];
+
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return unpackHalf2x16(word).y;
+    } else {
+        uint word2 = v_input_b[word_idx + 1];
+        uint h;
+        if (byte_in_word == 1) {
+            h = (word >> 8) | (word2 << 24);
+        } else {
+            h = (word >> 24) | (word2 << 8);
+        }
+        return half_to_float_lo(h);
+    }
+}
+
+float warp_reduce_sum(float v) {
+    v += subgroupShuffleXor(v, 16);
+    v += subgroupShuffleXor(v, 8);
+    v += subgroupShuffleXor(v, 4);
+    v += subgroupShuffleXor(v, 2);
+    v += subgroupShuffleXor(v, 1);
+    return v;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint warp = gl_LocalInvocationID.y;
+    uint wg_x = gl_WorkGroupID.x;
+    uint wg_y = gl_WorkGroupID.y;
+    uint batch = gl_WorkGroupID.z;
+
+    uint out_n = wg_x * NWARPS + warp;
+    uint out_m = wg_y;
+
+    if (out_n >= op_n || out_m >= op_m) return;
+
+    uint a_offset = op_a_offset + batch * op_a_stride_b + out_m * op_a_stride_m;
+
+    uint num_blocks = op_k / QK6_K;
+    uint b_row_bytes = num_blocks * QK6_K_BYTES;
+    uint b_byte_offset = out_n * b_row_bytes;
+
+    uvec2 effective_seed = uvec2(op_seed_lo ^ op_tid_lo, op_seed_hi ^ op_tid_hi);
+    float epsilon = uintBitsToFloat(op_epsilon_bits);
+
+    float acc = 0.0;
+
+    for (uint blk = 0; blk < num_blocks; blk++) {
+        uint block_byte = b_byte_offset + blk * QK6_K_BYTES;
+        uint k_base = blk * QK6_K;
+
+        float d = load_f16(block_byte + D_OFFSET);
+
+        for (uint n = 0; n < 256; n += 128) {
+            uint idx = n / 128;
+            uint sc_base = block_byte + SCALES_OFFSET + 8 * idx;
+            uint ql_base = block_byte + QL_OFFSET + 64 * idx;
+            uint qh_base = block_byte + QH_OFFSET + 32 * idx;
+
+            // First pass: l = 0..15
+            {
+                float scale0 = float(load_i8(sc_base + 0));
+                float scale1 = float(load_i8(sc_base + 2));
+                float scale2 = float(load_i8(sc_base + 4));
+                float scale3 = float(load_i8(sc_base + 6));
+
+                if (lane < 16) {
+                    uint l = lane;
+                    uint ql1 = load_byte(ql_base + l);
+                    uint ql2 = load_byte(ql_base + l + 32);
+                    uint qh1 = load_byte(qh_base + l);
+
+                    int q1 = int((ql1 & 0xF) | ((qh1 & 3) << 4)) - 32;
+                    int q2 = int((ql2 & 0xF) | (((qh1 >> 2) & 3) << 4)) - 32;
+                    int q3 = int((ql1 >> 4) | (((qh1 >> 4) & 3) << 4)) - 32;
+                    int q4 = int((ql2 >> 4) | (((qh1 >> 6) & 3) << 4)) - 32;
+
+                    uint k0 = k_base + n + l;
+                    uint k1 = k_base + n + l + 32;
+                    uint k2 = k_base + n + l + 64;
+                    uint k3 = k_base + n + l + 96;
+
+                    float a0 = v_input_a[a_offset + k0 * op_a_stride_k];
+                    float a1 = v_input_a[a_offset + k1 * op_a_stride_k];
+                    float a2 = v_input_a[a_offset + k2 * op_a_stride_k];
+                    float a3 = v_input_a[a_offset + k3 * op_a_stride_k];
+
+                    // Dequantize + perturb
+                    float w0 = d * scale0 * float(q1);
+                    float w1 = d * scale1 * float(q2);
+                    float w2 = d * scale2 * float(q3);
+                    float w3 = d * scale3 * float(q4);
+
+                    w0 += epsilon * philox_gaussian(effective_seed, out_n * op_k + k0);
+                    w1 += epsilon * philox_gaussian(effective_seed, out_n * op_k + k1);
+                    w2 += epsilon * philox_gaussian(effective_seed, out_n * op_k + k2);
+                    w3 += epsilon * philox_gaussian(effective_seed, out_n * op_k + k3);
+
+                    acc += a0 * w0 + a1 * w1 + a2 * w2 + a3 * w3;
+                }
+            }
+
+            // Second pass: l = 16..31
+            {
+                float scale0 = float(load_i8(sc_base + 1));
+                float scale1 = float(load_i8(sc_base + 3));
+                float scale2 = float(load_i8(sc_base + 5));
+                float scale3 = float(load_i8(sc_base + 7));
+
+                if (lane < 16) {
+                    uint l = lane + 16;
+                    uint ql1 = load_byte(ql_base + l);
+                    uint ql2 = load_byte(ql_base + l + 32);
+                    uint qh1 = load_byte(qh_base + l);
+
+                    int q1 = int((ql1 & 0xF) | ((qh1 & 3) << 4)) - 32;
+                    int q2 = int((ql2 & 0xF) | (((qh1 >> 2) & 3) << 4)) - 32;
+                    int q3 = int((ql1 >> 4) | (((qh1 >> 4) & 3) << 4)) - 32;
+                    int q4 = int((ql2 >> 4) | (((qh1 >> 6) & 3) << 4)) - 32;
+
+                    uint k0 = k_base + n + l;
+                    uint k1 = k_base + n + l + 32;
+                    uint k2 = k_base + n + l + 64;
+                    uint k3 = k_base + n + l + 96;
+
+                    float a0 = v_input_a[a_offset + k0 * op_a_stride_k];
+                    float a1 = v_input_a[a_offset + k1 * op_a_stride_k];
+                    float a2 = v_input_a[a_offset + k2 * op_a_stride_k];
+                    float a3 = v_input_a[a_offset + k3 * op_a_stride_k];
+
+                    float w0 = d * scale0 * float(q1);
+                    float w1 = d * scale1 * float(q2);
+                    float w2 = d * scale2 * float(q3);
+                    float w3 = d * scale3 * float(q4);
+
+                    w0 += epsilon * philox_gaussian(effective_seed, out_n * op_k + k0);
+                    w1 += epsilon * philox_gaussian(effective_seed, out_n * op_k + k1);
+                    w2 += epsilon * philox_gaussian(effective_seed, out_n * op_k + k2);
+                    w3 += epsilon * philox_gaussian(effective_seed, out_n * op_k + k3);
+
+                    acc += a0 * w0 + a1 * w1 + a2 * w2 + a3 * w3;
+                }
+            }
+        }
+    }
+
+    float sum = warp_reduce_sum(acc);
+
+    if (lane == 0) {
+        uint out_idx = batch * op_m * op_n + out_m * op_n + out_n;
+        v_dest[out_idx] = sum;
+    }
+}

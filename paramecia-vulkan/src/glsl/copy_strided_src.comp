@@ -1,0 +1,41 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#include "common.comp"
+
+// Source buffer (read-only).
+layout(set = 0, binding = 0) readonly buffer SrcBuffer {
+    TYPE src_data[];
+};
+// Destination buffer (write-only).
+layout(set = 0, binding = 1) writeonly buffer DstBuffer {
+    TYPE dst_data[];
+};
+
+// Push constants: supports up to MAX_RANK dimensions.
+layout(push_constant) uniform PushConstants {
+    uint base;
+    uint rank;
+    uint shape[MAX_RANK];
+    uint stride[MAX_RANK];
+    uint dst_offset;
+} pc;
+
+void main() {
+    uint lin_idx = global_linear_id();
+    // Compute total number of elements from shape.
+    uint total_elements = 1u;
+    for (uint d = 0u; d < pc.rank && d < MAX_RANK; d++) {
+        total_elements *= pc.shape[d];
+    }
+    if (lin_idx < total_elements) {
+        uint src_index = get_physical_index(pc.rank, pc.base, pc.shape, pc.stride, lin_idx);
+        dst_data[pc.dst_offset + lin_idx] = src_data[src_index];
+    }
+}

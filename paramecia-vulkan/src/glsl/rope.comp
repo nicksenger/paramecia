@@ -1,0 +1,68 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256) in;
+
+#include "common.comp"
+
+layout(push_constant) uniform PushConstants {
+    uvec4 shape;
+    uvec4 strides;
+    uint base;
+    uint stride_b; // cosine/sine batch stride when using 3D tables
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer InputData { INNER_TYPE input_data[]; };
+layout(set = 0, binding = 1) readonly buffer Cosine { INNER_TYPE cos[]; };
+layout(set = 0, binding = 2) readonly buffer Sine { INNER_TYPE sin[]; };
+layout(set = 0, binding = 3) writeonly buffer OutputData { OUTER_TYPE output_data[]; };
+
+#if BF16
+    #define CAST_OUT(x) uint16_t((floatBitsToUint(x) + 0x8000u) >> 16u)
+    #define CAST_IN(x) uintBitsToFloat(uint(x) << 16u)
+#else
+    #define CAST_OUT(x) OUTER_TYPE(x)
+    #define CAST_IN(x) INNER_TYPE(x)
+#endif
+
+void main() {
+    uint gid = global_linear_id();
+    if (gid >= pc.shape.x * pc.shape.y * pc.shape.z * pc.shape.w) return;
+
+    uint dim  = gid % pc.shape.w;
+    uint bsz  = gid / (pc.shape.w * pc.shape.z * pc.shape.y);
+    #if THD
+    // Layout: (b, s, h, d)
+    uint n_seq = pc.shape.y;
+    uint head = (gid / pc.shape.w) % pc.shape.z;
+    uint seq  = (gid / (pc.shape.w * pc.shape.z)) % pc.shape.y;
+    uint offset = bsz * pc.strides.x + seq * pc.strides.y + head * pc.strides.z + dim * pc.strides.w;
+    #else
+    // Layout: (b, h, s, d)
+    uint n_seq = pc.shape.z;
+    uint seq  = (gid / pc.shape.w) % pc.shape.z;
+    uint head = (gid / (pc.shape.w * pc.shape.z)) % pc.shape.y;
+    uint offset = bsz * pc.strides.x + head * pc.strides.y + seq * pc.strides.z + dim * pc.strides.w;
+    #endif
+
+    INNER_TYPE val = CAST_IN(input_data[pc.base + offset]);
+
+    uint half_dim = pc.shape.w / 2;
+    uint idx = seq * half_dim + dim % half_dim;
+    if (pc.stride_b != 0u) {
+        idx += bsz * half_dim * n_seq;
+    }
+
+    INNER_TYPE c = cos[idx];
+    INNER_TYPE s = sin[idx];
+
+    INNER_TYPE val2 = (dim < half_dim)
+            ? CAST_IN(input_data[pc.base + offset + half_dim * pc.strides.w])
+            : CAST_IN(input_data[pc.base + offset - half_dim * pc.strides.w]);
+
+    INNER_TYPE val_out = (dim < half_dim) ? val * c - val2 * s : val * c + val2 * s;
+
+    output_data[offset] = CAST_OUT(val_out);
+}

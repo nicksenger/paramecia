@@ -1,0 +1,266 @@
+// Q3_K Quantized Matrix Multiplication - GLSL/SPIR-V version
+//
+// Computes: C[m,n] = A[m,k] * B[n,k]^T
+// Where B is Q3_K quantized (256 elements per block, 110 bytes)
+//
+// Q3_K block structure (110 bytes total):
+// - Bytes 0-31: u8 hmask[32] (high bit mask for each element)
+// - Bytes 32-95: u8 qs[64] (packed 2-bit quantized values)
+// - Bytes 96-107: u8 scales[12] (packed 16 scale values)
+// - Bytes 108-109: f16 d (global scale)
+//
+// Q3_K dequantization:
+// - 256 elements in 2 half-blocks of 128
+// - Each half-block: 4 groups of 32 elements (shift 0,2,4,6)
+// - Each group of 32 has 2 sub-groups of 16, each with its own scale
+// - q = (qs >> shift) & 3 - (hmask_bit ? 0 : 4)  // range [-4, 3]
+// - val = d * (scale - 32) * q
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Q3_K constants
+#define QK3_K 256        // Elements per Q3_K block
+#define QK3_K_BYTES 110  // Bytes per block
+#define HMASK_OFFSET 0
+#define QS_OFFSET 32
+#define SCALES_OFFSET 96
+#define D_OFFSET 108
+
+// Workgroup: 32 threads x 4 warps = 128 threads
+#define WARP_SIZE 32
+#define NWARPS 4
+
+layout(local_size_x = WARP_SIZE, local_size_y = NWARPS, local_size_z = 1) in;
+
+// Parameters via push constants (32 bytes)
+layout(push_constant) uniform PushConstants {
+    uint params[8];
+    // [0]: m (rows of output)
+    // [1]: k (reduction dimension)
+    // [2]: n (columns of output)
+    // [3]: a_stride_batch
+    // [4]: a_offset
+    // [5]: a_stride_k
+    // [6]: a_stride_m
+    // [7]: unused
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf {
+    float v_dest[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputA {
+    float v_input_a[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer InputB {
+    uint v_input_b[];
+};
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+float half_to_float_lo(uint packed) {
+    return unpackHalf2x16(packed).x;
+}
+
+uint load_byte(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = v_input_b[word_idx];
+    return (word >> (byte_in_word * 8)) & 0xFF;
+}
+
+float load_f16(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = v_input_b[word_idx];
+
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return unpackHalf2x16(word).y;
+    } else {
+        uint word2 = v_input_b[word_idx + 1];
+        uint h;
+        if (byte_in_word == 1) {
+            h = (word >> 8) | (word2 << 24);
+        } else {
+            h = (word >> 24) | (word2 << 8);
+        }
+        return half_to_float_lo(h);
+    }
+}
+
+uint load_u32_unaligned(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    if (byte_in_word == 0) {
+        return v_input_b[word_idx];
+    } else {
+        uint w0 = v_input_b[word_idx];
+        uint w1 = v_input_b[word_idx + 1];
+        return (w0 >> (byte_in_word * 8)) | (w1 << ((4 - byte_in_word) * 8));
+    }
+}
+
+float warp_reduce_sum(float v) {
+    v += subgroupShuffleXor(v, 16);
+    v += subgroupShuffleXor(v, 8);
+    v += subgroupShuffleXor(v, 4);
+    v += subgroupShuffleXor(v, 2);
+    v += subgroupShuffleXor(v, 1);
+    return v;
+}
+
+// ============================================================================
+// Q3_K scale decoding
+// ============================================================================
+// 12 bytes encode 16 scales. Decode using the KMASK bit manipulation.
+// Returns scale[is] as a signed value (already minus 32).
+float get_q3k_scale(uint block_byte, uint is) {
+    uint sc_base = block_byte + SCALES_OFFSET;
+
+    // Read 12 scale bytes as 3 u32s
+    uint a0 = load_u32_unaligned(sc_base);
+    uint a1 = load_u32_unaligned(sc_base + 4);
+    uint a2 = load_u32_unaligned(sc_base + 8);
+
+    // Decode 16 scales from 12 bytes
+    // aux[0..3] contain 4 bytes each = 16 scale values
+    uint KMASK1 = 0x03030303u;
+    uint KMASK2 = 0x0f0f0f0fu;
+
+    uint d0 = (a0 & KMASK2) | (((a2) & KMASK1) << 4);
+    uint d1 = (a1 & KMASK2) | (((a2 >> 2) & KMASK1) << 4);
+    uint d2 = ((a0 >> 4) & KMASK2) | (((a2 >> 4) & KMASK1) << 4);
+    uint d3 = ((a1 >> 4) & KMASK2) | (((a2 >> 6) & KMASK1) << 4);
+
+    // Pick the right u32 and byte
+    uint word;
+    uint idx = is;
+    if (idx < 4) {
+        word = d0;
+    } else if (idx < 8) {
+        word = d1;
+        idx -= 4;
+    } else if (idx < 12) {
+        word = d2;
+        idx -= 8;
+    } else {
+        word = d3;
+        idx -= 12;
+    }
+
+    // Extract byte and convert to signed (scale - 32)
+    int scale_byte = int((word >> (idx * 8)) & 0xFF);
+    // Treat as unsigned byte, subtract 32
+    return float(scale_byte - 32);
+}
+
+// ============================================================================
+// Main kernel
+// ============================================================================
+// Dispatch: (ceil(n/NWARPS), m, batch)
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint warp = gl_LocalInvocationID.y;
+    uint wg_x = gl_WorkGroupID.x;
+    uint wg_y = gl_WorkGroupID.y;
+    uint batch = gl_WorkGroupID.z;
+
+    uint out_n = wg_x * NWARPS + warp;
+    uint out_m = wg_y;
+
+    if (out_n >= op_n || out_m >= op_m) {
+        return;
+    }
+
+    uint a_offset = op_a_offset + batch * op_a_stride_b + out_m * op_a_stride_m;
+
+    uint num_blocks = op_k / QK3_K;
+    uint b_row_bytes = num_blocks * QK3_K_BYTES;
+    uint b_byte_offset = out_n * b_row_bytes;
+
+    float acc = 0.0;
+
+    for (uint blk = 0; blk < num_blocks; blk++) {
+        uint block_byte = b_byte_offset + blk * QK3_K_BYTES;
+        uint k_base = blk * QK3_K;
+
+        float d_all = load_f16(block_byte + D_OFFSET);
+
+        // Process 256 elements in 2 half-blocks of 128
+        // Each half-block uses 32 qs bytes and processes with shifts 0,2,4,6
+        uint is = 0;  // scale index (0-15)
+        uint m = 1;   // hmask bit position
+
+        for (uint half_blk = 0; half_blk < 2; half_blk++) {
+            uint qs_base = block_byte + QS_OFFSET + half_blk * 32;
+            uint y_base = k_base + half_blk * 128;
+
+            for (uint shift = 0; shift < 8; shift += 2) {
+                // First sub-group of 16 elements
+                {
+                    float dl = d_all * get_q3k_scale(block_byte, is);
+                    is++;
+
+                    if (lane < 16) {
+                        uint qs_byte = load_byte(qs_base + lane);
+                        uint hmask_byte = load_byte(block_byte + HMASK_OFFSET + lane);
+                        uint q2 = (qs_byte >> shift) & 3;
+                        int q3 = int(q2) - ((hmask_byte & m) != 0 ? 0 : 4);
+
+                        uint k_idx = y_base + lane;
+                        float a = v_input_a[a_offset + k_idx * op_a_stride_k];
+                        acc += a * dl * float(q3);
+                    }
+                }
+
+                // Second sub-group of 16 elements
+                {
+                    float dl = d_all * get_q3k_scale(block_byte, is);
+                    is++;
+
+                    if (lane < 16) {
+                        uint qs_byte = load_byte(qs_base + 16 + lane);
+                        uint hmask_byte = load_byte(block_byte + HMASK_OFFSET + 16 + lane);
+                        uint q2 = (qs_byte >> shift) & 3;
+                        int q3 = int(q2) - ((hmask_byte & m) != 0 ? 0 : 4);
+
+                        uint k_idx = y_base + 16 + lane;
+                        float a = v_input_a[a_offset + k_idx * op_a_stride_k];
+                        acc += a * dl * float(q3);
+                    }
+                }
+
+                y_base += 32;
+                m <<= 1;
+            }
+        }
+    }
+
+    float sum = warp_reduce_sum(acc);
+
+    if (lane == 0) {
+        uint out_idx = batch * op_m * op_n + out_m * op_n + out_n;
+        v_dest[out_idx] = sum;
+    }
+}

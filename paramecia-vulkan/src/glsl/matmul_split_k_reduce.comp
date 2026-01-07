@@ -1,0 +1,54 @@
+// Split-K Reduction: sum partial GEMM results
+//
+// When a GEMM is split along the K dimension into `split_k` partial results,
+// each partial produces an (m x n) output. This shader sums them into the
+// final output.
+//
+// Partials are always f32. Output type is configurable via TYPE/BF16 defines
+// (defaults to f32 if not specified).
+//
+// Layout: partials[split_k][m * n], output[m * n]
+// Each thread handles one output element.
+//
+// Dispatch: (ceil(total_elems / 256), 1, 1)
+
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#ifndef TYPE
+#define TYPE float
+#endif
+
+#if BF16
+    #define CAST_OUT(x) uint16_t((floatBitsToUint(x) + 0x8000u) >> 16u)
+#else
+    #define CAST_OUT(x) TYPE(x)
+#endif
+
+layout(push_constant) uniform PC {
+    uint total_elems;  // m * n * batch
+    uint split_k;      // number of partial results to sum
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer Partials {
+    float partials[];
+};
+
+layout(set = 0, binding = 1, std430) writeonly buffer Output {
+    TYPE output_buf[];
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total_elems) return;
+
+    float sum = 0.0;
+    for (uint s = 0; s < split_k; s++) {
+        sum += partials[s * total_elems + idx];
+    }
+    output_buf[idx] = CAST_OUT(sum);
+}

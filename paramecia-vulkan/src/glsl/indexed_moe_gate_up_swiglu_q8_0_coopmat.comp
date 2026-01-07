@@ -1,0 +1,219 @@
+// Q8_0 Indexed MoE Gate+Up+SwiGLU - Cooperative Matrix
+// Each workgroup processes TILE_N output columns for a single input vector (M=1)
+// Computes: output[batch, topk, n] = silu(gate @ x) * (up @ x)
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#define QK8_0 32
+#define QK8_0_BYTES 34
+
+layout(constant_id = 0) const uint TILE_M = 16;
+layout(constant_id = 1) const uint TILE_N = 16;
+layout(constant_id = 2) const uint TILE_K = 16;
+
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform PushConstants { uint params[12]; };
+#define op_n                  params[0]
+#define op_k                  params[1]
+#define op_batch              params[2]
+#define op_topk               params[3]
+#define op_x_inner_dim        params[4]
+#define op_gate_expert_stride params[5]
+#define op_up_expert_stride   params[6]
+#define op_x_stride_batch     params[7]
+#define op_x_stride_inner     params[8]
+// params[9-11]: unused
+
+layout(set = 0, binding = 0, std430) writeonly buffer O { float v_dest[]; };
+layout(set = 0, binding = 1, std430) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2, std430) readonly buffer GateW { uint gate_weights[]; };
+layout(set = 0, binding = 3, std430) readonly buffer UpW { uint up_weights[]; };
+layout(set = 0, binding = 4, std430) readonly buffer I { uint ids[]; };
+
+shared float16_t shared_a[16 * 32];  // TILE_M * TILE_K (K can be 32 on some GPUs)
+shared float16_t shared_b[32 * 16];  // TILE_K * TILE_N
+// We only use the first row of these tiles (M=1 for MoE)
+shared float temp_c[16 * 16];  // TILE_M * TILE_N for storing matC results
+
+float half_to_float_lo(uint packed) { return unpackHalf2x16(packed).x; }
+
+float load_q8_scale_gate(uint block_byte) {
+    uint word_idx = block_byte / 4;
+    uint byte_in_word = block_byte % 4;
+    uint word = gate_weights[word_idx];
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return half_to_float_lo(word >> 16);
+    } else {
+        uint word2 = gate_weights[word_idx + 1];
+        uint h;
+        if (byte_in_word == 1) {
+            h = (word >> 8) | (word2 << 24);
+        } else {
+            h = (word >> 24) | (word2 << 8);
+        }
+        return half_to_float_lo(h);
+    }
+}
+
+int load_q8_i8_gate(uint block_byte, uint qs_idx) {
+    uint byte_offset = block_byte + 2 + qs_idx;
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = gate_weights[word_idx];
+    int val = int(word >> (byte_in_word * 8)) << 24 >> 24;
+    return val;
+}
+
+float load_q8_scale_up(uint block_byte) {
+    uint word_idx = block_byte / 4;
+    uint byte_in_word = block_byte % 4;
+    uint word = up_weights[word_idx];
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return half_to_float_lo(word >> 16);
+    } else {
+        uint word2 = up_weights[word_idx + 1];
+        uint h;
+        if (byte_in_word == 1) {
+            h = (word >> 8) | (word2 << 24);
+        } else {
+            h = (word >> 24) | (word2 << 8);
+        }
+        return half_to_float_lo(h);
+    }
+}
+
+int load_q8_i8_up(uint block_byte, uint qs_idx) {
+    uint byte_offset = block_byte + 2 + qs_idx;
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = up_weights[word_idx];
+    int val = int(word >> (byte_in_word * 8)) << 24 >> 24;
+    return val;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_n = gl_WorkGroupID.x;
+    uint batch_idx = gl_WorkGroupID.y;
+    uint topk_idx = gl_WorkGroupID.z;
+
+    uint n_start = wg_n * TILE_N;
+
+    if (n_start >= op_n || batch_idx >= op_batch || topk_idx >= op_topk) return;
+
+    uint expert_id = ids[batch_idx * op_topk + topk_idx];
+    uint gate_expert_base = expert_id * op_gate_expert_stride * 4;  // Convert u32 words to bytes
+    uint up_expert_base = expert_id * op_up_expert_stride * 4;      // Convert u32 words to bytes
+
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> matA;
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> matC;
+
+    // Compute gate matmul (1×K × K×N)
+    uint x_inner_idx = min(topk_idx, op_x_inner_dim - 1);
+    uint x_base_offset = batch_idx * op_x_stride_batch + x_inner_idx * op_x_stride_inner;
+    matC = coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(0.0);
+    for (uint k_tile = 0; k_tile < (op_k + TILE_K - 1) / TILE_K; k_tile++) {
+        uint k_start = k_tile * TILE_K;
+        // Load input vector, replicate across all M rows for coopmat
+        for (uint i = tid; i < TILE_M * TILE_K; i += 32) {
+            uint k_idx = k_start + (i % TILE_K);
+            float val = 0.0;
+            if (k_idx < op_k) {
+                val = x[x_base_offset + k_idx];
+            }
+            shared_a[i] = float16_t(val);
+        }
+        for (uint i = tid; i < TILE_K * TILE_N; i += 32) {
+            uint k_idx = k_start + (i / TILE_N);
+            uint n_idx = n_start + (i % TILE_N);
+            float val = 0.0;
+            if (k_idx < op_k && n_idx < op_n) {
+                uint block_idx = k_idx / QK8_0;
+                uint block_offset = k_idx % QK8_0;
+                uint num_blocks = (op_k + QK8_0 - 1) / QK8_0;
+                uint b_row_bytes = num_blocks * QK8_0_BYTES;
+                uint b_byte_offset = gate_expert_base + n_idx * b_row_bytes;
+                uint block_byte = b_byte_offset + block_idx * QK8_0_BYTES;
+                float scale = load_q8_scale_gate(block_byte);
+                int q = load_q8_i8_gate(block_byte, block_offset);
+                val = scale * float(q);
+            }
+            shared_b[i] = float16_t(val);
+        }
+        barrier();
+        coopMatLoad(matA, shared_a, 0, TILE_K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, shared_b, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+        matC = coopMatMulAdd(matA, matB, matC);
+        barrier();
+    }
+    coopMatStore(matC, temp_c, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    // Compute up matmul (1×K × K×N)
+    matC = coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(0.0);
+    for (uint k_tile = 0; k_tile < (op_k + TILE_K - 1) / TILE_K; k_tile++) {
+        uint k_start = k_tile * TILE_K;
+        // Load input vector, replicate across all M rows for coopmat
+        for (uint i = tid; i < TILE_M * TILE_K; i += 32) {
+            uint k_idx = k_start + (i % TILE_K);
+            float val = 0.0;
+            if (k_idx < op_k) {
+                val = x[x_base_offset + k_idx];
+            }
+            shared_a[i] = float16_t(val);
+        }
+        for (uint i = tid; i < TILE_K * TILE_N; i += 32) {
+            uint k_idx = k_start + (i / TILE_N);
+            uint n_idx = n_start + (i % TILE_N);
+            float val = 0.0;
+            if (k_idx < op_k && n_idx < op_n) {
+                uint block_idx = k_idx / QK8_0;
+                uint block_offset = k_idx % QK8_0;
+                uint num_blocks = (op_k + QK8_0 - 1) / QK8_0;
+                uint b_row_bytes = num_blocks * QK8_0_BYTES;
+                uint b_byte_offset = up_expert_base + n_idx * b_row_bytes;
+                uint block_byte = b_byte_offset + block_idx * QK8_0_BYTES;
+                float scale = load_q8_scale_up(block_byte);
+                int q = load_q8_i8_up(block_byte, block_offset);
+                val = scale * float(q);
+            }
+            shared_b[i] = float16_t(val);
+        }
+        barrier();
+        coopMatLoad(matA, shared_a, 0, TILE_K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, shared_b, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+        matC = coopMatMulAdd(matA, matB, matC);
+        barrier();
+    }
+
+    // Read gate results from temp_c (first row) before computing up
+    float gate_val = 0.0;
+    if (tid < TILE_N) {
+        gate_val = temp_c[tid];
+    }
+
+    // Compute up matmul result and store in temp_c (overwrites gate)
+    coopMatStore(matC, temp_c, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    // Apply SwiGLU and write output
+    if (tid < TILE_N) {
+        uint n_idx = n_start + tid;
+        if (n_idx < op_n) {
+            float up_val = temp_c[tid];
+            float silu_gate = gate_val / (1.0 + exp(-gate_val));
+            uint out_idx = batch_idx * op_topk * op_n + topk_idx * op_n + n_idx;
+            v_dest[out_idx] = silu_gate * up_val;
+        }
+    }
+}

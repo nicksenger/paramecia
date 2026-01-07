@@ -1,0 +1,177 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_AMD_gpu_shader_half_float: enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#include "common.comp"
+
+#if BF16
+    #define CAST_OUT(x) uint16_t((floatBitsToUint(x) + 0x8000u) >> 16u)
+    #define CAST_IN(x) uintBitsToFloat(uint(x) << 16u)
+#else
+    #define CAST_OUT(x) OUTER_TYPE(x)
+    #define CAST_IN(x) INNER_TYPE(x)
+#endif
+
+layout(set = 0, binding = 0) buffer InputBuffer {
+    OUTER_TYPE input_data[];
+};
+layout(set = 0, binding = 1) buffer OutputBuffer {
+    OUTER_TYPE output_data[];
+};
+layout(push_constant) uniform PushConstants {
+    uint rank;
+    uint base;
+    uint shape[MAX_RANK];
+    uint stride[MAX_RANK];
+} pc;
+
+const INNER_TYPE ZERO = INNER_TYPE(0.0);
+const INNER_TYPE HALF = INNER_TYPE(0.5);
+const INNER_TYPE ONE = INNER_TYPE(1.0);
+
+void neg_op(uint idx, uint a_idx) {
+    output_data[idx] = CAST_OUT(-CAST_IN(input_data[a_idx]));
+}
+
+void abs_op(uint idx, uint a_idx) {
+    output_data[idx] = CAST_OUT(abs(CAST_IN(input_data[a_idx])));
+}
+
+void sign_op(uint idx, uint a_idx) {
+    output_data[idx] = CAST_OUT(sign(CAST_IN(input_data[a_idx])));
+}
+
+void gelu_op(uint idx, uint a_idx) {
+    const INNER_TYPE COEF_A = INNER_TYPE(0.79788456) + INNER_TYPE(0.000000000802865355);
+    const INNER_TYPE COEF_B = INNER_TYPE(0.04471509) + INNER_TYPE(-0.0000000026068047);
+    INNER_TYPE x = CAST_IN(input_data[a_idx]);
+    INNER_TYPE x_cubed = x * x * x;
+    INNER_TYPE inner = COEF_A * (x + COEF_B * x_cubed);
+    INNER_TYPE cdf = HALF * (ONE + tanh(inner));
+    output_data[idx] = CAST_OUT(x * cdf);
+}
+
+// Custom erf approximation
+INNER_TYPE erf_approx(INNER_TYPE x) {
+    const INNER_TYPE a1 = INNER_TYPE(0.25482959) + INNER_TYPE(0.000000002091);
+    const INNER_TYPE a2 = INNER_TYPE(-0.28449674) + INNER_TYPE(0.000000003751);
+    const INNER_TYPE a3 = INNER_TYPE(1.42141378) + INNER_TYPE(-0.000000038331);
+    const INNER_TYPE a4 = INNER_TYPE(-1.45315206) + INNER_TYPE(0.00000003259);
+    const INNER_TYPE a5 = INNER_TYPE(1.06140542) + INNER_TYPE(0.000000009758);
+    const INNER_TYPE p  = INNER_TYPE(0.3275911) + INNER_TYPE(0.000000000330);
+    INNER_TYPE s = sign(x);
+    x = abs(x);
+    INNER_TYPE t = ONE / (ONE + p * x);
+    INNER_TYPE y = ONE - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * exp(-x * x);
+    return s * y;
+}
+
+void gelu_erf_op(uint idx, uint a_idx) {
+    INNER_TYPE x = CAST_IN(input_data[a_idx]);
+    INNER_TYPE cdf = HALF * (ONE + erf_approx(x / sqrt(2.0)));
+    output_data[idx] = CAST_OUT(x * cdf);
+}
+
+void erf_op(uint idx, uint a_idx) {
+    INNER_TYPE x = CAST_IN(input_data[a_idx]);
+    output_data[idx] = CAST_OUT(erf_approx(x));
+}
+
+void relu_op(uint idx, uint a_idx) {
+    INNER_TYPE x = CAST_IN(input_data[a_idx]);
+    if (x < ZERO) {
+        output_data[idx] = CAST_OUT(ZERO);
+    } else {
+        output_data[idx] = input_data[a_idx];
+    }
+}
+
+void silu_op(uint idx, uint a_idx) {
+    INNER_TYPE x = CAST_IN(input_data[a_idx]);
+    output_data[idx] = CAST_OUT(x / (ONE + exp(-x)));
+}
+
+void ceil_op(uint idx, uint a_idx) {
+    output_data[idx] = CAST_OUT(ceil(CAST_IN(input_data[a_idx])));
+}
+
+void floor_op(uint idx, uint a_idx) {
+    output_data[idx] = CAST_OUT(floor(CAST_IN(input_data[a_idx])));
+}
+
+float c_round(float x) {
+    return (x >= 0.0) ? floor(x + 0.5) : ceil(x - 0.5);
+}
+
+void round_op(uint idx, uint a_idx) {
+    output_data[idx] = CAST_OUT(c_round(CAST_IN(input_data[a_idx])));
+}
+
+void sqr_op(uint idx, uint a_idx) {
+    INNER_TYPE data = CAST_IN(input_data[a_idx]);
+    output_data[idx] = CAST_OUT(data * data);
+}
+
+void sqrt_op(uint idx, uint a_idx) {
+    INNER_TYPE data = CAST_IN(input_data[a_idx]);
+    output_data[idx] = CAST_OUT(sqrt(data));
+}
+
+void sin_op(uint idx, uint a_idx) {
+    INNER_TYPE data = CAST_IN(input_data[a_idx]);
+    output_data[idx] = CAST_OUT(sin(data));
+}
+
+void cos_op(uint idx, uint a_idx) {
+    INNER_TYPE data = CAST_IN(input_data[a_idx]);
+    output_data[idx] = CAST_OUT(cos(data));
+}
+
+void tan_op(uint idx, uint a_idx) {
+    INNER_TYPE data = CAST_IN(input_data[a_idx]);
+    output_data[idx] = CAST_OUT(tan(data));
+}
+
+void sigmoid_op(uint idx, uint a_idx) {
+    INNER_TYPE data = CAST_IN(input_data[a_idx]);
+    output_data[idx] = CAST_OUT(1.0 / (1.0 + exp(-data)));
+}
+
+void exp_op(uint idx, uint a_idx) {
+    INNER_TYPE data = CAST_IN(input_data[a_idx]);
+    output_data[idx] = CAST_OUT(exp(data));
+}
+
+void log_op(uint idx, uint a_idx) {
+    INNER_TYPE data = CAST_IN(input_data[a_idx]);
+    output_data[idx] = CAST_OUT(log(data));
+}
+
+void recip_op(uint idx, uint a_idx) {
+    INNER_TYPE data = CAST_IN(input_data[a_idx]);
+    output_data[idx] = CAST_OUT(1.0 / data);
+}
+
+void tanh_op(uint idx, uint a_idx) {
+    INNER_TYPE data = CAST_IN(input_data[a_idx]);
+    output_data[idx] = CAST_OUT(tanh(data));
+}
+
+void main() {
+    uint idx = global_linear_id();
+    uint total_elems = 1;
+    for (uint i = 0; i < pc.rank; ++i) {
+        // Handle dim size 0 safely - if any dim is 0, total elems is 0
+        if (pc.shape[i] == 0) {
+            total_elems = 0;
+            break;
+        }
+        total_elems *= pc.shape[i];
+    }
+    if (idx >= total_elems) { return; }
+    uint a_idx = get_physical_index(pc.rank, pc.base, pc.shape, pc.stride, idx);
+    OP(idx, a_idx);
+}

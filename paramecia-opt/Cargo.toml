@@ -1,0 +1,71 @@
+[package]
+name = "paramecia-opt"
+description = "Training and QuZO optimization utilities"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+bytemuck = { workspace = true }
+byteorder = { workspace = true }
+paramecia-core = { workspace = true }
+paramecia-nn = { workspace = true }
+half = { workspace = true }
+hf-hub = { workspace = true }
+paramecia-model = { path = "../paramecia-model" }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+rayon = { workspace = true }
+tokenizers = { workspace = true, features = ["onig"] }
+tracing = { workspace = true }
+walkdir = "2"
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive"] }
+
+[features]
+default = []
+accelerate = [
+    "paramecia-core/accelerate",
+    "paramecia-nn/accelerate",
+    "paramecia-model/accelerate",
+]
+cuda = [
+    "paramecia-core/cuda",
+    "paramecia-nn/cuda",
+    "paramecia-model/cuda",
+]
+metal = [
+    "paramecia-core/metal",
+    "paramecia-nn/metal",
+    "paramecia-model/metal",
+]
+vulkan = [
+    "paramecia-core/vulkan",
+    "paramecia-nn/vulkan",
+    "paramecia-model/vulkan",
+]
+qwen3next_80b_a3b = ["paramecia-model/qwen3next_80b_a3b"]
+qwen35moe_35b_a3b = ["paramecia-model/qwen35moe_35b_a3b"]
+qwen35moe_122b_a10b = ["paramecia-model/qwen35moe_122b_a10b"]
+qwen35moe_397b_a17b = ["paramecia-model/qwen35moe_397b_a17b"]
+qwen35_0p8b = ["paramecia-model/qwen35_0p8b"]
+qwen35_4b = ["paramecia-model/qwen35_4b"]
+qwen35_9b = ["paramecia-model/qwen35_9b"]
+qwen35_27b = ["paramecia-model/qwen35_27b"]
+
+[[example]]
+name = "inspect_tuning"
+required-features = []
+
+[[example]]
+name = "fuse"
+required-features = []
+
+[[example]]
+name = "prune_experts"
+required-features = []
+
+[[example]]
+name = "prune_layers"
+required-features = []

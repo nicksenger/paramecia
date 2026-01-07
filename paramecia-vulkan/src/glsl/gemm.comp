@@ -1,0 +1,190 @@
+// Tiled GEMM: C = alpha * A * B + beta * C
+//
+// Uses shared memory tiling to reduce global memory bandwidth.
+// Each workgroup computes a 16x16 tile of C by iterating over K in
+// chunks of 16, loading tiles of A and B into shared memory.
+//
+// Dispatch: (ceil(N/16), ceil(M/16), batch)
+// local_size: (16, 16, 1)
+
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+
+#define TILE 16
+
+layout(local_size_x = TILE, local_size_y = TILE, local_size_z = 1) in;
+
+#include "common.comp"
+
+#if BF16
+    #define CAST_OUT(x) uint16_t((floatBitsToUint(x) + 0x8000u) >> 16u)
+    #define CAST_IN(x) uintBitsToFloat(uint(x) << 16u)
+    #define SUM_TYPE float
+#else
+    #define CAST_OUT(x) TYPE(x)
+    #define CAST_IN(x) (x)
+    #define SUM_TYPE TYPE
+#endif
+
+layout(set = 0, binding = 0) readonly buffer MatrixA {
+    TYPE a[];
+};
+
+layout(set = 0, binding = 1) readonly buffer MatrixB {
+    TYPE b[];
+};
+
+#ifdef SPLIT_K_F32
+// Split-K mode: partials buffer is always f32 for accurate accumulation
+layout(set = 0, binding = 2) buffer MatrixC {
+    float c[];
+};
+#else
+layout(set = 0, binding = 2) buffer MatrixC {
+    TYPE c[];
+};
+#endif
+
+// Must exactly match the GemmPushConstants struct in Rust.
+layout(push_constant) uniform GemmPushConstants {
+    uint m;
+    uint n;
+    uint k;
+    uint a_stride_bh;
+    uint a_stride_m;
+    uint a_stride_k;
+    uint b_stride_bh;
+    uint b_stride_k;
+    uint b_stride_n;
+    uint a_base;
+    uint b_base;
+    uint ldc;
+    uint c_stride_bh;
+    float alpha;
+    float beta;
+    uint k_split;  // 0 = no split, >0 = size of each K-slice (split-K mode)
+} pc;
+
+#ifdef F16ACC
+shared float16_t tile_a[TILE][TILE];
+shared float16_t tile_b[TILE][TILE];
+#else
+shared float tile_a[TILE][TILE];
+shared float tile_b[TILE][TILE];
+#endif
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;  // column within tile
+    uint ty = gl_LocalInvocationID.y;  // row within tile
+    uint col = gl_WorkGroupID.x * TILE + tx;  // global N index
+
+    // In split-K mode, gl_WorkGroupID.y packs: m_tile_idx * split_count + split_idx
+    uint m_tiles = (pc.m + TILE - 1) / TILE;
+    uint wg_y = gl_WorkGroupID.y;
+    uint split_idx = 0;
+    uint row;
+    if (pc.k_split > 0) {
+        split_idx = wg_y / m_tiles;
+        row = (wg_y % m_tiles) * TILE + ty;
+    } else {
+        row = wg_y * TILE + ty;
+    }
+    uint batch = gl_GlobalInvocationID.z;
+
+    uint a_batch_off = pc.a_base + batch * pc.a_stride_bh;
+    uint b_batch_off = pc.b_base + batch * pc.b_stride_bh;
+
+#ifdef F16ACC
+    float16_t acc = float16_t(0.0);
+#else
+    float acc = 0.0;
+#endif
+
+    // Determine K range for this workgroup
+    uint k_start = 0;
+    uint k_end = pc.k;
+    if (pc.k_split > 0) {
+        k_start = split_idx * pc.k_split;
+        k_end = min(k_start + pc.k_split, pc.k);
+    }
+
+    uint first_tile = k_start / TILE;
+    uint num_tiles = (k_end + TILE - 1) / TILE;
+
+    for (uint t = first_tile; t < num_tiles; t++) {
+        uint k_base = t * TILE;
+
+        // Load tile of A: A[row, k_base + tx]
+        uint a_k = k_base + tx;
+        if (row < pc.m && a_k < pc.k) {
+#ifdef F16ACC
+            tile_a[ty][tx] = float16_t(CAST_IN(a[a_batch_off + row * pc.a_stride_m + a_k * pc.a_stride_k]));
+#else
+            tile_a[ty][tx] = float(CAST_IN(a[a_batch_off + row * pc.a_stride_m + a_k * pc.a_stride_k]));
+#endif
+        } else {
+#ifdef F16ACC
+            tile_a[ty][tx] = float16_t(0.0);
+#else
+            tile_a[ty][tx] = 0.0;
+#endif
+        }
+
+        // Load tile of B: B[k_base + ty, col]
+        uint b_k = k_base + ty;
+        if (b_k < pc.k && col < pc.n) {
+#ifdef F16ACC
+            tile_b[ty][tx] = float16_t(CAST_IN(b[b_batch_off + b_k * pc.b_stride_k + col * pc.b_stride_n]));
+#else
+            tile_b[ty][tx] = float(CAST_IN(b[b_batch_off + b_k * pc.b_stride_k + col * pc.b_stride_n]));
+#endif
+        } else {
+#ifdef F16ACC
+            tile_b[ty][tx] = float16_t(0.0);
+#else
+            tile_b[ty][tx] = 0.0;
+#endif
+        }
+
+        barrier();
+
+        // Accumulate: dot product of tile_a row ty with tile_b column tx
+        for (uint i = 0; i < TILE; i++) {
+            acc += tile_a[ty][i] * tile_b[i][tx];
+        }
+
+        barrier();
+    }
+
+    // Write result
+    if (row < pc.m && col < pc.n) {
+        if (pc.k_split > 0) {
+            // Split-K mode: write partial result to c[split_idx * m*n + batch*m*n + ...]
+            // The output buffer is sized: split_count * batch * m * n
+            uint split_count = (pc.k + pc.k_split - 1) / pc.k_split;
+            uint slice_size = pc.m * pc.n;
+            uint c_index = (split_idx * uint(gl_NumWorkGroups.z) + batch) * slice_size
+                         + row * pc.n + col;
+#ifdef SPLIT_K_F32
+            c[c_index] = float(acc);
+#else
+            c[c_index] = CAST_OUT(float(acc));
+#endif
+        } else {
+            // Normal mode (not used when SPLIT_K_F32 is defined, but must compile)
+            uint c_batch_stride = pc.m * pc.ldc;
+            uint c_index = batch * c_batch_stride + row * pc.ldc + col;
+
+#ifdef SPLIT_K_F32
+            float old_c = (pc.beta == 0.0) ? 0.0 : c[c_index];
+            c[c_index] = pc.alpha * float(acc) + pc.beta * old_c;
+#else
+            float old_c = (pc.beta == 0.0) ? 0.0 : float(CAST_IN(c[c_index]));
+            float final_val = pc.alpha * float(acc) + pc.beta * old_c;
+            c[c_index] = CAST_OUT(final_val);
+#endif
+        }
+    }
+}

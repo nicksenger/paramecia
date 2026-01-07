@@ -1,0 +1,153 @@
+// QuZO perturbation common utilities: RNG and stochastic rounding.
+// Included by quzo_*.comp shaders.
+//
+// Each shader must define `shared uint s_data[N]` BEFORE including this file.
+
+// xorshift64* pseudorandom number generator (GPU-friendly)
+uint64_t xorshift64star(inout uint64_t state) {
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    return state * 0x2545F4914F6CDD1DUL;
+}
+
+// Convert RNG output to uniform float in [0, 1)
+float rand_uniform(inout uint64_t state) {
+    uint64_t r = xorshift64star(state);
+    return float(r >> 40) * (1.0 / 16777216.0);
+}
+
+// Initialize per-element RNG state from seed and global index
+uint64_t init_rng(uint64_t seed, uint global_idx) {
+    uint64_t state = seed ^ (uint64_t(global_idx) * 0x9E3779B97F4A7C15UL);
+    xorshift64star(state); // warm up
+    return state;
+}
+
+// ---- Stochastic rounding functions ----
+
+int stochastic_round_i8(float x, inout uint64_t state) {
+    x = clamp(x, -127.0, 127.0);
+    float fl = floor(x);
+    float frac = x - fl;
+    float r = rand_uniform(state);
+    int result = int(fl) + (r < frac ? 1 : 0);
+    return clamp(result, -127, 127);
+}
+
+uint stochastic_round_u4(float x, inout uint64_t state) {
+    x = clamp(x, 0.0, 15.0);
+    float fl = floor(x);
+    float frac = x - fl;
+    float r = rand_uniform(state);
+    uint result = uint(fl) + (r < frac ? 1u : 0u);
+    return min(result, 15u);
+}
+
+uint stochastic_round_u2(float x, inout uint64_t state) {
+    x = clamp(x, 0.0, 3.0);
+    float fl = floor(x);
+    float frac = x - fl;
+    float r = rand_uniform(state);
+    uint result = uint(fl) + (r < frac ? 1u : 0u);
+    return min(result, 3u);
+}
+
+int stochastic_round_i3(float x, inout uint64_t state) {
+    x = clamp(x, -4.0, 3.0);
+    float fl = floor(x);
+    float frac = x - fl;
+    float r = rand_uniform(state);
+    int result = int(fl) + (r < frac ? 1 : 0);
+    return clamp(result, -4, 3);
+}
+
+uint stochastic_round_u5(float x, inout uint64_t state) {
+    x = clamp(x, 0.0, 31.0);
+    float fl = floor(x);
+    float frac = x - fl;
+    float r = rand_uniform(state);
+    uint result = uint(fl) + (r < frac ? 1u : 0u);
+    return min(result, 31u);
+}
+
+int stochastic_round_i6(float x, inout uint64_t state) {
+    x = clamp(x, -32.0, 31.0);
+    float fl = floor(x);
+    float frac = x - fl;
+    float r = rand_uniform(state);
+    int result = int(fl) + (r < frac ? 1 : 0);
+    return clamp(result, -32, 31);
+}
+
+// ---- Byte access helpers referencing s_data[] ----
+
+uint read_byte(uint byte_offset) {
+    uint word = s_data[byte_offset >> 2];
+    return (word >> ((byte_offset & 3u) * 8u)) & 0xFFu;
+}
+
+int read_sbyte(uint byte_offset) {
+    uint b = read_byte(byte_offset);
+    return (b >= 128u) ? int(b) - 256 : int(b);
+}
+
+void write_byte_shared(uint word_idx, uint byte_pos, uint value) {
+    uint shift = byte_pos * 8u;
+    atomicAnd(s_data[word_idx], ~(0xFFu << shift));
+    atomicOr(s_data[word_idx], (value & 0xFFu) << shift);
+}
+
+float read_f16_shared(uint byte_offset) {
+    uint word_idx = byte_offset >> 2;
+    uint byte_in_word = byte_offset & 3u;
+    uint word = s_data[word_idx];
+    if (byte_in_word == 0u) {
+        return unpackHalf2x16(word).x;
+    } else if (byte_in_word == 2u) {
+        return unpackHalf2x16(word >> 16).x;
+    } else {
+        uint word2 = s_data[word_idx + 1u];
+        uint h;
+        if (byte_in_word == 1u) {
+            h = (word >> 8) | (word2 << 24);
+        } else { // 3
+            h = (word >> 24) | (word2 << 8);
+        }
+        return unpackHalf2x16(h).x;
+    }
+}
+
+// ---- Scale extraction helpers for K-quant formats ----
+
+// Q4K/Q5K scale extraction (6-bit packed scales)
+void get_scale_min_k4(uint scales_byte, uint j, out float sc, out float m) {
+    if (j < 4u) {
+        sc = float(read_byte(scales_byte + j) & 63u);
+        m = float(read_byte(scales_byte + j + 4u) & 63u);
+    } else {
+        uint d_byte = read_byte(scales_byte + j + 4u);
+        uint lo_byte = read_byte(scales_byte + j - 4u);
+        sc = float((d_byte & 0xFu) | ((lo_byte >> 6) << 4));
+        m = float((d_byte >> 4) | ((read_byte(scales_byte + j) >> 6) << 4));
+    }
+}
+
+// Q3K scale extraction (6-bit scales packed into 12 bytes)
+float get_q3k_scale(uint scales_byte, uint idx) {
+    int val;
+    if (idx < 4u) {
+        val = int((read_byte(scales_byte + idx) & 0xFu)
+              | ((read_byte(scales_byte + idx + 8u) << 4) & 0x30u));
+    } else if (idx < 8u) {
+        val = int((read_byte(scales_byte + idx) >> 4)
+              | ((read_byte(scales_byte + (idx & 3u) + 8u) << 2) & 0x30u));
+    } else if (idx < 12u) {
+        val = int((read_byte(scales_byte + idx - 4u) & 0xFu)
+              | (read_byte(scales_byte + (idx & 3u) + 8u) & 0x30u));
+    } else {
+        val = int((read_byte(scales_byte + idx - 4u) >> 4)
+              | ((read_byte(scales_byte + (idx & 3u) + 8u) >> 2) & 0x30u));
+    }
+    return float(val - 32);
+}

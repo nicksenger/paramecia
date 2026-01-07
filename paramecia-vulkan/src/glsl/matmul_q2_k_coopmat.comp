@@ -1,0 +1,166 @@
+// q2_k Cooperative Matrix Matmul
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#define Q2_K_K 256
+#define Q2_K_K_BYTES 84
+
+layout(constant_id = 0) const uint TILE_M = 16;
+layout(constant_id = 1) const uint TILE_N = 16;
+layout(constant_id = 2) const uint TILE_K = 16;
+
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform PushConstants { uint params[8]; };
+#define op_m params[0]
+#define op_k params[1]
+#define op_n params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+layout(set = 0, binding = 0, std430) writeonly buffer O { float v_dest[]; };
+layout(set = 0, binding = 1, std430) readonly buffer A { float v_input_a[]; };
+layout(set = 0, binding = 2, std430) readonly buffer B { uint v_input_b[]; };
+
+// Pad shared memory to avoid bank conflicts (16 -> 17)
+shared float16_t shared_a[16 * 17];
+shared float16_t shared_b[16 * 17];
+shared float temp_c[16 * 17];
+
+float half_to_float_lo(uint packed) { return unpackHalf2x16(packed).x; }
+float half_to_float_hi(uint packed) { return unpackHalf2x16(packed).y; }
+
+uint load_byte(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = v_input_b[word_idx];
+    return (word >> (byte_in_word * 8)) & 0xFF;
+}
+
+float load_f16(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = v_input_b[word_idx];
+
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return half_to_float_hi(word);
+    } else {
+        uint word2 = v_input_b[word_idx + 1];
+        uint h;
+        if (byte_in_word == 1) {
+            h = (word >> 8) | (word2 << 24);
+        } else {
+            h = (word >> 24) | (word2 << 8);
+        }
+        return half_to_float_lo(h);
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_m = gl_WorkGroupID.x * TILE_M;
+    uint wg_n = gl_WorkGroupID.y * TILE_N;
+    uint batch = gl_WorkGroupID.z;
+
+    if (wg_m >= op_m || wg_n >= op_n) return;
+
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> matA;
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> matC;
+
+    matC = coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint k_tile = 0; k_tile < (op_k + TILE_K - 1) / TILE_K; k_tile++) {
+        uint k_start = k_tile * TILE_K;
+
+        // Load A - use padded stride
+        for (uint i = tid; i < TILE_M * TILE_K; i += 32) {
+            uint m_local = i / TILE_K;
+            uint k_local = i % TILE_K;
+            uint m_idx = wg_m + m_local;
+            uint k_idx = k_start + k_local;
+            float val = 0.0;
+            if (m_idx < op_m && k_idx < op_k) {
+                val = v_input_a[op_a_offset + batch * op_a_stride_b + m_idx * op_a_stride_m + k_idx * op_a_stride_k];
+            }
+            shared_a[m_local * 17 + k_local] = float16_t(val);
+        }
+
+        // Dequantize B (Q2_K format)
+        // Q2K format (84 bytes per block):
+        // - scales: 16 bytes at offset 0 (each byte: lower 4 bits = scale, upper 4 bits = min)
+        // - qs: 64 bytes at offset 16 (2-bit values, 4 per byte)
+        // - d: f16 at offset 80
+        // - dmin: f16 at offset 82
+        //
+        // Formula: value = d * scale * q - dmin * min
+        for (uint i = tid; i < TILE_K * TILE_N; i += 32) {
+            uint k_local = i / TILE_N;
+            uint n_local = i % TILE_N;
+            uint k_idx = k_start + k_local;
+            uint n_idx = wg_n + n_local;
+            float val = 0.0;
+            if (k_idx < op_k && n_idx < op_n) {
+                uint blk = k_idx / Q2_K_K;
+                uint off = k_idx % Q2_K_K;
+                uint num_blocks = (op_k + Q2_K_K - 1) / Q2_K_K;
+                uint block_byte = n_idx * num_blocks * Q2_K_K_BYTES + blk * Q2_K_K_BYTES;
+
+                // Load d and dmin
+                float d = load_f16(block_byte + 80);
+                float dmin = load_f16(block_byte + 82);
+
+                // Determine position within block
+                uint chunk = off / 128;
+                uint off_in_chunk = off % 128;
+                uint group32 = off_in_chunk / 32;
+                uint subgroup = (off % 32) / 16;
+                uint lane = off % 16;
+                uint shift = group32 * 2;
+                uint qs_index_base = chunk * 32;
+                uint qs_byte_index = qs_index_base + (subgroup * 16) + lane;
+                uint is = chunk * 8 + group32 * 2 + subgroup;
+
+                // Load scale byte
+                uint sc = load_byte(block_byte + 0 + is);
+                float dl = d * float(sc & 0xF);
+                float ml = dmin * float(sc >> 4);
+
+                // Load and extract quantized value
+                uint qs_byte = load_byte(block_byte + 16 + qs_byte_index);
+                uint q = (qs_byte >> shift) & 3u;
+
+                // Dequantize
+                val = dl * float(q) - ml;
+            }
+            shared_b[k_local * 17 + n_local] = float16_t(val);
+        }
+
+        subgroupBarrier();
+        coopMatLoad(matA, shared_a, 0, 17, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, shared_b, 0, 17, gl_CooperativeMatrixLayoutRowMajor);
+        matC = coopMatMulAdd(matA, matB, matC);
+        subgroupBarrier();
+    }
+
+    coopMatStore(matC, temp_c, 0, 17, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupBarrier();
+
+    for (uint i = tid; i < TILE_M * TILE_N; i += 32) {
+        uint m_local = i / TILE_N;
+        uint n_local = i % TILE_N;
+        uint m_idx = wg_m + m_local;
+        uint n_idx = wg_n + n_local;
+        if (m_idx < op_m && n_idx < op_n) {
+            v_dest[batch * op_m * op_n + m_idx * op_n + n_idx] = temp_c[m_local * 17 + n_local];
+        }
+    }
+}

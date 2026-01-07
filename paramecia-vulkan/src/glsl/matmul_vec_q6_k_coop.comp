@@ -1,0 +1,185 @@
+// Q6_K Matrix-Vector Multiplication - Cooperative with shared activation loading
+//
+// Dispatch: [ceil(n / NUM_ROWS), batch, 1]
+// Workgroup: 32 (x) × NUM_ROWS (y)
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(constant_id = 0) const uint NUM_ROWS = 2;
+
+#define QK6_K 256
+#define QK6_K_BYTES 210
+#define NUM_SCALES 16
+#define WARP_SIZE 32
+
+layout(local_size_x = WARP_SIZE, local_size_y_id = 0, local_size_z = 1) in;
+
+shared float shared_scales[NUM_ROWS][NUM_SCALES];
+shared float shared_a[QK6_K];
+
+layout(push_constant) uniform PushConstants {
+    uint params[8];
+};
+
+#define op_m          params[0]
+#define op_k          params[1]
+#define op_n          params[2]
+#define op_a_stride_b params[3]
+#define op_a_offset   params[4]
+#define op_a_stride_k params[5]
+#define op_a_stride_m params[6]
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuf { float v_dest[]; };
+layout(set = 0, binding = 1, std430) readonly buffer InputA { float v_input_a[]; };
+layout(set = 0, binding = 2, std430) readonly buffer InputB { uint v_input_b[]; };
+
+#include "dequant_helpers.glsl"
+
+int load_signed_byte(uint byte_offset) {
+    uint word_idx = byte_offset / 4;
+    uint byte_in_word = byte_offset % 4;
+    uint word = v_input_b[word_idx];
+    return int(word >> (byte_in_word * 8)) << 24 >> 24;
+}
+
+float load_q6k_scale(uint block_byte) {
+    uint scale_byte = block_byte + 208;
+    uint word_idx = scale_byte / 4;
+    uint byte_in_word = scale_byte % 4;
+    uint word = v_input_b[word_idx];
+
+    if (byte_in_word == 0) {
+        return half_to_float_lo(word);
+    } else if (byte_in_word == 2) {
+        return half_to_float_lo(word >> 16);
+    } else {
+        uint word2 = v_input_b[word_idx + 1];
+        uint h = (byte_in_word == 1)
+            ? ((word >> 8) | (word2 << 24))
+            : ((word >> 24) | (word2 << 8));
+        return half_to_float_lo(h);
+    }
+}
+
+int load_q6_value(uint block_byte, uint off) {
+    uint j_base = (off < 128) ? 0 : 64;
+    uint qh_base = j_base / 2;
+    uint off_in_half = off % 128;
+    uint quarter = off_in_half / 32;
+    uint l = off_in_half % 32;
+
+    uint ql_idx, qh_shift;
+    bool use_upper_nibble;
+
+    if (quarter == 0) {
+        ql_idx = j_base + l;
+        use_upper_nibble = false;
+        qh_shift = 0;
+    } else if (quarter == 1) {
+        ql_idx = j_base + 32 + l;
+        use_upper_nibble = false;
+        qh_shift = 2;
+    } else if (quarter == 2) {
+        ql_idx = j_base + l;
+        use_upper_nibble = true;
+        qh_shift = 4;
+    } else {
+        ql_idx = j_base + 32 + l;
+        use_upper_nibble = true;
+        qh_shift = 6;
+    }
+
+    uint ql = load_byte(block_byte + ql_idx);
+    uint qh = load_byte(block_byte + 128 + qh_base + l);
+
+    uint ql_bits = use_upper_nibble ? (ql >> 4) : (ql & 0xF);
+    uint qh_bits = (qh >> qh_shift) & 0x3;
+    return int(ql_bits | (qh_bits << 4)) - 32;
+}
+
+vec2 dequantize_q6_vec2(uint block_byte, uint elem_idx0, float d,
+                        float cached_scales[NUM_SCALES]) {
+    int q0 = load_q6_value(block_byte, elem_idx0);
+    int q1 = load_q6_value(block_byte, elem_idx0 + 1);
+
+    uint scale_idx0 = elem_idx0 / 16;
+    uint scale_idx1 = (elem_idx0 + 1) / 16;
+
+    float scale0 = cached_scales[scale_idx0];
+    float scale1 = (scale_idx0 == scale_idx1) ? scale0 : cached_scales[scale_idx1];
+
+    return vec2(d * scale0 * float(q0), d * scale1 * float(q1));
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint row_in_wg = gl_LocalInvocationID.y;
+    uint flat_tid = gl_LocalInvocationIndex;
+    uint out_n = gl_WorkGroupID.x * NUM_ROWS + row_in_wg;
+    uint batch = gl_WorkGroupID.y;
+
+    if (out_n >= op_n) return;
+
+    uint a_offset = op_a_offset + batch * op_a_stride_b;
+    uint num_blocks = (op_k + QK6_K - 1) / QK6_K;
+    uint weight_row_start = out_n * num_blocks * QK6_K_BYTES;
+    uint total_threads = WARP_SIZE * NUM_ROWS;
+
+    float sum = 0.0;
+
+    for (uint blk = 0; blk < num_blocks; blk++) {
+        uint k_start = blk * QK6_K;
+        uint block_byte = weight_row_start + blk * QK6_K_BYTES;
+
+        // Cooperative activation load
+        for (uint i = flat_tid; i < QK6_K; i += total_threads) {
+            uint k_idx = k_start + i;
+            shared_a[i] = (k_idx < op_k) ? v_input_a[a_offset + k_idx * op_a_stride_k] : 0.0;
+        }
+        barrier();
+
+        float d = load_q6k_scale(block_byte);
+
+        if (lane < NUM_SCALES) {
+            int scale_i8 = load_signed_byte(block_byte + 192 + lane);
+            shared_scales[row_in_wg][lane] = float(scale_i8);
+        }
+        subgroupBarrier();
+
+        float cached_scales[NUM_SCALES];
+        for (uint s = 0; s < NUM_SCALES; s++) {
+            cached_scales[s] = shared_scales[row_in_wg][s];
+        }
+
+        for (uint i = 0; i < 8; i += 2) {
+            uint elem_idx0 = lane * 8 + i;
+            uint k0 = k_start + elem_idx0;
+
+            if (k0 + 1 < op_k) {
+                vec2 weights = dequantize_q6_vec2(block_byte, elem_idx0, d, cached_scales);
+                vec2 a_vals = vec2(shared_a[elem_idx0], shared_a[elem_idx0 + 1]);
+                sum = fma(weights.x, a_vals.x, sum);
+                sum = fma(weights.y, a_vals.y, sum);
+            } else if (k0 < op_k) {
+                int q = load_q6_value(block_byte, elem_idx0);
+                uint scale_idx = elem_idx0 / 16;
+                float weight = d * cached_scales[scale_idx] * float(q);
+                sum += weight * shared_a[elem_idx0];
+            }
+        }
+
+        barrier();
+    }
+
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) {
+        v_dest[batch * op_n + out_n] = sum;
+    }
+}

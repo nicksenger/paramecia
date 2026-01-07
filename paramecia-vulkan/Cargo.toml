@@ -1,0 +1,14 @@
+[package]
+name = "paramecia-vulkan"
+version = "0.1.0"
+edition = "2021"
+description = "Vulkan compute kernels for Paramecia"
+license = "Apache-2.0"
+
+[dependencies]
+ash = "0.38"
+shaderc = "0.10"
+thiserror = "2"
+
+[build-dependencies]
+shaderc = "0.10"
