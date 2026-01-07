@@ -1,0 +1,110 @@
+[workspace]
+resolver = "2"
+members = [
+    "paramecia-cli",
+    "paramecia-harness",
+    "paramecia-llm",
+    "paramecia-tools",
+    "paramecia-mcp",
+    "paramecia-acp",
+    "paramecia-model",
+    "paramecia-opt",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/nicksenger/paramecia"
+authors = ["Nick Senger"]
+keywords = ["ai", "cli", "coding-assistant", "mistral", "llm", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+
+[workspace.dependencies]
+# Internal crates
+paramecia-harness = { path = "paramecia-harness" }
+paramecia-llm = { path = "paramecia-llm" }
+paramecia-tools = { path = "paramecia-tools" }
+paramecia-mcp = { path = "paramecia-mcp" }
+paramecia-acp = { path = "paramecia-acp" }
+paramecia-opt = { path = "paramecia-opt" }
+
+# Async runtime
+tokio = { version = "1.44", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+crossterm = "0.28"
+ratatui = "0.29"
+
+# Terminal UI
+indicatif = "0.17"
+console = "0.15"
+dialoguer = "0.11"
+syntect = "5.2"
+
+# Logging and errors
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Utilities
+uuid = { version = "1.16", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.9"
+regex = "1.11"
+glob = "0.3"
+dirs = "6.0"
+dotenvy = "0.15"
+once_cell = "1.21"
+parking_lot = "0.12"
+bytes = "1.10"
+base64 = "0.22"
+hirschberg = "0.1"
+unicode-segmentation = "1.12"
+unicode-width = "0.1"
+
+# JSON Schema
+schemars = "0.8"
+
+# Process execution
+portable-pty = "0.8"
+
+# File watching
+notify = "7.0"
+
+# WebRTC and networking
+webrtc = "0.14"
+tokio-tungstenite = "0.26"
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Protocol Buffers
+prost = "0.13"
+prost-types = "0.13"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

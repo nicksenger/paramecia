@@ -1,0 +1,61 @@
+[package]
+name = "paramecia-cli"
+description = "Mistral's open-source CLI coding assistant - Rust implementation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+default-run = "paramecia"
+
+[[bin]]
+name = "paramecia"
+path = "src/main.rs"
+
+[dependencies]
+paramecia-harness = { workspace = true }
+paramecia-llm = { workspace = true }
+paramecia-tools = { workspace = true }
+paramecia-mcp = { workspace = true }
+
+tokio = { workspace = true }
+futures = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+clap = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+
+indicatif = { workspace = true }
+console = { workspace = true }
+dialoguer = { workspace = true }
+syntect = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
+
+dirs = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+
+atty = "0.2"
+whoami = "1.5"
+pulldown-cmark = "0.12"
+reqwest = { version = "0.11", features = ["json"] }
+textwrap = "0.16"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+tempfile = "3.18"
+
+[features]
+default = []
+cuda = ["paramecia-llm/cuda"]
+metal = ["paramecia-llm/metal"]
+flash-attn = ["cuda", "paramecia-llm/flash-attn"]
