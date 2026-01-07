@@ -13,14 +13,16 @@
 
 ### Note from the author
 
-The goal of this project is to create an artificial intelligence agent that:
+The goal of this project is to create artificial intelligence agents that:
 
-- Runs as a single process and from a single binary
-- Performs decently on a personal computer of what I consider _reasonable_ specifications: 24gb VRAM + 64gb SDRAM
-- Is capable of reading and editing its own source code in an agentic loop
-- Supports some form of weight modification or improvement
+- Run as a single process and from a single binary
+- Perform decently on a personal computer of _reasonable_ specifications: 24gb VRAM + 64gb DRAM, or >32gb unified
+- Are capable of reading and editing their own source code in an agentic loop
+- Support some form of weight modification (evolution/backprop/gradient approximation/etc)
 
-Currently, you can talk to this project and it will grep around iteself or give markdown explanations of quantum mechanics, etc, but it is not comparable to frontier-level cloud agentic AI. The focus of this project is _minimal reflection_, not maximal intelligence. That said, I hope it can be a sort of living experiment: one that anyone can take in whatever direction they choose.
+Currently, you can run this project and have it grep around iteself or give markdown explanations of quantum mechanics, etc, but it is not comparable to frontier-level cloud agentic AI. The focus here is reflection and self-improvement, not maximal intelligence or utility.
+
+My honest assessment is that agents spawned from this project are not currently capable of improving either their own weights or the agent/inference code. If that should change, I'll be sure to let folks know.
 
 # Paramecia
 
