@@ -7,7 +7,7 @@
 
 use paramecia_llm::LlmMessage;
 use paramecia_tools::ToolManager;
-use std::path::PathBuf;
+use std::path::Path;
 
 /// Generate multishot example messages that demonstrate tool usage.
 ///
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 /// prompt to teach the model the correct format for tool calls.
 pub fn generate_multishot_examples(
     tool_manager: &ToolManager,
-    workdir: &PathBuf,
+    workdir: &Path,
 ) -> Vec<LlmMessage> {
     let mut messages = Vec::new();
 
@@ -26,11 +26,11 @@ pub fn generate_multishot_examples(
     if available.iter().any(|t| t == "read_file") {
         let example_path = workdir.join("README.md");
         let example_path_str = example_path.to_string_lossy();
-        messages.push(LlmMessage::user(&format!(
+        messages.push(LlmMessage::user(format!(
             "Please use the read_file tool to read {}",
             example_path_str
         )));
-        messages.push(LlmMessage::assistant(&format!(
+        messages.push(LlmMessage::assistant(format!(
             "Ok, I'll read the file at the path specified.\n\n\
                 <tool_call>\n\
                 {{\"name\": \"read_file\", \"arguments\": {{\"path\": \"{}\"}}}}\n\

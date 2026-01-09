@@ -90,8 +90,8 @@ impl GameOfLife {
     pub fn step(&mut self) {
         let mut new_grid = vec![vec![false; self.width]; self.height];
 
-        for y in 0..self.height {
-            for x in 0..self.width {
+        for (y, new_row) in new_grid.iter_mut().enumerate() {
+            for (x, cell) in new_row.iter_mut().enumerate() {
                 let neighbors = self.count_neighbors(x, y);
                 let alive = self.grid[y][x];
 
@@ -99,7 +99,7 @@ impl GameOfLife {
                 // 1. Any live cell with 2 or 3 neighbors survives
                 // 2. Any dead cell with exactly 3 neighbors becomes alive
                 // 3. All other cells die or stay dead
-                new_grid[y][x] = matches!((alive, neighbors), (true, 2) | (true, 3) | (false, 3));
+                *cell = matches!((alive, neighbors), (true, 2) | (true, 3) | (false, 3));
             }
         }
 

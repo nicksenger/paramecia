@@ -733,7 +733,6 @@ impl Agent {
             };
 
             // Build the final message - only if we have content or tool_calls
-            // Mistral API requires assistant messages to have either content or tool_calls
             let has_content = !full_content.is_empty();
             let has_tool_calls = tool_calls.is_some();
 

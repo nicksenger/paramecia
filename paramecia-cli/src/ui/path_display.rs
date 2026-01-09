@@ -1,4 +1,4 @@
-//! Path display widget (matching Mistral Vibe style).
+//! Path display widget.
 
 use ratatui::prelude::*;
 use std::path::PathBuf;

@@ -113,13 +113,13 @@ pub async fn run(
         }
 
         // Check for Ctrl+C during loading
-        if event::poll(Duration::from_millis(0))? {
-            if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    agent_handle.shutdown().await;
-                    return Err(anyhow!("Interrupted by user"));
-                }
-            }
+        if event::poll(Duration::from_millis(0))?
+            && let Event::Key(key) = event::read()?
+            && key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            agent_handle.shutdown().await;
+            return Err(anyhow!("Interrupted by user"));
         }
 
         // Animation frame rate (~30 FPS)

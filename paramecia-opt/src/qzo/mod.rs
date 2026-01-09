@@ -251,7 +251,7 @@ impl QZO {
             let directional_deriv = (loss_plus - loss_minus) / (2.0 * self.params.epsilon as f32);
             let clip = self.params.clip_threshold as f32;
             let clipped_deriv = directional_deriv.clamp(-clip, clip);
-            let scale = (directional_deriv.abs() / clip).max(1.0).min(50.0);
+            let scale = (directional_deriv.abs() / clip).clamp(1.0, 50.0);
             let effective_lr = self.params.lr * scale as f64;
 
             for (var, z) in self.scale_vars.iter().zip(&z_directions) {
@@ -402,7 +402,7 @@ mod tests {
         }
 
         let final_val = var.to_vec1::<f32>()?;
-        let first = final_val.get(0).copied().unwrap_or(0.0);
+        let first = final_val.first().copied().unwrap_or(0.0);
         assert!(
             (first - 5.0).abs() < 1.0,
             "Expected value near 5.0, got {}",

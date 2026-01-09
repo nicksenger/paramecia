@@ -385,7 +385,7 @@ pub fn evaluate_examples_chunked<M: ChunkedForward>(
     }
 
     let num_examples = all_input_ids.len();
-    let num_chunks = (num_examples + config.example_batch_size - 1) / config.example_batch_size;
+    let num_chunks = num_examples.div_ceil(config.example_batch_size);
     let mut all_losses = Vec::with_capacity(num_examples);
 
     for chunk_idx in 0..num_chunks {

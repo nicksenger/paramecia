@@ -249,7 +249,7 @@ impl ToolResultMessage {
     /// Get a display summary.
     #[must_use]
     pub fn summary(&self) -> String {
-        // Use different shortcut hint for todo tool (matching Mistral Vibe)
+        // Use different shortcut hint for todo tool
         let shortcut = if self.tool_name == "todo" {
             "ctrl+t"
         } else {
@@ -425,7 +425,7 @@ impl CompactMessage {
     }
 }
 
-/// A bash command output message (matching Mistral Vibe's BashOutputMessage).
+/// A bash command output message.
 #[derive(Debug, Clone)]
 pub struct BashOutputMessage {
     /// The command that was run.

@@ -92,7 +92,7 @@ impl VersionUpdateChecker {
         self.save_config().await?;
 
         // Fetch latest release from GitHub
-        let url = "https://api.github.com/repos/mistralai/vibe/releases/latest";
+        let url = "https://api.github.com/repos/nicksenger/paramecia/releases/latest";
         let response = self
             .client
             .get(url)

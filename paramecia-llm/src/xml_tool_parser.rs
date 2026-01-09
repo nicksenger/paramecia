@@ -464,10 +464,8 @@ fn repair_json_in_xml(input: &str) -> Option<serde_json::Value> {
             escape = ch == '\\' && !escape;
         }
 
-        if let Some(end) = end_pos {
-            if let Ok(value) = serde_json::from_str(&trimmed[start..end]) {
-                return Some(value);
-            }
+        if let Some(end) = end_pos && let Ok(value) = serde_json::from_str(&trimmed[start..end]) {
+            return Some(value);
         }
     }
 

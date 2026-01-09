@@ -153,6 +153,7 @@ pub fn process_experts_tokio(
 }
 
 /// Process a single expert with minimal allocations.
+#[allow(clippy::too_many_arguments)]
 fn process_single_expert_optimized(
     expert_idx: usize,
     token_indices: &[u32],
@@ -204,8 +205,6 @@ fn process_single_expert_optimized(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_parallel_threads() {
         let parallelism = rayon::current_num_threads();

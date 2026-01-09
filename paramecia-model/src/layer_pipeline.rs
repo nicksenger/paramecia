@@ -185,7 +185,8 @@ impl PrefetchPipelineCoordinator {
                     }
 
                     // Process experts in parallel using tensor operations
-                    let expert_results: Vec<(usize, Vec<(usize, f32, Vec<f32>)>)> = expert_groups
+                    type ExpertResult = Vec<(usize, f32, Vec<f32>)>;
+                    let expert_results: Vec<(usize, ExpertResult)> = expert_groups
                         .into_par_iter()
                         .filter_map(|(expert_id, assignments)| {
                             if expert_id >= num_experts {

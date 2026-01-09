@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 /// Result of parsing a JSON chunk in tool calls.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ToolCallParseResult {
     /// Whether the JSON parsing is complete.
     pub complete: bool,
@@ -22,17 +22,6 @@ pub struct ToolCallParseResult {
     pub error: Option<String>,
     /// Whether the JSON was repaired (e.g., auto-closed unclosed strings).
     pub repaired: bool,
-}
-
-impl Default for ToolCallParseResult {
-    fn default() -> Self {
-        Self {
-            complete: false,
-            value: None,
-            error: None,
-            repaired: false,
-        }
-    }
 }
 
 impl ToolCallParseResult {
@@ -228,7 +217,7 @@ impl StreamingToolCallParser {
 
             // Check if we have a complete tool call with a different ID
             if !buffer.trim().is_empty()
-                && state.map_or(false, |s| s.depth == 0)
+                && state.is_some_and(|s| s.depth == 0)
                 && meta.is_some_and(|m| m.id.as_deref().is_some_and(|id| id != new_id))
             {
                 // Try to parse to confirm it's complete
@@ -244,7 +233,7 @@ impl StreamingToolCallParser {
             let state = self.parse_states.get(&index);
 
             // If there's an incomplete tool call at this index, continue with it
-            if state.map_or(true, |s| s.depth > 0) || buffer.trim().is_empty() {
+            if state.is_none_or(|s| s.depth > 0) || buffer.trim().is_empty() {
                 return index;
             }
 
@@ -268,7 +257,7 @@ impl StreamingToolCallParser {
 
             // Check if this tool call is incomplete
             let is_incomplete = if meta.is_some_and(|m| m.id.is_some()) {
-                state.map_or(true, |s| s.depth > 0) || buffer.trim().is_empty()
+                state.is_none_or(|s| s.depth > 0) || buffer.trim().is_empty()
             } else if !buffer.trim().is_empty() {
                 serde_json::from_str::<serde_json::Value>(buffer).is_err()
             } else {
@@ -280,7 +269,7 @@ impl StreamingToolCallParser {
             }
         }
 
-        max_index.unwrap_or_else(|| self.next_available_index)
+        max_index.unwrap_or(self.next_available_index)
     }
 
     /// Find the next available index for a new tool call.
@@ -294,8 +283,8 @@ impl StreamingToolCallParser {
 
                 // If buffer is empty or incomplete, this index is available
                 if buffer.trim().is_empty()
-                    || state.map_or(true, |s| s.depth > 0)
-                    || meta.map_or(true, |m| m.id.is_none())
+                    || state.is_none_or(|s| s.depth > 0)
+                    || meta.is_none_or(|m| m.id.is_none())
                 {
                     return index;
                 }

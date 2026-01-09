@@ -141,11 +141,9 @@ fn format_prompt_for_display(messages: &[LlmMessage], tools: Option<&[AvailableT
     if has_tools {
         prompt.push_str("<|im_start|>system\n");
 
-        if first_is_system {
-            if let Some(content) = &messages[0].content {
-                prompt.push_str(content);
-                prompt.push_str("\n\n");
-            }
+        if first_is_system && let Some(content) = &messages[0].content {
+            prompt.push_str(content);
+            prompt.push_str("\n\n");
         }
 
         // Add tool definitions in Qwen3-Next native XML format
@@ -207,7 +205,7 @@ fn format_prompt_for_display(messages: &[LlmMessage], tools: Option<&[AvailableT
                         if !first {
                             prompt.push_str(", ");
                         }
-                        prompt.push_str("\"");
+                        prompt.push('"');
                         prompt.push_str(name);
                         prompt.push_str("\": \"value\"");
                         first = false;
@@ -570,7 +568,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(tcs) = &chunk.message.tool_calls {
                 for tc in tcs {
                     // Merge or add tool call
-                    let idx = tc.index.unwrap_or(0) as usize;
+                    let idx = tc.index.unwrap_or(0);
                     while tool_calls.len() <= idx {
                         tool_calls.push(paramecia_llm::ToolCall {
                             id: None,
@@ -599,12 +597,10 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Print content as it arrives (streaming!)
-            if let Some(content) = &chunk.message.content {
-                if !content.is_empty() {
-                    print!("{}", content);
-                    std::io::stdout().flush()?;
-                    full_content.push_str(content);
-                }
+            if let Some(content) = &chunk.message.content && !content.is_empty() {
+                print!("{}", content);
+                std::io::stdout().flush()?;
+                full_content.push_str(content);
             }
         }
         println!(); // Newline after streaming content
@@ -636,55 +632,52 @@ async fn main() -> anyhow::Result<()> {
         let duration = start.elapsed().as_secs_f64();
 
         // Check for tool calls
-        if let Some(tool_calls) = &result.message.tool_calls {
-            if !tool_calls.is_empty() {
-                println!("\n[Tool calls detected]");
+        if let Some(tool_calls) = &result.message.tool_calls && !tool_calls.is_empty() {
+            println!("\n[Tool calls detected]");
 
-                // Add the assistant message with tool calls to history
-                messages.push(result.message.clone());
+            // Add the assistant message with tool calls to history
+            messages.push(result.message.clone());
 
-                // Execute each tool
-                for tc in tool_calls {
-                    let tool_name = tc.function.name.as_deref().unwrap_or("unknown");
-                    let tool_args: serde_json::Value = tc
-                        .function
-                        .arguments
-                        .as_ref()
-                        .and_then(|a| serde_json::from_str(a).ok())
-                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            // Execute each tool
+            for tc in tool_calls {
+                let tool_name = tc.function.name.as_deref().unwrap_or("unknown");
+                let tool_args: serde_json::Value = tc
+                    .function
+                    .arguments
+                    .as_ref()
+                    .and_then(|a| serde_json::from_str(a).ok())
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
-                    println!("\n> Calling tool: {} with args: {}", tool_name, tool_args);
+                println!("\n> Calling tool: {} with args: {}", tool_name, tool_args);
 
-                    // Execute the tool via ToolManager
-                    let tool_result =
-                        execute_tool_via_manager(&tool_manager, tool_name, &tool_args).await;
-                    println!(
-                        "< Result: {}",
-                        if tool_result.len() > 200 {
-                            format!("{}...(truncated)", &tool_result[..200])
-                        } else {
-                            tool_result.clone()
-                        }
-                    );
+                // Execute the tool via ToolManager
+                let tool_result = execute_tool_via_manager(&tool_manager, tool_name, &tool_args).await;
+                println!(
+                    "< Result: {}",
+                    if tool_result.len() > 200 {
+                        format!("{}...(truncated)", &tool_result[..200])
+                    } else {
+                        tool_result.clone()
+                    }
+                );
 
-                    // Add tool response to messages
-                    let tool_call_id = tc.id.clone().unwrap_or_else(|| format!("call_{}", turn));
-                    messages.push(LlmMessage::tool(&tool_call_id, tool_name, tool_result));
-                }
-
-                if let Some(usage) = &result.usage {
-                    println!(
-                        "\n[Tokens: {} prompt, {} completion | {:.1}s | {:.1} tok/s]",
-                        usage.prompt_tokens,
-                        usage.completion_tokens,
-                        duration,
-                        usage.completion_tokens as f64 / duration
-                    );
-                }
-
-                // Continue the loop for tool calls
-                continue;
+                // Add tool response to messages
+                let tool_call_id = tc.id.clone().unwrap_or_else(|| format!("call_{}", turn));
+                messages.push(LlmMessage::tool(&tool_call_id, tool_name, tool_result));
             }
+
+            if let Some(usage) = &result.usage {
+                println!(
+                    "\n[Tokens: {} prompt, {} completion | {:.1}s | {:.1} tok/s]",
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    duration,
+                    usage.completion_tokens as f64 / duration
+                );
+            }
+
+            // Continue the loop for tool calls
+            continue;
         }
 
         // No tool calls - add message and potentially break

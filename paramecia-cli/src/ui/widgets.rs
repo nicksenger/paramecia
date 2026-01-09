@@ -25,13 +25,13 @@ fn truncate_string(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Colors matching Mistral Vibe's theme (extracted from app.tcss).
+/// Colors for Paramecia's theme.
 #[allow(dead_code)]
 pub mod colors {
     use ratatui::style::{Color, Style};
 
-    // Exact colors from Mistral Vibe's CSS variables
-    pub const PRIMARY: Color = Color::Rgb(0, 150, 255); // #FFAF00 - Blue primary
+    // Theme colors
+    pub const PRIMARY: Color = Color::Rgb(0, 150, 255); // Blue primary
     pub const SUCCESS: Color = Color::Rgb(0, 200, 100); // Green for success
     pub const WARNING: Color = Color::Rgb(0, 200, 100); // Green for warnings
     pub const ERROR: Color = Color::Rgb(200, 50, 50); // Red for errors
@@ -58,7 +58,7 @@ pub mod colors {
         Color::Rgb(200, 230, 100), // Lime-green (biological theme)
     ];
 
-    /// Foreground colors to match Mistral Vibe's theme
+    /// Foreground colors
     pub const FOREGROUND: Color = Color::Rgb(220, 220, 220); // $foreground
     pub const FOREGROUND_MUTED: Color = Color::Rgb(128, 128, 128); // $foreground-muted
     pub const TEXT_MUTED: Color = Color::Rgb(100, 100, 100); // $text-muted
@@ -128,7 +128,7 @@ pub mod colors {
     }
 }
 
-/// Render a user message (matching Mistral Vibe style with surface background).
+/// Render a user message.
 /// In Python, user messages have:
 ///   - margin-top: 1
 ///   - padding: 1 0 (vertical padding)
@@ -1168,7 +1168,7 @@ pub fn render_tool_call(
     ]
 }
 
-/// Render a tool result message (matching Mistral Vibe style with expanding border).
+/// Render a tool result message.
 /// margin-top: 0 (no extra spacing before)
 pub fn render_tool_result(msg: &ToolResultMessage) -> Vec<Line<'static>> {
     let border_style = Style::default().fg(colors::MUTED);
@@ -1455,7 +1455,7 @@ pub fn render_compact(
     lines
 }
 
-/// Render the loading indicator (matching Mistral Vibe's gradient wave animation).
+/// Render the loading indicator.
 ///
 /// The animation works by having a "wave" that propagates through the text,
 /// changing each character from the current color to the next color in sequence.
@@ -1518,7 +1518,7 @@ pub fn render_loading(
     Line::from(spans)
 }
 
-/// Render the input box (matching Mistral Vibe style).
+/// Render the input box.
 pub fn render_input_box<'a>(
     content: &'a str,
     _cursor: usize,
@@ -1543,7 +1543,7 @@ pub fn render_input_box<'a>(
         Span::raw("")
     };
 
-    // Show placeholder when empty (matching Mistral Vibe's "Ask anything..." placeholder)
+    // Show placeholder when empty
     let content_span = if content.is_empty() {
         Span::styled(
             "Ask anything...",
@@ -1587,7 +1587,7 @@ pub fn render_input_box<'a>(
     }
 }
 
-/// Render the approval dialog (matching Mistral Vibe style with enhanced formatting).
+/// Render the approval dialog.
 pub fn render_approval_dialog(
     frame: &mut Frame,
     area: Rect,
@@ -1604,7 +1604,7 @@ pub fn render_approval_dialog(
     frame.render_widget(block, area);
 
     let mut lines = vec![
-        // Title - matching Mistral's "⚠ {tool_name} command" style
+        // Title
         Line::from(vec![Span::styled(
             format!("⚠ {} command", tool_name),
             Style::default().fg(colors::WARNING).bold(),
@@ -1639,7 +1639,7 @@ pub fn render_approval_dialog(
 
     lines.push(Line::from(""));
 
-    // Options with keyboard shortcuts (matching Mistral Vibe's ApprovalApp)
+    // Options with keyboard shortcuts
     let options = [
         ("Yes", "yes", "y"),
         (
@@ -1654,7 +1654,7 @@ pub fn render_approval_dialog(
         let is_selected = i == selected;
         let cursor = if is_selected { "› " } else { "  " };
 
-        // Style matching Mistral Vibe: yes options are green, no options are red
+        // Style: yes options are green, no options are red
         let style = if is_selected {
             if *color_type == "no" {
                 Style::default().fg(colors::ERROR).bold()
@@ -1700,7 +1700,7 @@ pub fn render_approval_dialog(
     frame.render_widget(paragraph, inner);
 }
 
-/// Render the completion popup (matching Mistral Vibe style).
+/// Render the completion popup.
 pub fn render_completion_popup(
     frame: &mut Frame,
     area: Rect,
@@ -1743,7 +1743,7 @@ pub fn render_completion_popup(
         height,
     };
 
-    // Clear the area with background (matching Mistral Vibe's #completion-popup styling)
+    // Clear the area with background
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(colors::MUTED))

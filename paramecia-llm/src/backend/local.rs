@@ -265,10 +265,8 @@ impl LocalBackend {
             }
         }
 
-        if let Ok(device) = Device::cuda_if_available(0) {
-            if matches!(device, Device::Cuda(_)) {
-                return Ok(device);
-            }
+        if let Ok(device) = Device::cuda_if_available(0) && matches!(device, Device::Cuda(_)) {
+            return Ok(device);
         }
         if let Ok(device) = Device::new_metal(0) {
             return Ok(device);
@@ -431,7 +429,7 @@ impl LocalBackend {
                 if !first {
                     prompt.push_str(", ");
                 }
-                prompt.push_str("\"");
+                prompt.push('"');
                 prompt.push_str(name);
                 prompt.push_str("\": \"value\"");
                 first = false;
@@ -476,11 +474,9 @@ impl LocalBackend {
             prompt.push_str("<|im_start|>system\n");
 
             // Add system message content if present
-            if first_is_system {
-                if let Some(content) = &messages[0].content {
-                    prompt.push_str(content);
-                    prompt.push_str("\n\n");
-                }
+            if first_is_system && let Some(content) = &messages[0].content {
+                prompt.push_str(content);
+                prompt.push_str("\n\n");
             }
 
             // Add tool definitions in Qwen3-Next native XML format
@@ -603,47 +599,43 @@ impl LocalBackend {
         }
 
         // Also try the old JSON format for backwards compatibility
-        if parsed.is_empty() {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
-                if let Some(tool_calls) = value.get("tool_calls").and_then(|v| v.as_array()) {
-                    for (i, tc) in tool_calls.iter().enumerate() {
-                        let name = tc
-                            .get("name")
+        if parsed.is_empty()
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(raw)
+            && let Some(tool_calls) = value.get("tool_calls").and_then(|v| v.as_array())
+        {
+            for (i, tc) in tool_calls.iter().enumerate() {
+                let name = tc
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        tc.get("function")
+                            .and_then(|f| f.get("name"))
                             .and_then(|v| v.as_str())
                             .map(str::to_string)
-                            .or_else(|| {
-                                tc.get("function")
-                                    .and_then(|f| f.get("name"))
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string)
-                            });
+                    });
 
-                        let args_value = tc
-                            .get("arguments")
-                            .cloned()
-                            .or_else(|| {
-                                tc.get("function").and_then(|f| f.get("arguments").cloned())
-                            })
-                            .unwrap_or(serde_json::Value::Null);
+                let args_value = tc
+                    .get("arguments")
+                    .cloned()
+                    .or_else(|| tc.get("function").and_then(|f| f.get("arguments").cloned()))
+                    .unwrap_or(serde_json::Value::Null);
 
-                        let arguments =
-                            serde_json::to_string(&args_value).unwrap_or_else(|_| "{}".to_string());
+                let arguments = serde_json::to_string(&args_value).unwrap_or_else(|_| "{}".to_string());
 
-                        parsed.push(ToolCall {
-                            id: tc
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .map(str::to_string)
-                                .or_else(|| Some(format!("local-tool-{i}"))),
-                            index: Some(i),
-                            function: FunctionCall {
-                                name,
-                                arguments: Some(arguments),
-                            },
-                            r#type: "function".to_string(),
-                        });
-                    }
-                }
+                parsed.push(ToolCall {
+                    id: tc
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .or_else(|| Some(format!("local-tool-{i}"))),
+                    index: Some(i),
+                    function: FunctionCall {
+                        name,
+                        arguments: Some(arguments),
+                    },
+                    r#type: "function".to_string(),
+                });
             }
         }
 
@@ -873,11 +865,9 @@ impl LocalBackend {
             generated.push(next_token);
 
             // Track thinking state
-            if let Some(start_token) = self.think_start_token {
-                if next_token == start_token {
-                    in_thinking = true;
-                    thinking_tokens = 0;
-                }
+            if let Some(start_token) = self.think_start_token && next_token == start_token {
+                in_thinking = true;
+                thinking_tokens = 0;
             }
             if in_thinking {
                 thinking_tokens += 1;
@@ -892,10 +882,8 @@ impl LocalBackend {
                 }
             }
 
-            if let Some(eos) = self.eos_token {
-                if next_token == eos {
-                    break;
-                }
+            if let Some(eos) = self.eos_token && next_token == eos {
+                break;
             }
         }
 
@@ -1564,11 +1552,9 @@ impl LocalBackend {
             generated_token_ids.push(next_token);
 
             // Track thinking state
-            if let Some(start_token) = think_start_token {
-                if next_token == start_token {
-                    in_thinking = true;
-                    thinking_tokens = 0;
-                }
+            if let Some(start_token) = think_start_token && next_token == start_token {
+                in_thinking = true;
+                thinking_tokens = 0;
             }
             if in_thinking {
                 thinking_tokens += 1;

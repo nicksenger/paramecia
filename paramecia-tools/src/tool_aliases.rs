@@ -33,7 +33,7 @@ pub struct ToolAliasConfig {
 }
 
 /// Parameter transformation rules.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ParamTransform {
     /// Rename parameters: internal_name -> model_name
     pub renames: HashMap<String, String>,
@@ -43,17 +43,6 @@ pub struct ParamTransform {
     pub additional_required: Vec<String>,
     /// Additional properties to add to schema
     pub additional_properties: HashMap<String, Value>,
-}
-
-impl Default for ParamTransform {
-    fn default() -> Self {
-        Self {
-            renames: HashMap::new(),
-            defaults: HashMap::new(),
-            additional_required: Vec::new(),
-            additional_properties: HashMap::new(),
-        }
-    }
 }
 
 impl ToolAliasConfig {
@@ -344,10 +333,9 @@ impl ToolAliasConfig {
             if let Some(Value::Array(required)) = obj.get_mut("required") {
                 // Rename required fields
                 for item in required.iter_mut() {
-                    if let Value::String(s) = item {
-                        if let Some(new_name) = transform.renames.get(s) {
+                    if let Value::String(s) = item
+                        && let Some(new_name) = transform.renames.get(s) {
                             *s = new_name.clone();
-                        }
                     }
                 }
 

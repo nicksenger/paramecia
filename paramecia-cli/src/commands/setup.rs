@@ -3,7 +3,7 @@
 use anyhow::Result;
 use console::style;
 use dialoguer::{Password, theme::ColorfulTheme};
-use paramecia_harness::paths::{CONFIG_DIR, ENV_FILE, ensure_dirs};
+use paramecia_harness::paths::{ENV_FILE, ensure_dirs};
 use std::fs;
 
 /// Run the setup wizard.
@@ -19,9 +19,9 @@ pub async fn run() -> Result<()> {
 
     // Get API key
     let api_key: String = Password::with_theme(&ColorfulTheme::default())
-        .with_prompt("Enter your Mistral API key")
+        .with_prompt("Enter your API key")
         .with_confirmation(
-            "Confirm your Mistral API key",
+            "Confirm your API key",
             "API keys don't match, try again",
         )
         .interact()?;
@@ -35,12 +35,8 @@ pub async fn run() -> Result<()> {
     }
 
     // Save to .env file
-    let env_content = format!("MISTRAL_API_KEY={api_key}\n");
+    let env_content = format!("API_KEY={api_key}\n");
     fs::write(&*ENV_FILE, env_content)?;
-
-    // Also save to mistral.txt for compatibility with Python implementation
-    let mistral_key_file = CONFIG_DIR.join("mistral.txt");
-    fs::write(&mistral_key_file, api_key)?;
 
     println!();
     println!(
