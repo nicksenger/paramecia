@@ -86,7 +86,7 @@ pub fn group_tokens_by_expert(
     // token_ids: [0, 0, ..., 0, 1, 1, ..., 1, ...] (each token repeated top_k times)
     // k_ids: [0, 1, 2, ..., top_k-1, 0, 1, 2, ..., top_k-1, ...]
     let token_ids: Vec<u32> = (0..n_tokens as u32)
-        .flat_map(|t| std::iter::repeat(t).take(top_k))
+        .flat_map(|t| std::iter::repeat_n(t, top_k))
         .collect();
     let k_ids: Vec<u32> = (0..n_tokens).flat_map(|_| 0..top_k as u32).collect();
 
@@ -198,7 +198,8 @@ pub fn process_moe_gpu_grouped(
     let weights_flat: Vec<f32> = weights_cpu.flatten_all()?.to_vec1()?;
 
     // Step 3: Build expert assignments (which tokens go to which expert)
-    let expert_assignments: Vec<(usize, Vec<(usize, usize, usize)>)> = (0..num_experts)
+    type ExpertAssignment = Vec<(usize, usize, usize)>;
+    let expert_assignments: Vec<(usize, ExpertAssignment)> = (0..num_experts)
         .filter_map(|expert_id| {
             let start = segment_offsets[expert_id];
             let end = segment_offsets[expert_id + 1];
@@ -220,7 +221,8 @@ pub fn process_moe_gpu_grouped(
 
     // Step 4: Process each expert in parallel using Rayon
     // Uses apply_op1_no_bwd which leverages optimized quantized matmul internally
-    let expert_results: Vec<(usize, Vec<(usize, f32, Vec<f32>)>)> = expert_assignments
+    type ExpertResult = Vec<(usize, f32, Vec<f32>)>;
+    let expert_results: Vec<(usize, ExpertResult)> = expert_assignments
         .into_par_iter()
         .filter_map(|(expert_id, assignments)| {
             let segment_size = assignments.len();
@@ -385,6 +387,7 @@ pub fn cumsum_last_dim(x: &Tensor) -> Result<Tensor> {
 /// Returns: (output, new_state) where:
 ///   output: [batch, num_heads, head_dim]
 ///   new_state: [batch, num_heads, head_dim, head_dim]
+#[allow(clippy::too_many_arguments)]
 pub fn delta_net_autoregressive_step(
     q: &Tensor,
     k: &Tensor,

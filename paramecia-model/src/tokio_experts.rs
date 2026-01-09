@@ -154,6 +154,7 @@ pub fn process_experts_tokio(
 
 /// Process a single expert with minimal allocations.
 fn process_single_expert_optimized(
+#[allow(clippy::too_many_arguments)]
     expert_idx: usize,
     token_indices: &[u32],
     weights: &[f32],

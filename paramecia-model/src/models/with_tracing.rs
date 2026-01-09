@@ -183,12 +183,12 @@ impl QMatMul {
                 let rank = lora_a.dim(1)? as f64;
                 let scale = sigma / rank.sqrt();
 
-                let lora_a = lora_a.to_device(&device)?.to_dtype(candle::DType::F16)?;
-                let lora_b = lora_b.to_device(&device)?.to_dtype(candle::DType::F16)?;
+                let lora_a = lora_a.to_device(device)?.to_dtype(candle::DType::F16)?;
+                let lora_b = lora_b.to_device(device)?.to_dtype(candle::DType::F16)?;
                 let lora_delta = lora_a.matmul(&lora_b)?;
                 let lora_delta = (lora_delta * scale)?;
 
-                let merged = (t.as_ref() + lora_delta)?;
+                let merged = (t + lora_delta)?;
 
                 // Return as a "fake" quantized tensor - use F16 dtype
                 candle::quantized::QTensor::quantize(&merged, candle::quantized::GgmlDType::F16)
@@ -200,12 +200,12 @@ impl QMatMul {
                 let rank = lora_a.dim(1)? as f64;
                 let scale = sigma / rank.sqrt();
 
-                let lora_a = lora_a.to_device(&device)?.to_dtype(t.dtype())?;
-                let lora_b = lora_b.to_device(&device)?.to_dtype(t.dtype())?;
+                let lora_a = lora_a.to_device(device)?.to_dtype(t.dtype())?;
+                let lora_b = lora_b.to_device(device)?.to_dtype(t.dtype())?;
                 let lora_delta = lora_a.matmul(&lora_b)?;
                 let lora_delta = (lora_delta * scale)?;
 
-                let merged = (t.as_ref() + lora_delta)?;
+                let merged = (t + lora_delta)?;
 
                 // Return as F32 quantized tensor
                 candle::quantized::QTensor::quantize(&merged, candle::quantized::GgmlDType::F32)
