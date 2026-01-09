@@ -1,6 +1,6 @@
 //! Text input handling for the chat interface.
 //!
-//! This module mirrors the behavior of Mistral Vibe's ChatTextArea:
+//! Text input features:
 //! - Up/down arrows only trigger history when cursor is on first/last line
 //! - Proper multiline cursor navigation
 //! - Prefix-based history filtering

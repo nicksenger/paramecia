@@ -5,10 +5,9 @@ use paramecia_harness::modes::AgentMode;
 use paramecia_harness::types::OutputFormat;
 use std::io::{self, Read};
 
-/// Version constant matching the Python CLI
 const VERSION: &str = "1.2.1";
 
-/// Paramecia CLI - Rust rewrite of Mistral's open-source CLI coding assistant
+/// Paramecia CLI
 #[derive(Parser, Debug)]
 #[command(name = "paramecia")]
 #[command(author = "Devstral 2")]

@@ -32,7 +32,7 @@ impl WelcomeBanner {
 
     /// Render the welcome banner.
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        // Create animated border matching Mistral Vibe's welcome banner
+        // Create animated border
         let border_color = colors::GRADIENT[self.color_index % colors::GRADIENT.len()];
         let block = Block::default()
             .borders(Borders::ALL)

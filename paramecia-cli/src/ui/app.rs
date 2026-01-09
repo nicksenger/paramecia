@@ -241,7 +241,7 @@ impl App {
         self.loading_start = None;
     }
 
-    /// Set loading status with easter egg logic (matching Mistral Vibe's set_status).
+    /// Set loading status with easter egg logic.
     /// Has a 10% chance to replace the status with a French easter egg.
     pub fn set_loading_status(&mut self, status: &str) {
         self.loading_status = apply_easter_egg(status);
@@ -288,7 +288,7 @@ impl App {
 
     /// Add a tool call message.
     pub fn add_tool_call(&mut self, tool_name: String, args: &serde_json::Value) {
-        // Update loading status with tool-specific text (matching Mistral Vibe)
+        // Update loading status with tool-specific text
         // This has a 10% chance to show an easter egg instead
         let status_text = get_tool_status_text(&tool_name);
         self.set_loading_status(status_text);
@@ -681,7 +681,7 @@ impl App {
             self.color_index = (self.color_index + 1) % colors::GRADIENT.len();
 
             // Note: loading_status is set once in start_loading() and preserved
-            // until loading stops (matching Mistral Vibe behavior where easter eggs
+            // until loading stops
             // persist for the duration of the loading state)
 
             self.last_render = now;
@@ -709,7 +709,7 @@ impl App {
             return;
         }
 
-        // Calculate layout matching Mistral Vibe's app.tcss more precisely:
+        // Calculate layout:
         // - #chat: height 1fr (takes remaining space)
         // - #loading-area: height auto, padding 1 0 0 0 (1 line top padding + content)
         // - #todo-area: height auto (for todo checklist)
@@ -789,7 +789,7 @@ impl App {
             };
             config_app.render(frame, dialog_area);
         } else if let Some(approval) = &self.approval {
-            // Overlay approval dialog (matching Mistral Vibe's #approval-app max-height: 16)
+            // Overlay approval dialog
             let dialog_height = 14.min(area.height.saturating_sub(6));
             let dialog_area = Rect {
                 x: 0,
@@ -1062,7 +1062,7 @@ impl App {
         }
     }
 
-    /// Render the loading area (matching Mistral Vibe: loading content + mode indicator).
+    /// Render the loading area.
     fn render_loading(&self, frame: &mut Frame, area: Rect) {
         // Split area into loading content and mode indicator
         let chunks = Layout::default()
@@ -1100,7 +1100,7 @@ impl App {
         self.mode_indicator.render(mode_area, frame.buffer_mut());
     }
 
-    /// Render the todo area (matching Mistral Vibe's todo checklist at bottom).
+    /// Render the todo area.
     fn render_todo_area(&self, frame: &mut Frame, area: Rect) {
         if let Some(todos) = &self.current_todos {
             if todos.is_empty() {
@@ -1334,7 +1334,7 @@ impl App {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 
-    /// Render the bottom bar (matching Mistral Vibe layout).
+    /// Render the bottom bar.
     fn render_bottom_bar(&self, frame: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)

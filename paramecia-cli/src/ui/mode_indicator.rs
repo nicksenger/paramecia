@@ -1,11 +1,11 @@
-//! Mode indicator widget (matching Mistral Vibe style).
+//! Mode indicator widget.
 
 use paramecia_harness::modes::{AgentMode, ModeSafety};
 use ratatui::prelude::*;
 
 use super::widgets::colors;
 
-/// Get the icon for a mode (matching Mistral Vibe).
+/// Get the icon for a mode.
 fn mode_icon(mode: AgentMode) -> &'static str {
     match mode {
         AgentMode::Default => "⏵",

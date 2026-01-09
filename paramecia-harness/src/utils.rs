@@ -1,4 +1,4 @@
-//! Utility functions and constants matching mistral-vibe behavior.
+//! Utility functions and constants for Paramecia.
 
 /// Tag for user cancellation events.
 pub const CANCELLATION_TAG: &str = "user_cancellation";

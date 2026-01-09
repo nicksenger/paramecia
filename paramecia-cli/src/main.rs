@@ -1,6 +1,4 @@
-//! Paramecia CLI - Mistral's open-source CLI coding assistant.
-//!
-//! A Rust implementation of the Mistral Vibe command-line tool.
+//! Paramecia CLI
 
 use anyhow::Result;
 use clap::Parser;

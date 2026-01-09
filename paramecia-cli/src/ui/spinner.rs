@@ -62,7 +62,7 @@ impl Spinner {
 fn get_easter_egg() -> Option<&'static str> {
     let mut rng = rand::rng();
 
-    // 10% chance of easter egg (matching Mistral Vibe)
+    // 10% chance of easter egg
     const EASTER_EGG_PROBABILITY: f64 = 0.10;
     if rng.random::<f64>() >= EASTER_EGG_PROBABILITY {
         return None;
@@ -72,13 +72,13 @@ fn get_easter_egg() -> Option<&'static str> {
     EASTER_EGGS.get(idx).copied()
 }
 
-/// Easter egg messages for loading states (matching Mistral Vibe style).
+/// Easter egg messages for loading states.
 /// Uses proper random selection and includes holiday-specific messages.
 pub fn get_loading_message() -> &'static str {
     get_easter_egg().unwrap_or("Thinking")
 }
 
-/// Apply easter egg logic to a status message (matching Mistral Vibe's _apply_easter_egg).
+/// Apply easter egg logic to a status message.
 /// Has a 10% chance to replace the status with an easter egg.
 pub fn apply_easter_egg(status: &str) -> String {
     get_easter_egg()
@@ -86,7 +86,7 @@ pub fn apply_easter_egg(status: &str) -> String {
         .unwrap_or_else(|| status.to_string())
 }
 
-/// Get status text for a tool (matching Mistral Vibe's get_status_text pattern).
+/// Get status text for a tool.
 pub fn get_tool_status_text(tool_name: &str) -> &'static str {
     match tool_name {
         "read" | "Read" => "Reading",

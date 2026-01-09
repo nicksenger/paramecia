@@ -40,7 +40,7 @@ impl AgentTrait for AcpAgent {
         params: InitializeRequest,
     ) -> Result<InitializeResponse, AcpError> {
         // Check if client supports terminal authentication before moving
-        let supports_terminal_auth = params
+        let _supports_terminal_auth = params
             .client_capabilities
             .as_ref()
             .and_then(|cc| cc.field_meta.as_object())
@@ -50,23 +50,7 @@ impl AgentTrait for AcpAgent {
 
         self.client_capabilities = params.client_capabilities;
 
-        let auth_methods = if supports_terminal_auth {
-            vec![crate::types::AuthMethod {
-                id: "vibe-setup".to_string(),
-                name: "Register your API Key".to_string(),
-                description: "Register your API Key inside Mistral Vibe".to_string(),
-                field_meta: serde_json::json!({
-                    "terminal-auth": {
-                        "command": "paramecia",
-                        "args": ["--setup"],
-                        "label": "Mistral Vibe Setup",
-                    }
-                }),
-            }]
-        } else {
-            vec![]
-        };
-
+        let auth_methods = vec![];
         let response = InitializeResponse {
             agent_capabilities: AgentCapabilities {
                 load_session: false,
@@ -78,7 +62,7 @@ impl AgentTrait for AcpAgent {
             },
             protocol_version: PROTOCOL_VERSION.to_string(),
             agent_info: Implementation {
-                name: "@mistralai/paramecia".to_string(),
+                name: "paramecia".to_string(),
                 title: "Paramecia".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
