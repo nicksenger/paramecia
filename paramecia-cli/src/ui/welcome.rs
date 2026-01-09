@@ -201,7 +201,7 @@ impl WelcomeBanner {
                 Span::styled(BLOCK, Style::default().fg(get_line_color(4))),
                 Span::raw(" ".repeat(11)), // Align text with line 2
                 Span::styled(
-                    format!("{display_workdir}"),
+                    display_workdir.to_string(),
                     Style::default().fg(colors::MUTED),
                 ),
                 Span::raw(" ".repeat(max_text_width - display_workdir.len())),

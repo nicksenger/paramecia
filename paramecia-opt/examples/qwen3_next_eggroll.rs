@@ -232,12 +232,12 @@ fn show_top_predictions(logits: &Tensor, prompt: &str, tokenizer: &Tokenizer) ->
     let probs_vec = probs.to_vec1::<f32>()?;
 
     let mut indexed: Vec<_> = probs_vec.iter().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
+    indexed.sort_by(|a, b| b.1.total_cmp(a.1));
 
     print!("  Input: \"{}\"\n  Top predictions: ", prompt);
-    for i in 0..3.min(indexed.len()) {
-        if let Ok(decoded) = tokenizer.decode(&[indexed[i].0 as u32], false) {
-            print!("'{}' ({:.1}%)", decoded.trim(), indexed[i].1 * 100.0);
+    for (i, (token_id, prob)) in indexed.iter().copied().take(3).enumerate() {
+        if let Ok(decoded) = tokenizer.decode(&[token_id as u32], false) {
+            print!("'{}' ({:.1}%)", decoded.trim(), prob * 100.0);
             if i < 2 {
                 print!(", ");
             }

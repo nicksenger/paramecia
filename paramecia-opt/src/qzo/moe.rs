@@ -59,11 +59,11 @@ impl RouterStats {
     }
 
     pub fn num_tokens(&self) -> Result<usize> {
-        Ok(self.router_logits.dim(0)?)
+        self.router_logits.dim(0)
     }
 
     pub fn num_experts(&self) -> Result<usize> {
-        Ok(self.router_logits.dim(1)?)
+        self.router_logits.dim(1)
     }
 }
 

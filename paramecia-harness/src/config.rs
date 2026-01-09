@@ -760,10 +760,10 @@ impl VibeConfig {
     /// Check if the active model uses the local backend.
     #[must_use]
     pub fn is_using_local_backend(&self) -> bool {
-        if let Ok(model) = self.get_active_model() {
-            if let Ok(provider) = self.get_provider_for_model(model) {
-                return provider.backend == BackendType::Local;
-            }
+        if let Ok(model) = self.get_active_model()
+            && let Ok(provider) = self.get_provider_for_model(model)
+        {
+            return provider.backend == BackendType::Local;
         }
         false
     }

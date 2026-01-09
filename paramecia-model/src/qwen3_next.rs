@@ -2019,6 +2019,7 @@ impl MoeBlock {
 
     /// Create MoeBlock for MTP layers using GGUF-style weight names
     /// Uses blk.{idx}.mtp.* naming convention
+    #[allow(clippy::too_many_arguments)]
     fn new_mtp<R: Read + Seek>(
         gg: &mut Gguf<R>,
         prefix: &str,
@@ -2445,6 +2446,7 @@ struct FullAttention {
 }
 
 impl FullAttention {
+    #[allow(clippy::too_many_arguments)]
     fn new<R: Read + Seek>(
         gg: &mut Gguf<R>,
         num_heads: usize,
@@ -2521,6 +2523,7 @@ impl FullAttention {
     /// Create FullAttention for MTP layers using GGUF-style weight names
     /// Uses blk.{idx}.mtp.attn_* naming convention
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     fn new_mtp<R: Read + Seek>(
         gg: &mut Gguf<R>,
         num_heads: usize,
@@ -2598,6 +2601,7 @@ impl FullAttention {
 
     /// Create FullAttention for MTP layers with Gemma-style (1+weight) Q/K norms
     /// Uses blk.{idx}.mtp.attn_* naming convention
+    #[allow(clippy::too_many_arguments)]
     fn new_mtp_gemma<R: Read + Seek>(
         gg: &mut Gguf<R>,
         num_heads: usize,
@@ -3352,6 +3356,7 @@ struct LinearAttention {
 }
 
 impl LinearAttention {
+    #[allow(clippy::too_many_arguments)]
     fn new<R: Read + Seek>(
         gg: &mut Gguf<R>,
         prefix: &str,
@@ -4591,8 +4596,8 @@ impl LinearAttention {
 // ============================================================================
 
 #[derive(Debug)]
-enum AttentionLayer {
 #[allow(clippy::large_enum_variant)]
+enum AttentionLayer {
     Full(FullAttention),
     Linear(LinearAttention),
 }
@@ -5049,6 +5054,7 @@ impl MtpWeights {
     ///
     /// # Returns
     /// Logits for next token prediction [batch, vocab_size]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &mut self,
         input_ids: &Tensor,
@@ -5274,6 +5280,7 @@ impl MtpWeights {
     /// * `offset` - Position offset for attention
     /// * `dtype` - Data type for computation
     /// * `spec_step_idx` - Speculative step index
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_with_shared_kv(
         &mut self,
         input_ids: &Tensor,
@@ -5333,6 +5340,7 @@ impl MtpWeights {
     }
 
     /// Forward pass using SHARED K/V returning hidden states for chaining.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_hidden_with_shared_kv(
         &mut self,
         input_ids: &Tensor,
@@ -5629,6 +5637,7 @@ impl ModelWeights {
         gg.tensor(tensor_name)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_moe_block_with_devices<R: Read + Seek>(
         gg: &mut Gguf<R>,
         prefix: &str,
@@ -5872,6 +5881,7 @@ impl ModelWeights {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_gguf_with_devices<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
@@ -6031,9 +6041,8 @@ impl ModelWeights {
         let span = self.span.clone();
         let _enter = span.enter();
         let dims = input.dims();
-        let b = *dims.get(0).unwrap_or(&0);
-        #[allow(clippy::get_first)]
-        let l = *dims.get(1).unwrap_or(&0);
+        let b = dims.first().copied().unwrap_or(0);
+        let l = dims.get(1).copied().unwrap_or(0);
         let mut h = self.embed_tokens.forward(input)?.to_dtype(self.dtype)?;
 
         let causal_mask = if l == 1 {
@@ -6226,9 +6235,8 @@ impl ModelWeights {
     pub fn forward_all_positions(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let _enter = self.span.enter();
         let dims = input.dims();
-        let b = *dims.get(0).unwrap_or(&0);
-        #[allow(clippy::get_first)]
-        let l = *dims.get(1).unwrap_or(&0);
+        let b = dims.first().copied().unwrap_or(0);
+        let l = dims.get(1).copied().unwrap_or(0);
         let mut h = self.embed_tokens.forward(input)?.to_dtype(self.dtype)?;
 
         let causal_mask = if l == 1 {
@@ -6264,9 +6272,8 @@ impl ModelWeights {
     ) -> Result<(Tensor, Tensor)> {
         let _enter = self.span.enter();
         let dims = input.dims();
-        let b = *dims.get(0).unwrap_or(&0);
-        #[allow(clippy::get_first)]
-        let l = *dims.get(1).unwrap_or(&0);
+        let b = dims.first().copied().unwrap_or(0);
+        let l = dims.get(1).copied().unwrap_or(0);
         let mut h = self.embed_tokens.forward(input)?.to_dtype(self.dtype)?;
 
         let causal_mask = if l == 1 {
@@ -6318,9 +6325,8 @@ impl ModelWeights {
     ) -> Result<(Tensor, Tensor)> {
         let _enter = self.span.enter();
         let dims = input.dims();
-        let b = *dims.get(0).unwrap_or(&0);
-        #[allow(clippy::get_first)]
-        let l = *dims.get(1).unwrap_or(&0);
+        let b = dims.first().copied().unwrap_or(0);
+        let l = dims.get(1).copied().unwrap_or(0);
 
         let mut h = self.embed_tokens.forward(input)?.to_dtype(self.dtype)?;
 
@@ -6399,9 +6405,8 @@ impl ModelWeights {
 
         let _enter = self.span.enter();
         let dims = input.dims();
-        let b = *dims.get(0).unwrap_or(&0);
-        #[allow(clippy::get_first)]
-        let l = *dims.get(1).unwrap_or(&0);
+        let b = dims.first().copied().unwrap_or(0);
+        let l = dims.get(1).copied().unwrap_or(0);
         let mut h = self.embed_tokens.forward(input)?.to_dtype(self.dtype)?;
 
         let causal_mask = if l == 1 {
@@ -6474,9 +6479,8 @@ impl ModelWeights {
     pub fn forward_embeddings(&mut self, input: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         let dims = input.dims();
-        let b = *dims.get(0).unwrap_or(&0);
-        #[allow(clippy::get_first)]
-        let l = *dims.get(1).unwrap_or(&0);
+        let b = dims.first().copied().unwrap_or(0);
+        let l = dims.get(1).copied().unwrap_or(0);
         let mut h = self.embed_tokens.forward(input)?.to_dtype(self.dtype)?;
 
         let causal_mask = if l == 1 {
@@ -6512,9 +6516,8 @@ impl ModelWeights {
     pub fn forward_embeddings_last(&mut self, input: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         let dims = input.dims();
-        let b = *dims.get(0).unwrap_or(&0);
-        #[allow(clippy::get_first)]
-        let l = *dims.get(1).unwrap_or(&0);
+        let b = dims.first().copied().unwrap_or(0);
+        let l = dims.get(1).copied().unwrap_or(0);
         let mut h = self.embed_tokens.forward(input)?.to_dtype(self.dtype)?;
 
         let causal_mask = if l == 1 {
@@ -7307,8 +7310,7 @@ impl ModelWeights {
                 }
             }
             let total_selections =
-                selected_flat.len() * selected_flat.get(0).map_or(1, |r| r.len());
-            #[allow(clippy::get_first)]
+                selected_flat.len() * selected_flat.first().map_or(1, |r| r.len());
             let f_i = Tensor::from_vec(
                 expert_counts
                     .iter()

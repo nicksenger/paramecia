@@ -844,7 +844,7 @@ impl App {
         // Render Game of Life as background
         let gol_cells = self
             .game_of_life
-            .render(self.color_index, &colors::GRADIENT);
+            .render(self.color_index, colors::GRADIENT);
         for (y, row) in gol_cells.iter().enumerate() {
             for (x, &(ch, color)) in row.iter().enumerate() {
                 if ch == ' ' {
@@ -854,19 +854,21 @@ impl App {
                 let cell_x = area.x + (x as u16 * 2);
                 let cell_y = area.y + y as u16;
 
-                if cell_x < area.right() && cell_y < area.bottom() {
-                    if let Some(cell) = frame.buffer_mut().cell_mut((cell_x, cell_y)) {
-                        cell.set_char(ch);
-                        cell.set_fg(color);
-                    }
+                if cell_x < area.right()
+                    && cell_y < area.bottom()
+                    && let Some(cell) = frame.buffer_mut().cell_mut((cell_x, cell_y))
+                {
+                    cell.set_char(ch);
+                    cell.set_fg(color);
                 }
 
                 let second_x = cell_x.saturating_add(1);
-                if second_x < area.right() && cell_y < area.bottom() {
-                    if let Some(cell) = frame.buffer_mut().cell_mut((second_x, cell_y)) {
-                        cell.set_char(ch);
-                        cell.set_fg(color);
-                    }
+                if second_x < area.right()
+                    && cell_y < area.bottom()
+                    && let Some(cell) = frame.buffer_mut().cell_mut((second_x, cell_y))
+                {
+                    cell.set_char(ch);
+                    cell.set_fg(color);
                 }
             }
         }
@@ -1255,19 +1257,18 @@ impl App {
         for (line_idx, line) in content.split('\n').enumerate() {
             let line_start = global_byte_offset;
             let line_end = line_start + line.len();
-            let contains_cursor = cursor_byte.map_or(false, |c| c >= line_start && c <= line_end);
+            let contains_cursor =
+                cursor_byte.is_some_and(|c| c >= line_start && c <= line_end);
 
             let mut line_content = line.to_string();
-            if contains_cursor {
-                if let Some(cursor) = cursor_byte {
-                    let local_offset = cursor.saturating_sub(line_start);
-                    let insert_at = line_content
-                        .char_indices()
-                        .nth(local_offset)
-                        .map(|(idx, _)| idx)
-                        .unwrap_or_else(|| line_content.len());
-                    line_content.insert(insert_at, CURSOR_SENTINEL);
-                }
+            if contains_cursor && let Some(cursor) = cursor_byte {
+                let local_offset = cursor.saturating_sub(line_start);
+                let insert_at = line_content
+                    .char_indices()
+                    .nth(local_offset)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or_else(|| line_content.len());
+                line_content.insert(insert_at, CURSOR_SENTINEL);
             }
 
             let (first_prefix, subsequent_prefix) = match (multiline, line_idx) {
@@ -1293,11 +1294,12 @@ impl App {
             };
 
             for wrapped_line in wrapped_iter {
-                if contains_cursor && cursor_location.is_none() {
-                    if let Some(pos) = wrapped_line.find(CURSOR_SENTINEL) {
-                        let col = UnicodeWidthStr::width(&wrapped_line[..pos]);
-                        cursor_location = Some((total_lines, col));
-                    }
+                if contains_cursor
+                    && cursor_location.is_none()
+                    && let Some(pos) = wrapped_line.find(CURSOR_SENTINEL)
+                {
+                    let col = UnicodeWidthStr::width(&wrapped_line[..pos]);
+                    cursor_location = Some((total_lines, col));
                 }
                 total_lines = total_lines.saturating_add(1);
             }
