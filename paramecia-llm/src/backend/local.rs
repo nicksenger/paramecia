@@ -66,24 +66,12 @@ pub struct LocalBackend {
     think_start_token: Option<u32>,
     /// Token IDs for `</think>` sequence (end of thinking).
     think_end_tokens: Vec<u32>,
-    /// Accumulated MTP statistics (total predictions, accepted predictions).
-    /// These are accumulated during speculative generation and can be reset.
-    mtp_stats: Arc<Mutex<MtpStats>>,
     /// Chat template for formatting messages.
     chat_template: ChatTemplate,
     /// Cached prefix state for avoiding recomputation of shared conversation context.
     /// When a new prompt starts with the same tokens as a previous prompt, we can
     /// restore the KV cache from the prefix and only process new tokens.
     prefix_cache: Arc<Mutex<Option<PrefixCache>>>,
-}
-
-/// Accumulated MTP statistics for tracking acceptance rate.
-#[derive(Debug, Clone, Default)]
-pub struct MtpStats {
-    /// Total number of MTP predictions made.
-    pub total_predictions: usize,
-    /// Number of MTP predictions that were accepted.
-    pub accepted_predictions: usize,
 }
 
 impl LocalBackend {
@@ -192,7 +180,6 @@ impl LocalBackend {
             eos_token,
             think_start_token,
             think_end_tokens,
-            mtp_stats: Arc::new(Mutex::new(MtpStats::default())),
             chat_template,
             prefix_cache: Arc::new(Mutex::new(None)),
         })
@@ -1050,188 +1037,6 @@ impl LocalBackend {
 
         Ok(embeddings.squeeze(0)?.to_vec1::<f32>()?)
     }
-
-    /// Evaluate MTP (Multi-Token Prediction) accuracy on a token sequence.
-    ///
-    /// This runs MTP predictions and verifies them against the ground truth
-    /// tokens in the sequence, returning the percentage of correct predictions.
-    ///
-    /// # Arguments
-    /// * `tokens` - Token IDs to evaluate on (needs at least num_mtp_steps + 2 tokens)
-    /// * `num_mtp_steps` - Number of MTP prediction steps to evaluate (typically 1-4)
-    ///
-    /// # Returns
-    /// * (accuracy, total_predictions, correct_predictions)
-    pub async fn evaluate_mtp_accuracy(
-        &self,
-        tokens: &[u32],
-        num_mtp_steps: usize,
-    ) -> LlmResult<(f32, usize, usize)> {
-        let mut model = self.model.lock().await;
-        let device = self.device.clone();
-        let input = Tensor::new(tokens, &device)?.unsqueeze(0)?;
-
-        let (accuracy, total, correct) = model.evaluate_mtp_accuracy(&input, num_mtp_steps)?;
-        Ok((accuracy, total, correct))
-    }
-
-    /// Check if the model has MTP weights loaded.
-    pub async fn has_mtp(&self) -> bool {
-        let model = self.model.lock().await;
-        model.has_mtp()
-    }
-
-    /// Reset accumulated MTP statistics.
-    ///
-    /// Call this before evaluating a population member to start fresh tracking.
-    pub async fn reset_mtp_stats(&self) {
-        let mut stats = self.mtp_stats.lock().await;
-        stats.total_predictions = 0;
-        stats.accepted_predictions = 0;
-    }
-
-    /// Get accumulated MTP statistics.
-    ///
-    /// Returns (total_predictions, accepted_predictions, acceptance_rate).
-    /// The acceptance_rate is None if no predictions were made.
-    pub async fn get_mtp_stats(&self) -> (usize, usize, Option<f32>) {
-        let stats = self.mtp_stats.lock().await;
-        let rate = if stats.total_predictions > 0 {
-            Some(stats.accepted_predictions as f32 / stats.total_predictions as f32)
-        } else {
-            None
-        };
-        (stats.total_predictions, stats.accepted_predictions, rate)
-    }
-
-    /// Accumulate MTP statistics (internal helper).
-    async fn accumulate_mtp_stats(&self, total: usize, accepted: usize) {
-        let mut stats = self.mtp_stats.lock().await;
-        stats.total_predictions += total;
-        stats.accepted_predictions += accepted;
-    }
-
-    /// Generate tokens using speculative decoding with MTP.
-    ///
-    /// This method uses the MTP head for speculative decoding and tracks
-    /// the acceptance rate, returning it along with the generated tokens.
-    /// If MTP is not available, falls back to standard generation.
-    ///
-    /// # Arguments
-    /// * `prompt_tokens` - Initial prompt tokens
-    /// * `max_new_tokens` - Maximum tokens to generate
-    /// * `num_speculative` - Number of tokens to speculate per step (typically 2-4)
-    ///
-    /// # Returns
-    /// * `GenerationWithMtp` containing tokens and MTP statistics
-    pub async fn generate_tokens_speculative(
-        &self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        num_speculative: usize,
-    ) -> LlmResult<GenerationWithMtp> {
-        let mut model = self.model.lock().await;
-        model.clear_kv_cache();
-
-        let device = self.device.clone();
-        let mut generated = prompt_tokens.to_vec();
-
-        // Check if MTP is available
-        if !model.has_mtp() {
-            // Fallback to standard generation
-            for _ in 0..max_new_tokens {
-                let input = Tensor::new(&generated[..], &device)?.unsqueeze(0)?;
-                let logits = model.forward(&input, 0)?;
-
-                let next_token = logits.argmax(candle::D::Minus1)?.to_vec1::<u32>()?[0];
-
-                if next_token == 151643 {
-                    break;
-                }
-
-                generated.push(next_token);
-            }
-
-            return Ok(GenerationWithMtp {
-                tokens: generated,
-                mtp_total_predictions: 0,
-                mtp_accepted_predictions: 0,
-                mtp_acceptance_rate: None,
-            });
-        }
-
-        // Use speculative decoding with MTP
-        let mut tokens_generated = 0;
-        let mut mtp_total_predictions = 0usize;
-        let mut mtp_accepted_predictions = 0usize;
-
-        while tokens_generated < max_new_tokens {
-            let input = Tensor::new(&generated[..], &device)?.unsqueeze(0)?;
-            model.clear_kv_cache();
-
-            // Greedy sampling function
-            let sample_fn = |logits: &Tensor| -> candle::Result<u32> {
-                logits.argmax(candle::D::Minus1)?.to_scalar::<u32>()
-            };
-
-            let (_logits, accepted_tokens, num_accepted) =
-                model.forward_speculative(&input, 0, num_speculative, sample_fn)?;
-
-            // Track MTP acceptance rate
-            mtp_total_predictions += num_speculative;
-            mtp_accepted_predictions += num_accepted;
-
-            // No tokens accepted means generation should stop
-            if accepted_tokens.is_empty() {
-                break;
-            }
-
-            // Add accepted tokens
-            let mut hit_eos = false;
-            for token in accepted_tokens.iter() {
-                if *token == 151643 {
-                    hit_eos = true;
-                    break;
-                }
-                generated.push(*token);
-                tokens_generated += 1;
-            }
-
-            if hit_eos {
-                break;
-            }
-        }
-
-        // Accumulate stats for tracking across multiple generations
-        self.accumulate_mtp_stats(mtp_total_predictions, mtp_accepted_predictions)
-            .await;
-
-        let mtp_acceptance_rate = if mtp_total_predictions > 0 {
-            Some(mtp_accepted_predictions as f32 / mtp_total_predictions as f32)
-        } else {
-            None
-        };
-
-        Ok(GenerationWithMtp {
-            tokens: generated,
-            mtp_total_predictions,
-            mtp_accepted_predictions,
-            mtp_acceptance_rate,
-        })
-    }
-}
-
-/// Result of token generation with MTP statistics.
-#[derive(Debug, Clone)]
-pub struct GenerationWithMtp {
-    /// Generated tokens (including prompt).
-    pub tokens: Vec<u32>,
-    /// Total number of MTP predictions made.
-    pub mtp_total_predictions: usize,
-    /// Number of MTP predictions that were accepted (matched main model).
-    pub mtp_accepted_predictions: usize,
-    /// MTP acceptance rate (0.0-1.0), None if MTP was not used.
-    pub mtp_acceptance_rate: Option<f32>,
 }
 
 #[async_trait]

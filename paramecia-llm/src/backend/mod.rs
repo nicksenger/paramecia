@@ -4,7 +4,7 @@ mod factory;
 mod local;
 
 pub use factory::{BackendFactory, BackendType};
-pub use local::{GenerationWithMtp, LocalBackend, MtpStats};
+pub use local::LocalBackend;
 
 use async_trait::async_trait;
 use futures::Stream;

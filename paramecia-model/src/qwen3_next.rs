@@ -24,7 +24,7 @@ pub struct LoraAdapter {
     pub b: Tensor,
 }
 use candle::quantized::{gguf_file, GgmlDType, QStorage, QTensor};
-use candle::{DType, Device, IndexOp, Result, Tensor, D};
+use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::{Activation, Embedding, Module};
 use std::io::{Read, Seek};
 use std::path::Path;
@@ -53,11 +53,6 @@ impl<R: Read + Seek> Gguf<R> {
     fn rms_norm(&mut self, name: &str, eps: f64, dtype: DType) -> Result<RmsNorm> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
         RmsNorm::from_qtensor(ws, eps)?.to_dtype(dtype)
-    }
-
-    /// Alias for rms_norm
-    fn rms_norm_gemma(&mut self, name: &str, eps: f64, dtype: DType) -> Result<RmsNorm> {
-        self.rms_norm(name, eps, dtype)
     }
 
     fn metadata(&self) -> &std::collections::HashMap<String, gguf_file::Value> {
@@ -210,8 +205,6 @@ impl DeviceOffloadMode {
 }
 
 /// Default maximum sequence length for pre-allocated KV cache
-const DEFAULT_MAX_SEQ_LEN: usize = 8192;
-
 /// Pre-allocated KV cache with O(1) token insertion.
 ///
 /// Unlike the naive `Tensor::cat` approach which is O(n) per token (O(n²) overall),
@@ -1172,9 +1165,6 @@ struct MoeExperts {
     gpu_hot_cache: Option<GpuHotExpertCache>,
     /// The GPU device for hot caching (may differ from compute_device)
     gpu_device: Option<Device>,
-    /// Whether expert weights have transposed layout
-    /// When true, expert weights are [n_exp, in_dim, out_dim] instead of [n_exp, out_dim, in_dim]
-    transposed_layout: bool,
 }
 
 impl std::fmt::Debug for MoeExperts {
@@ -1259,69 +1249,6 @@ impl MoeExperts {
             custom_down_block_mults: None,
             gpu_hot_cache,
             gpu_device,
-            transposed_layout: false,
-        })
-    }
-
-    /// Create MoeExperts for MTP layers using GGUF-style weight names
-    /// Uses blk.{idx}.mtp.ffn_{gate|up|down}_exps.weight naming convention
-    /// The experts are packed into a single 3D tensor per projection type
-    /// Create MoeExperts for MTP layers using GGUF-style weight names.
-    ///
-    /// With the fixed GGUF converter, MTP expert weights have the same layout as main model:
-    /// - gate/up: [n_exp, intermediate, hidden]
-    /// - down: [n_exp, hidden, intermediate]
-    ///   No transpose needed - weights are loaded directly.
-    #[allow(clippy::too_many_arguments)]
-    fn new_mtp<R: Read + Seek>(
-        gg: &mut Gguf<R>,
-        prefix: &str,
-        compute_device: &Device,
-        cache_capacity: usize,
-    ) -> Result<Self> {
-        // MTP uses GGUF naming with packed experts: blk.{idx}.mtp.ffn_gate_exps.weight
-        // With fixed converter, layout matches main model - no transpose needed
-        let gate_exps = Arc::new(gg.tensor(&format!("{}.ffn_gate_exps.weight", prefix))?);
-        let up_exps = Arc::new(gg.tensor(&format!("{}.ffn_up_exps.weight", prefix))?);
-        let down_exps = Arc::new(gg.tensor(&format!("{}.ffn_down_exps.weight", prefix))?);
-
-        let act_fn = Activation::Silu;
-        let span = tracing::span!(tracing::Level::TRACE, "mtp-experts");
-
-        // Get number of experts from shape
-        let _num_experts = gate_exps.shape().dims().first().copied().unwrap_or(512);
-
-        let cache = if cache_capacity == 0 {
-            None
-        } else if should_cache_experts(&gate_exps, &up_exps, &down_exps, compute_device) {
-            Some(ExpertCache::new(compute_device.clone(), cache_capacity))
-        } else {
-            None
-        };
-
-        let training_cache =
-            if should_cache_experts(&gate_exps, &up_exps, &down_exps, compute_device) {
-                Some(ExpertCache::new(compute_device.clone(), cache_capacity))
-            } else {
-                None
-            };
-
-        Ok(Self {
-            gate_exps,
-            up_exps,
-            down_exps,
-            act_fn,
-            span,
-            cache,
-            training_cache,
-            compute_device: compute_device.clone(),
-            custom_gate_block_mults: None,
-            custom_up_block_mults: None,
-            custom_down_block_mults: None,
-            gpu_hot_cache: None,
-            gpu_device: None,
-            // Weights are pre-transposed during loading, no runtime transpose needed
-            transposed_layout: false,
         })
     }
 
@@ -1414,11 +1341,6 @@ impl MoeExperts {
     /// Check if batched forward is supported (CUDA + supported quant type + ALL experts on GPU)
     fn supports_batched_forward(&self) -> bool {
         use candle::quantized::GgmlDType;
-
-        // Transposed layout requires per-expert transpose, can't use indexed_moe_forward
-        if self.transposed_layout {
-            return false;
-        }
 
         // Check if we're on CUDA
         if !matches!(self.compute_device, Device::Cuda(_)) {
@@ -1529,8 +1451,7 @@ impl MoeExperts {
                 self.build_scaled_mats(expert_idx)?
             }
         } else if let Some(cache) = &mut self.cache {
-            // Skip cache for transposed layout (MTP) since cache doesn't handle transpose
-            if cache.enabled() && !self.transposed_layout {
+            if cache.enabled() {
                 cache.get_or_prepare(expert_idx, &self.gate_exps, &self.up_exps, &self.down_exps)?
             } else {
                 self.build_uncached_mats(expert_idx)?
@@ -1547,49 +1468,18 @@ impl MoeExperts {
         let up_qtensor = self.up_exps.slice_first_dim(expert_idx)?;
         let down_qtensor = self.down_exps.slice_first_dim(expert_idx)?;
 
-        if self.transposed_layout {
-            // MTP expert weights are transposed: [in_dim, out_dim] instead of [out_dim, in_dim]
-            // Need to dequantize, transpose, and re-quantize
-            let gate_device = self.compute_device.clone();
-            let up_device = self.compute_device.clone();
-            let down_device = self.compute_device.clone();
+        let (gate_tensor, gate_device) = self.materialize_for_compute(gate_qtensor)?;
+        let (up_tensor, up_device) = self.materialize_for_compute(up_qtensor)?;
+        let (down_tensor, down_device) = self.materialize_for_compute(down_qtensor)?;
 
-            let gate_dequant = gate_qtensor.dequantize(&gate_device)?;
-            let up_dequant = up_qtensor.dequantize(&up_device)?;
-            let down_dequant = down_qtensor.dequantize(&down_device)?;
-
-            // Transpose: [in_dim, out_dim] -> [out_dim, in_dim]
-            let gate_transposed = gate_dequant.t()?.contiguous()?;
-            let up_transposed = up_dequant.t()?.contiguous()?;
-            let down_transposed = down_dequant.t()?.contiguous()?;
-
-            // Re-quantize with original dtype
-            let gate_requant = QTensor::quantize(&gate_transposed, gate_qtensor.dtype())?;
-            let up_requant = QTensor::quantize(&up_transposed, up_qtensor.dtype())?;
-            let down_requant = QTensor::quantize(&down_transposed, down_qtensor.dtype())?;
-
-            Ok(CachedMatmuls {
-                gate: Arc::new(QMatMul::from_weights(Arc::new(gate_requant))?),
-                up: Arc::new(QMatMul::from_weights(Arc::new(up_requant))?),
-                down: Arc::new(QMatMul::from_weights(Arc::new(down_requant))?),
-                gate_device,
-                up_device,
-                down_device,
-            })
-        } else {
-            let (gate_tensor, gate_device) = self.materialize_for_compute(gate_qtensor)?;
-            let (up_tensor, up_device) = self.materialize_for_compute(up_qtensor)?;
-            let (down_tensor, down_device) = self.materialize_for_compute(down_qtensor)?;
-
-            Ok(CachedMatmuls {
-                gate: Arc::new(QMatMul::from_weights(gate_tensor)?),
-                up: Arc::new(QMatMul::from_weights(up_tensor)?),
-                down: Arc::new(QMatMul::from_weights(down_tensor)?),
-                gate_device,
-                up_device,
-                down_device,
-            })
-        }
+        Ok(CachedMatmuls {
+            gate: Arc::new(QMatMul::from_weights(gate_tensor)?),
+            up: Arc::new(QMatMul::from_weights(up_tensor)?),
+            down: Arc::new(QMatMul::from_weights(down_tensor)?),
+            gate_device,
+            up_device,
+            down_device,
+        })
     }
 
     fn materialize_for_compute(&self, qtensor: QTensor) -> Result<(Arc<QTensor>, Device)> {
@@ -1660,50 +1550,19 @@ impl MoeExperts {
         let up_modified = up_qtensor.modify_block_scales(&up_mults)?;
         let down_modified = down_qtensor.modify_block_scales(&down_mults)?;
 
-        if self.transposed_layout {
-            // MTP expert weights are transposed: [in_dim, out_dim] instead of [out_dim, in_dim]
-            // Need to dequantize, transpose, and re-quantize
-            let gate_device = self.compute_device.clone();
-            let up_device = self.compute_device.clone();
-            let down_device = self.compute_device.clone();
+        // Materialize modified tensors to compute device
+        let (gate_tensor, gate_device) = self.materialize_for_compute(gate_modified)?;
+        let (up_tensor, up_device) = self.materialize_for_compute(up_modified)?;
+        let (down_tensor, down_device) = self.materialize_for_compute(down_modified)?;
 
-            let gate_dequant = gate_modified.dequantize(&gate_device)?;
-            let up_dequant = up_modified.dequantize(&up_device)?;
-            let down_dequant = down_modified.dequantize(&down_device)?;
-
-            // Transpose: [in_dim, out_dim] -> [out_dim, in_dim]
-            let gate_transposed = gate_dequant.t()?.contiguous()?;
-            let up_transposed = up_dequant.t()?.contiguous()?;
-            let down_transposed = down_dequant.t()?.contiguous()?;
-
-            // Re-quantize with original dtype
-            let gate_requant = QTensor::quantize(&gate_transposed, gate_modified.dtype())?;
-            let up_requant = QTensor::quantize(&up_transposed, up_modified.dtype())?;
-            let down_requant = QTensor::quantize(&down_transposed, down_modified.dtype())?;
-
-            Ok(CachedMatmuls {
-                gate: Arc::new(QMatMul::from_weights(Arc::new(gate_requant))?),
-                up: Arc::new(QMatMul::from_weights(Arc::new(up_requant))?),
-                down: Arc::new(QMatMul::from_weights(Arc::new(down_requant))?),
-                gate_device,
-                up_device,
-                down_device,
-            })
-        } else {
-            // Materialize modified tensors to compute device
-            let (gate_tensor, gate_device) = self.materialize_for_compute(gate_modified)?;
-            let (up_tensor, up_device) = self.materialize_for_compute(up_modified)?;
-            let (down_tensor, down_device) = self.materialize_for_compute(down_modified)?;
-
-            Ok(CachedMatmuls {
-                gate: Arc::new(QMatMul::from_weights(gate_tensor)?),
-                up: Arc::new(QMatMul::from_weights(up_tensor)?),
-                down: Arc::new(QMatMul::from_weights(down_tensor)?),
-                gate_device,
-                up_device,
-                down_device,
-            })
-        }
+        Ok(CachedMatmuls {
+            gate: Arc::new(QMatMul::from_weights(gate_tensor)?),
+            up: Arc::new(QMatMul::from_weights(up_tensor)?),
+            down: Arc::new(QMatMul::from_weights(down_tensor)?),
+            gate_device,
+            up_device,
+            down_device,
+        })
     }
 
     fn forward_with_cached(
@@ -1833,7 +1692,7 @@ struct SharedExpert {
 
 impl SharedExpert {
     fn new<R: Read + Seek>(gg: &mut Gguf<R>, prefix: &str, dtype: DType) -> Result<Option<Self>> {
-    #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::too_many_arguments)]
         let up_proj = match gg.try_qmatmul(&format!("{}.ffn_up_shexp.weight", prefix))? {
             Some(p) => p,
             None => return Ok(None),
@@ -1844,43 +1703,6 @@ impl SharedExpert {
         let shared_gate = gg
             .tensor(&format!("{}.ffn_gate_inp_shexp.weight", prefix))
             .or_else(|_| gg.tensor(&format!("{}.ffn_gate_inp_shexp", prefix)))?
-            .dequantize(&gg.device)?
-            .to_dtype(dtype)?;
-
-        Ok(Some(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-            shared_gate,
-            act_fn: Activation::Silu,
-            custom_gate_scales: None,
-            custom_up_scales: None,
-            custom_down_scales: None,
-        }))
-    }
-
-    /// Create SharedExpert for MTP layers using GGUF-style weight names
-    /// Uses blk.{idx}.mtp.ffn_*_shexp.weight naming convention
-    fn new_mtp<R: Read + Seek>(
-        gg: &mut Gguf<R>,
-        prefix: &str,
-        dtype: DType,
-    ) -> Result<Option<Self>> {
-        // MTP uses GGUF naming: blk.{idx}.mtp.ffn_up_shexp.weight
-        let up_proj = match gg.try_qmatmul(&format!("{}.ffn_up_shexp.weight", prefix))? {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-        let gate_proj = gg.qmatmul(&format!("{}.ffn_gate_shexp.weight", prefix))?;
-        let down_proj = gg.qmatmul(&format!("{}.ffn_down_shexp.weight", prefix))?;
-
-        // MTP shared expert mixing gate (1D [hidden_size])
-        // Try standard naming first, fall back to alternative naming for compatibility
-        let shared_gate = gg
-            .tensor(&format!("{}.ffn_gate_inp_shexp.weight", prefix))
-            .or_else(|_| gg.tensor(&format!("{}.ffn_gate_inp_shexp", prefix)))
-            .or_else(|_| gg.tensor(&format!("{}.shared_expert_gate.weight", prefix)))
-            .or_else(|_| gg.tensor(&format!("{}.shared_expert_gate", prefix)))?
             .dequantize(&gg.device)?
             .to_dtype(dtype)?;
 
@@ -2017,58 +1839,6 @@ impl MoeBlock {
         })
     }
 
-    /// Create MoeBlock for MTP layers using GGUF-style weight names
-    /// Uses blk.{idx}.mtp.* naming convention
-    #[allow(clippy::too_many_arguments)]
-    fn new_mtp<R: Read + Seek>(
-        gg: &mut Gguf<R>,
-        prefix: &str,
-        num_experts: usize,
-        num_experts_per_tok: usize,
-        dtype: DType,
-        compute_device: &Device,
-        cache_capacity: usize,
-        _layer_idx: usize,
-    ) -> Result<Self> {
-        let cache_capacity = if cache_capacity == 0 {
-            default_cache_capacity(num_experts_per_tok)
-        } else {
-            cache_capacity
-        };
-
-        // MTP uses GGUF naming: blk.{idx}.mtp.*
-        let experts = MoeExperts::new_mtp(gg, prefix, compute_device, cache_capacity)?;
-
-        // MTP also has shared expert
-        let shared_expert = SharedExpert::new_mtp(gg, prefix, dtype)?;
-
-        // MTP router gate: blk.{idx}.mtp.ffn_gate_inp.weight
-        // Fall back to shared_gate.weight for compatibility with different GGUF exports
-        // GGML format: [hidden_size, num_experts] which is correct for projecting
-        // from hidden_size to num_experts logits (no transpose needed)
-        let gate = gg
-            .try_qmatmul(&format!("{}.ffn_gate_inp.weight", prefix))?
-            .or(gg.try_qmatmul(&format!("{}.shared_gate.weight", prefix))?)
-            .ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "MTP router gate not found at {}.ffn_gate_inp.weight or {}.shared_gate.weight",
-                    prefix, prefix
-                ))
-            })?;
-
-        let span = tracing::span!(tracing::Level::TRACE, "mtp-moe-block");
-        Ok(Self {
-            experts,
-            shared_expert,
-            gate,
-            num_experts,
-            num_experts_per_tok,
-            span,
-            custom_gate_scales: None,
-            layer_idx: 0,
-        })
-    }
-
     #[allow(dead_code)]
     fn forward(&mut self, hidden_states: &Tensor) -> Result<Tensor> {
         let (output, _) = self.forward_with_stats(hidden_states)?;
@@ -2167,8 +1937,7 @@ impl MoeBlock {
         // This keeps expert indices on GPU for sorting, minimizing sync overhead
         let use_gpu_grouped = !training_mode
             && all_experts_on_cpu
-            && hidden_on_gpu
-            && !self.experts.transposed_layout;
+            && hidden_on_gpu;
 
         let result = if use_batched {
             // Use batched indexed_moe_forward CUDA kernels (fastest - all on GPU)
@@ -2345,14 +2114,12 @@ impl MoeBlock {
         // Check if we should use parallel processing for remaining
         // Parallel is beneficial when we have multiple experts and ALL weights are on CPU
         // (the parallel path processes entire expert on CPU, so mixed GPU/CPU doesn't work)
-        // Don't use parallel for transposed layout (MTP) as it doesn't handle the transpose
         let all_experts_on_cpu = !matches!(self.experts.gate_exps.device(), Device::Cuda(_))
             && !matches!(self.experts.up_exps.device(), Device::Cuda(_))
             && !matches!(self.experts.down_exps.device(), Device::Cuda(_));
         let use_parallel = remaining_experts.len() > 1
             && all_experts_on_cpu
-            && !training_mode
-            && !self.experts.transposed_layout;
+            && !training_mode;
 
         if use_parallel {
             // Parallel expert processing using Tokio's blocking pool
@@ -2520,164 +2287,6 @@ impl FullAttention {
         })
     }
 
-    /// Create FullAttention for MTP layers using GGUF-style weight names
-    /// Uses blk.{idx}.mtp.attn_* naming convention
-    #[allow(dead_code)]
-    #[allow(clippy::too_many_arguments)]
-    fn new_mtp<R: Read + Seek>(
-        gg: &mut Gguf<R>,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rms_norm_eps: f64,
-        rotary_emb: Arc<RotaryEmbedding>,
-        prefix: &str,
-        dtype: DType,
-        kv_cache_quantization: KvCacheQuantization,
-    ) -> Result<Self> {
-        let num_kv_groups = num_heads / num_kv_heads;
-
-        // MTP uses GGUF naming: blk.{idx}.mtp.attn_q.weight
-        let wq = gg.qmatmul(&format!("{}.attn_q.weight", prefix))?;
-        let wk = gg.qmatmul(&format!("{}.attn_k.weight", prefix))?;
-        let wv = gg.qmatmul(&format!("{}.attn_v.weight", prefix))?;
-        // Try attn_o first, fall back to attn_output for compatibility
-        let wo = gg
-            .try_qmatmul(&format!("{}.attn_o.weight", prefix))?
-            .or(gg.try_qmatmul(&format!("{}.attn_output.weight", prefix))?)
-            .ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "MTP attn output not found at {}.attn_o.weight or {}.attn_output.weight",
-                    prefix, prefix
-                ))
-            })?;
-
-        // MTP uses gated attention (Q outputs 2x: Q + gate)
-        let gated_attention = true;
-
-        let q_norm = gg.rms_norm(
-            &format!("{}.attn_q_norm.weight", prefix),
-            rms_norm_eps,
-            dtype,
-        )?;
-        let k_norm = gg.rms_norm(
-            &format!("{}.attn_k_norm.weight", prefix),
-            rms_norm_eps,
-            dtype,
-        )?;
-
-        let span = tracing::span!(tracing::Level::TRACE, "mtp-attn");
-
-        Ok(Self {
-            wq,
-            wk,
-            wv,
-            wo,
-            q_norm,
-            k_norm,
-            num_heads,
-            num_kv_heads,
-            num_kv_groups,
-            head_dim,
-            gated_attention,
-            rotary_emb,
-            preallocated_cache: None,
-            quantized_cache: None,
-            kv_cache: None,
-            kv_cache_quantization,
-            max_seq_len: DEFAULT_MAX_SEQ_LEN,
-            span,
-            custom_q_scales: None,
-            custom_k_scales: None,
-            custom_v_scales: None,
-            custom_o_scales: None,
-            lora_q: None,
-            lora_k: None,
-            lora_v: None,
-            lora_o: None,
-            lora_sigma: 1.0,
-        })
-    }
-
-    /// Create FullAttention for MTP layers with Gemma-style (1+weight) Q/K norms
-    /// Uses blk.{idx}.mtp.attn_* naming convention
-    #[allow(clippy::too_many_arguments)]
-    fn new_mtp_gemma<R: Read + Seek>(
-        gg: &mut Gguf<R>,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rms_norm_eps: f64,
-        rotary_emb: Arc<RotaryEmbedding>,
-        prefix: &str,
-        dtype: DType,
-        kv_cache_quantization: KvCacheQuantization,
-    ) -> Result<Self> {
-        let num_kv_groups = num_heads / num_kv_heads;
-
-        // MTP uses GGUF naming: blk.{idx}.mtp.attn_q.weight
-        let wq = gg.qmatmul(&format!("{}.attn_q.weight", prefix))?;
-        let wk = gg.qmatmul(&format!("{}.attn_k.weight", prefix))?;
-        let wv = gg.qmatmul(&format!("{}.attn_v.weight", prefix))?;
-        // Try attn_o first, fall back to attn_output for compatibility
-        let wo = gg
-            .try_qmatmul(&format!("{}.attn_o.weight", prefix))?
-            .or(gg.try_qmatmul(&format!("{}.attn_output.weight", prefix))?)
-            .ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "MTP attn output not found at {}.attn_o.weight or {}.attn_output.weight",
-                    prefix, prefix
-                ))
-            })?;
-
-        // MTP uses gated attention (Q outputs 2x: Q + gate)
-        let gated_attention = true;
-
-        // Q/K normalization for MTP attention (standard RmsNorm)
-        let q_norm = gg.rms_norm(
-            &format!("{}.attn_q_norm.weight", prefix),
-            rms_norm_eps,
-            dtype,
-        )?;
-        let k_norm = gg.rms_norm(
-            &format!("{}.attn_k_norm.weight", prefix),
-            rms_norm_eps,
-            dtype,
-        )?;
-
-        let span = tracing::span!(tracing::Level::TRACE, "mtp-attn");
-
-        Ok(Self {
-            wq,
-            wk,
-            wv,
-            wo,
-            q_norm,
-            k_norm,
-            num_heads,
-            num_kv_heads,
-            num_kv_groups,
-            head_dim,
-            gated_attention,
-            rotary_emb,
-            preallocated_cache: None,
-            quantized_cache: None,
-            kv_cache: None,
-            kv_cache_quantization,
-            max_seq_len: DEFAULT_MAX_SEQ_LEN,
-            span,
-            custom_q_scales: None,
-            custom_k_scales: None,
-            custom_v_scales: None,
-            custom_o_scales: None,
-            lora_q: None,
-            lora_k: None,
-            lora_v: None,
-            lora_o: None,
-            lora_sigma: 1.0,
-        })
-    }
-
     fn forward(&mut self, x: &Tensor, attn_mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let (b, l, _) = x.dims3()?;
 
@@ -2756,7 +2365,9 @@ impl FullAttention {
             }
 
             // Append new K/V and get dequantized result
-            let cache = self.quantized_cache.as_mut().unwrap();
+            let cache = self.quantized_cache.as_mut().ok_or_else(|| {
+                candle::Error::Msg("missing quantized KV cache".to_string())
+            })?;
             let (cached_k, cached_v) = cache.append(&k, &v)?;
 
             // Convert back to model dtype for attention computation
@@ -3122,178 +2733,6 @@ impl FullAttention {
             .unwrap_or(0)
     }
 
-    /// Get the current K/V tensors from cache (for MTP state sharing).
-    /// Returns (K, V) tensors in shape [batch, heads, seq, head_dim].
-    fn get_cached_kv(&self) -> Option<(Tensor, Tensor)> {
-        // Check quantized cache first (dequantize on access)
-        if let Some(ref cache) = self.quantized_cache {
-            if cache.seq_len > 0 {
-                return cache.get_kv().ok();
-            }
-        }
-        // Fall back to non-quantized cache
-        self.preallocated_cache.as_ref().and_then(|cache| {
-            if cache.seq_len > 0 {
-                // Extract valid portion
-                let k = cache.k_cache.narrow(2, 0, cache.seq_len).ok()?;
-                let v = cache.v_cache.narrow(2, 0, cache.seq_len).ok()?;
-                Some((k, v))
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Forward pass using SHARED K/V cache from another layer (for MTP state sharing).
-    ///
-    /// This is used for "native" MTP where the prediction head reads directly from
-    /// the main model's KV cache. MTP computes its own Q but uses the provided K/V.
-    ///
-    /// # Arguments
-    /// - `x`: Input tensor [batch, seq, hidden]
-    /// - `shared_k`: K tensor from main model's cache [batch, kv_heads, cache_seq, head_dim]
-    /// - `shared_v`: V tensor from main model's cache [batch, kv_heads, cache_seq, head_dim]
-    /// - `attn_mask`: Optional attention mask
-    /// - `offset`: Position offset for RoPE
-    fn forward_with_shared_kv(
-        &mut self,
-        x: &Tensor,
-        shared_k: &Tensor,
-        shared_v: &Tensor,
-        attn_mask: Option<&Tensor>,
-        offset: usize,
-    ) -> Result<Tensor> {
-        let (b, l, _) = x.dims3()?;
-        let x_contiguous = x.contiguous()?;
-
-        // Q projection (MTP's own weights)
-        let q_proj = self.wq.forward_with_scales_and_lora(
-            &x_contiguous,
-            self.custom_q_scales.as_ref(),
-            self.lora_q.as_ref().map(|l| &l.a),
-            self.lora_q.as_ref().map(|l| &l.b),
-            self.lora_sigma,
-        )?;
-
-        // Handle gated vs non-gated attention
-        let (q, gate) = if self.gated_attention {
-            let q_full = q_proj.reshape((b, l, self.num_heads, self.head_dim * 2))?;
-            let q = q_full.narrow(3, 0, self.head_dim)?;
-            let gate = q_full.narrow(3, self.head_dim, self.head_dim)?;
-            (q, Some(gate))
-        } else {
-            let q = q_proj.reshape((b, l, self.num_heads, self.head_dim))?;
-            (q, None)
-        };
-
-        // Apply Q normalization
-        let q = self.q_norm.forward(&q.contiguous()?)?;
-
-        // Transpose Q to [batch, heads, seq, head_dim]
-        let q = q.transpose(1, 2)?.contiguous()?;
-
-        // Apply RoPE to Q only (K is already rotated in the shared cache)
-        // We create a dummy K tensor to use the standard apply method, then discard it.
-        // The offset should be the position of the NEW tokens (total cache len before MTP tokens).
-        let dummy_k = Tensor::zeros_like(&q)?;
-        let (q, _) = self.rotary_emb.apply(&q, &dummy_k, offset)?;
-
-        // Use shared K, V directly (already have RoPE applied from main model)
-        let k = shared_k.clone();
-        let v = shared_v.clone();
-
-        // Compute attention with shared K/V
-        #[cfg(feature = "flash-attn")]
-        let attn_output = {
-            let input_dtype = q.dtype();
-
-            // Flash attention only supports F16/BF16
-            let (q_fa, k_fa, v_fa, needs_convert) = if input_dtype == DType::F32 {
-                (
-                    q.to_dtype(DType::F16)?,
-                    k.to_dtype(DType::F16)?,
-                    v.to_dtype(DType::F16)?,
-                    true,
-                )
-            } else {
-                (q.clone(), k, v, false)
-            };
-
-            // Flash attention expects (batch, seq, heads, head_dim)
-            let q_fa = q_fa.transpose(1, 2)?.contiguous()?;
-            let k_fa = k_fa.transpose(1, 2)?.contiguous()?;
-            let v_fa = v_fa.transpose(1, 2)?.contiguous()?;
-
-            let scale = 1f32 / (self.head_dim as f32).sqrt();
-            let is_causal = attn_mask.is_some();
-            let attn_out = candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, scale, is_causal)?;
-
-            let attn_out = if needs_convert {
-                attn_out.to_dtype(input_dtype)?
-            } else {
-                attn_out
-            };
-
-            attn_out
-                .reshape((b, l, self.num_heads * self.head_dim))?
-                .contiguous()?
-        };
-
-        #[cfg(not(feature = "flash-attn"))]
-        let attn_output = {
-            // Expand KV for GQA
-            let k = crate::utils::repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-            let v = crate::utils::repeat_kv(v, self.num_kv_groups)?.contiguous()?;
-
-            let scale = 1.0 / (self.head_dim as f64).sqrt();
-            let attn_weights = (q.matmul(&k.t()?)? * scale)?;
-
-            let attn_weights = if let Some(mask) = attn_mask {
-                let cache_len = k.dim(2)?;
-                let mask_len = mask.dim(D::Minus1)?;
-                if mask_len < cache_len {
-                    let pad_len = cache_len - mask_len;
-                    let zeros = Tensor::zeros((b, 1, l, pad_len), mask.dtype(), mask.device())?;
-                    let extended_mask = Tensor::cat(&[&zeros, mask], D::Minus1)?;
-                    (attn_weights + extended_mask)?
-                } else {
-                    (attn_weights + mask)?
-                }
-            } else {
-                attn_weights
-            };
-
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            let attn_output = attn_weights.matmul(&v)?;
-
-            attn_output
-                .transpose(1, 2)?
-                .reshape((b, l, self.num_heads * self.head_dim))?
-                .contiguous()?
-        };
-
-        // Apply gate if gated attention
-        let attn_output = if let Some(gate) = gate {
-            let gate = gate
-                .transpose(1, 2)?
-                .reshape((b, l, self.num_heads * self.head_dim))?;
-            let gate = candle_nn::ops::sigmoid(&gate)?;
-            (&attn_output * &gate)?
-        } else {
-            attn_output
-        };
-
-        // Output projection
-        let output = self.wo.forward_with_scales_and_lora(
-            &attn_output,
-            self.custom_o_scales.as_ref(),
-            self.lora_o.as_ref().map(|l| &l.a),
-            self.lora_o.as_ref().map(|l| &l.b),
-            self.lora_sigma,
-        )?;
-
-        Ok(output)
-    }
 }
 
 // ============================================================================
@@ -3555,7 +2994,7 @@ impl LinearAttention {
         };
 
         // Delta net computation
-        // For small batches (MTP verification), use autoregressive loop for correctness
+        // For small batches (verification), use autoregressive loop for correctness
         // For large batches (prefill), use chunked for efficiency
         const AUTOREGRESSIVE_LOOP_THRESHOLD: usize = 16;
 
@@ -3869,7 +3308,7 @@ impl LinearAttention {
     }
 
     /// Process multiple tokens using autoregressive loop.
-    /// This ensures correct state updates for MTP verification.
+    /// This ensures correct state updates for verification.
     fn delta_net_autoregressive_loop(
         &mut self,
         q: &Tensor,
@@ -4189,7 +3628,10 @@ impl LinearAttention {
                 });
                 (cm, cdm)
             } else {
-                let cached = self.cached_masks.as_ref().unwrap();
+                let cached = self
+                    .cached_masks
+                    .as_ref()
+                    .ok_or_else(|| candle::Error::Msg("missing cached masks".to_string()))?;
                 (cached.causal_mask.clone(), cached.causal_diag_mask.clone())
             }
         };
@@ -4466,17 +3908,26 @@ impl LinearAttention {
             if let (Ok(ssm), Ok(conv)) =
                 (state.ssm_state.contiguous(), state.conv_state.contiguous())
             {
-                // Get gate offset, defaulting to zeros if not present
-                let gate_offset = state
-                    .gate_cumsum_offset
-                    .as_ref()
-                    .and_then(|t| t.contiguous().ok())
-                    .unwrap_or_else(|| {
-                        // Create zero offset with correct shape: [batch, num_heads]
-                        let (b, num_heads, _, _) = ssm.dims4().unwrap_or((1, 1, 1, 1));
-                        Tensor::zeros((b, num_heads), ssm.dtype(), ssm.device())
-                            .expect("Failed to create zero gate offset")
-                    });
+                // Get gate offset, defaulting to zeros if not present.
+                // If we can't create a zero offset, fall back to an empty prefix cache entry.
+                let gate_offset =
+                    match state.gate_cumsum_offset.as_ref().and_then(|t| t.contiguous().ok()) {
+                        Some(offset) => offset,
+                        None => {
+                            // Create zero offset with correct shape: [batch, num_heads]
+                            let (b, num_heads, _, _) = ssm.dims4().unwrap_or((1, 1, 1, 1));
+                            match Tensor::zeros((b, num_heads), ssm.dtype(), ssm.device()) {
+                                Ok(offset) => offset,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "Failed to create zero gate offset for prefix cache"
+                                    );
+                                    return PrefixCacheEntry::Empty;
+                                }
+                            }
+                        }
+                    };
                 return PrefixCacheEntry::LinearAttention {
                     ssm_state: ssm,
                     conv_state: conv,
@@ -4519,7 +3970,7 @@ impl LinearAttention {
     ///
     /// Uses a fused CUDA kernel that processes K tokens with the same algorithm
     /// as K sequential autoregressive steps, ensuring identical state updates.
-    /// This is used for MTP verification where correctness is critical.
+    /// This is used for verification where correctness is critical.
     ///
     /// NOTE: Alternative kernel for performance optimization - not yet wired up.
     #[allow(dead_code)]
@@ -4811,20 +4262,6 @@ impl LayerWeights {
         Ok(output)
     }
 
-    /// Get the shared K/V cache for MTP state sharing.
-    /// Returns None if this is a linear attention layer (MTP uses DeltaNet state instead).
-    fn get_shared_kv(&self) -> Option<(Tensor, Tensor)> {
-        match &self.attn {
-            AttentionLayer::Full(attn) => attn.get_cached_kv(),
-            AttentionLayer::Linear(_) => None,
-        }
-    }
-
-    /// Check if this is a full attention layer.
-    fn is_full_attention(&self) -> bool {
-        matches!(&self.attn, AttentionLayer::Full(_))
-    }
-
     /// Save the current cache/state for prefix caching.
     /// Returns a deep copy that can be restored later.
     fn save_cache_for_prefix(&self) -> PrefixCacheEntry {
@@ -4839,548 +4276,6 @@ impl LayerWeights {
         match &mut self.attn {
             AttentionLayer::Full(attn) => attn.restore_kv_state(entry),
             AttentionLayer::Linear(attn) => attn.restore_state_from_prefix(entry),
-        }
-    }
-}
-
-// ============================================================================
-// Multi-Token Prediction (MTP) Module
-// ============================================================================
-
-/// MTP Decoder Layer - Uses shared state with main model
-///
-/// CRITICAL: Qwen3-Next MTP uses "state sharing" design:
-/// - For full attention: MTP READs from the main model's KV cache (does not maintain its own)
-/// - For linear attention: MTP reads from the main model's DeltaNet hidden state
-///
-/// The MTP layer index corresponds to the main model layer it shares state with.
-/// Typically this is the last layer (layer 47 for a 48-layer model like Qwen3-Next).
-#[derive(Debug)]
-struct MtpDecoderLayer {
-    /// Full attention with shared cache (NOTE: cache is borrowed from main model at runtime)
-    attn: FullAttention,
-    moe_block: MoeBlock,
-    attn_norm: RmsNorm,
-    ffn_norm: RmsNorm,
-    /// The main model layer index this MTP layer shares state with
-    #[allow(dead_code)]
-    shared_layer_idx: usize,
-}
-
-impl MtpDecoderLayer {
-    /// Create MTP decoder layer using GGUF-style weight names
-    /// Prefix should be like "blk.{idx}.mtp"
-    fn new<R: Read + Seek>(
-        gg: &mut Gguf<R>,
-        prefix: &str,
-        config: &ModelConfig,
-        rotary: Arc<RotaryEmbedding>,
-        compute_device: &Device,
-        layer_idx: usize,
-    ) -> Result<Self> {
-        // GGUF naming: blk.{idx}.mtp.in_norm.weight
-        // Use Gemma-style norms (1+weight) for MTP
-        let attn_norm = gg.rms_norm_gemma(
-            &format!("{}.in_norm.weight", prefix),
-            config.rms_norm_eps,
-            config.dtype,
-        )?;
-        let ffn_norm = gg.rms_norm_gemma(
-            &format!("{}.post_attn_norm.weight", prefix),
-            config.rms_norm_eps,
-            config.dtype,
-        )?;
-
-        // MTP uses full attention (not linear attention) with Gemma-style Q/K norms
-        let attn = FullAttention::new_mtp_gemma(
-            gg,
-            config.num_attention_heads,
-            config.num_key_value_heads,
-            config.head_dim,
-            config.rms_norm_eps,
-            rotary,
-            prefix,
-            config.dtype,
-            KvCacheQuantization::F16, // MTP doesn't need KV cache quantization
-        )?;
-
-        // MTP uses MoE block
-        let cache_capacity = default_cache_capacity(config.num_experts_per_tok);
-        let moe_block = MoeBlock::new_mtp(
-            gg,
-            prefix,
-            config.num_experts,
-            config.num_experts_per_tok,
-            config.dtype,
-            compute_device,
-            cache_capacity,
-            layer_idx,
-        )?;
-
-        // The shared layer index is the main model layer that MTP shares state with.
-        // For MTP at layer_idx 0, it shares with main model's last layer (typically 47 for Qwen3-Next).
-        // The caller should configure this appropriately.
-        let shared_layer_idx = layer_idx;
-
-        Ok(Self {
-            attn,
-            moe_block,
-            attn_norm,
-            ffn_norm,
-            shared_layer_idx,
-        })
-    }
-
-    /// Forward pass returning (hidden_states, residual) like vLLM's Qwen3NextDecoderLayer.
-    ///
-    /// The vLLM layer returns:
-    /// - `hidden_states`: MoE output (NOT normalized after MoE)
-    /// - `residual`: attn_output + input (NOT updated after MoE)
-    ///
-    /// The caller (model.forward()) then does: norm(hidden_states + residual) = norm(moe + attn + input)
-    #[allow(dead_code)]
-    fn forward(
-        &mut self,
-        x: &Tensor,
-        mask: Option<&Tensor>,
-        offset: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        // Input residual (like vLLM: residual = hidden_states when residual is None)
-        let residual = x.clone();
-
-        // Pre-attention norm (input_layernorm)
-        let h = self.attn_norm.forward(x)?;
-
-        // Full attention
-        let h = self.attn.forward(&h, mask, offset)?;
-
-        // Fused add+norm after attention (post_attention_layernorm)
-        // residual = attn_output + old_residual = attn + input
-        // hidden_states = norm(residual)
-        let residual = (h + &residual)?;
-        let h = self.ffn_norm.forward(&residual)?;
-
-        // FFN (MoE)
-        let (h, _router_stats) = self.moe_block.forward_with_stats(&h)?;
-
-        // Return (moe_output, attn + input) matching vLLM pattern
-        // Note: residual is NOT updated after MoE - only after attention
-        Ok((h, residual))
-    }
-
-    /// Forward pass using SHARED K/V cache from main model (native MTP design).
-    ///
-    /// This is the correct way to run MTP for Qwen3-Next:
-    /// - MTP computes its own Q from the input
-    /// - MTP reads K/V from the main model's cache (does NOT maintain its own)
-    /// - This enables "state sharing" where MTP sees the same context as the main model
-    ///
-    /// # Arguments
-    /// - `x`: Input tensor [batch, seq, hidden]
-    /// - `shared_k`: K tensor from main model's last layer cache
-    /// - `shared_v`: V tensor from main model's last layer cache
-    /// - `mask`: Optional attention mask
-    /// - `offset`: Position offset for RoPE
-    fn forward_with_shared_kv(
-        &mut self,
-        x: &Tensor,
-        shared_k: &Tensor,
-        shared_v: &Tensor,
-        mask: Option<&Tensor>,
-        offset: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        // Input residual
-        let residual = x.clone();
-
-        // Pre-attention norm
-        let h = self.attn_norm.forward(x)?;
-
-        // Full attention with SHARED K/V from main model
-        let h = self
-            .attn
-            .forward_with_shared_kv(&h, shared_k, shared_v, mask, offset)?;
-
-        // Fused add+norm after attention
-        let residual = (h + &residual)?;
-        let h = self.ffn_norm.forward(&residual)?;
-
-        // FFN (MoE)
-        let (h, _router_stats) = self.moe_block.forward_with_stats(&h)?;
-
-        Ok((h, residual))
-    }
-
-    fn clear_cache(&mut self) {
-        self.attn.clear_kv_cache();
-    }
-}
-
-/// Multi-Token Prediction weights
-///
-/// MTP is a form of speculative decoding where we predict multiple tokens
-/// using a lightweight prediction head. The MTP head combines the hidden
-/// state from the main model with the embedding of the predicted token
-/// to predict the next token.
-#[derive(Debug)]
-pub struct MtpWeights {
-    /// FC layer to combine hidden state and embedding: [hidden_size * 2] -> [hidden_size]
-    fc: QMatMul,
-    /// RMS norm applied to embeddings before FC (zero-centered)
-    pre_fc_norm_embedding: RmsNorm,
-    /// RMS norm applied to hidden states before FC (zero-centered)
-    pre_fc_norm_hidden: RmsNorm,
-    /// MTP decoder layers (typically 1)
-    layers: Vec<MtpDecoderLayer>,
-    /// Final RMS norm (zero-centered)
-    pub norm: RmsNorm,
-    /// Hidden size
-    #[allow(dead_code)]
-    hidden_size: usize,
-    /// Number of MTP layers
-    num_mtp_layers: usize,
-}
-
-impl MtpWeights {
-    /// Forward pass through MTP
-    ///
-    /// # Arguments
-    /// * `input_ids` - Token IDs to predict next token for [batch, 1]
-    /// * `embed_tokens` - Embedding layer (shared with main model)
-    /// * `hidden_states` - Hidden states from main model [batch, 1, hidden_size]
-    /// * `lm_head` - LM head for producing logits (shared with main model)
-    /// * `offset` - Position offset for attention
-    /// * `dtype` - Data type for computation
-    /// * `spec_step_idx` - Speculative step index (determines which layer to use)
-    ///
-    /// # Returns
-    /// Logits for next token prediction [batch, vocab_size]
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward(
-        &mut self,
-        input_ids: &Tensor,
-        embed_tokens: &Embedding,
-        hidden_states: &Tensor,
-        lm_head: &QMatMul,
-        offset: usize,
-        dtype: DType,
-        spec_step_idx: usize,
-    ) -> Result<Tensor> {
-        let debug = std::env::var("MTP_DEBUG").is_ok();
-
-        // Embed the input tokens
-        let inputs_embeds = embed_tokens
-            .forward(input_ids)?
-            .to_dtype(dtype)?
-            .contiguous()?;
-
-        // Ensure hidden_states is contiguous (it might be a narrow view)
-        let hidden_states = hidden_states.contiguous()?;
-
-        if debug {
-            let emb_f32 = inputs_embeds.to_dtype(candle::DType::F32)?;
-            let hid_f32 = hidden_states.to_dtype(candle::DType::F32)?;
-            eprintln!(
-                "[MTP] input_embeds shape={:?}, mean={:.4}",
-                inputs_embeds.dims(),
-                emb_f32.mean_all()?.to_scalar::<f32>()?
-            );
-            eprintln!(
-                "[MTP] hidden_states (input) shape={:?}, mean={:.4}",
-                hidden_states.dims(),
-                hid_f32.mean_all()?.to_scalar::<f32>()?
-            );
-        }
-
-        // Normalize embeddings and hidden states
-        let inputs_embeds_norm = self.pre_fc_norm_embedding.forward(&inputs_embeds)?;
-        let hidden_states_norm = self.pre_fc_norm_hidden.forward(&hidden_states)?;
-
-        if debug {
-            let emb_f32 = inputs_embeds_norm.to_dtype(candle::DType::F32)?;
-            let hid_f32 = hidden_states_norm.to_dtype(candle::DType::F32)?;
-            eprintln!(
-                "[MTP] after pre_fc_norm_embedding: mean={:.4}",
-                emb_f32.mean_all()?.to_scalar::<f32>()?
-            );
-            eprintln!(
-                "[MTP] after pre_fc_norm_hidden: mean={:.4}",
-                hid_f32.mean_all()?.to_scalar::<f32>()?
-            );
-        }
-
-        // Concatenate embeddings and hidden states along the last dimension
-        // inputs_embeds: [batch, seq, hidden_size]
-        // hidden_states: [batch, seq, hidden_size]
-        // result: [batch, seq, hidden_size * 2]
-        let combined = Tensor::cat(&[&inputs_embeds_norm, &hidden_states_norm], 2)?.contiguous()?;
-
-        if debug {
-            eprintln!("[MTP] combined shape={:?}", combined.dims());
-        }
-
-        // Apply FC layer to reduce back to hidden_size
-        let h = self.fc.forward(&combined)?.contiguous()?;
-
-        if debug {
-            let h_f32 = h.to_dtype(candle::DType::F32)?;
-            eprintln!(
-                "[MTP] after FC: shape={:?}, mean={:.4}",
-                h.dims(),
-                h_f32.mean_all()?.to_scalar::<f32>()?
-            );
-        }
-
-        // Forward through ONE MTP decoder layer based on spec_step_idx
-        // This matches vLLM's implementation: current_step_idx = spec_step_idx % self.num_mtp_layers
-        let layer_idx = spec_step_idx % self.num_mtp_layers;
-        let (hidden_states, residual) = self.layers[layer_idx].forward(&h, None, offset)?;
-
-        if debug {
-            let hs_f32 = hidden_states.to_dtype(candle::DType::F32)?;
-            let res_f32 = residual.to_dtype(candle::DType::F32)?;
-            eprintln!(
-                "[MTP] layer output: hidden mean={:.4}, residual mean={:.4}",
-                hs_f32.mean_all()?.to_scalar::<f32>()?,
-                res_f32.mean_all()?.to_scalar::<f32>()?
-            );
-        }
-
-        // Apply fused add+norm matching vLLM's model.forward():
-        // norm(hidden_states + residual) = norm(moe_output + attn + input)
-        let h = self.norm.forward(&(&hidden_states + &residual)?)?;
-
-        if debug {
-            let h_f32 = h.to_dtype(candle::DType::F32)?;
-            eprintln!(
-                "[MTP] after final norm: mean={:.4}",
-                h_f32.mean_all()?.to_scalar::<f32>()?
-            );
-        }
-
-        // Apply lm_head to get logits
-        let logits = lm_head.forward(&h)?.squeeze(1)?;
-
-        if debug {
-            let logits_f32 = logits.to_dtype(candle::DType::F32)?;
-            let argmax = logits_f32.argmax(0)?.to_scalar::<u32>()?;
-            eprintln!("[MTP] logits shape={:?}, argmax={}", logits.dims(), argmax);
-        }
-
-        Ok(logits)
-    }
-
-    /// Forward pass through MTP for a single step of speculative decoding.
-    /// Returns NORMALIZED hidden states for chaining (matching vLLM Qwen3NextMTP).
-    ///
-    /// This matches vLLM's Qwen3NextMultiTokenPredictor.forward() which does:
-    /// 1. Layer returns (hidden_states, residual) where hidden_states = norm(sum), residual = sum
-    /// 2. Final norm does fused add+norm: norm(hidden_states + residual) = norm(norm(sum) + sum)
-    ///
-    /// Since our layer doesn't have mlp_layernorm, we achieve the same by:
-    /// 1. Layer returns (sum, sum)
-    /// 2. We do: norm(norm(sum) + sum) using self.norm twice
-    pub fn forward_hidden(
-        &mut self,
-        input_ids: &Tensor,
-        embed_tokens: &Embedding,
-        hidden_states: &Tensor,
-        offset: usize,
-        dtype: DType,
-        spec_step_idx: usize,
-    ) -> Result<Tensor> {
-        let debug = std::env::var("MTP_DEBUG").is_ok();
-
-        // Embed the input tokens
-        let inputs_embeds = embed_tokens
-            .forward(input_ids)?
-            .to_dtype(dtype)?
-            .contiguous()?;
-
-        // Ensure hidden_states is contiguous (it might be a narrow view)
-        let hidden_states = hidden_states.contiguous()?;
-
-        if debug {
-            let emb_f32 = inputs_embeds.to_dtype(candle::DType::F32)?;
-            let hid_f32 = hidden_states.to_dtype(candle::DType::F32)?;
-            eprintln!(
-                "[MTP_H] input_embeds shape={:?}, mean={:.4}",
-                inputs_embeds.dims(),
-                emb_f32.mean_all()?.to_scalar::<f32>()?
-            );
-            eprintln!(
-                "[MTP_H] hidden_states (input) shape={:?}, mean={:.4}",
-                hidden_states.dims(),
-                hid_f32.mean_all()?.to_scalar::<f32>()?
-            );
-        }
-
-        // Normalize embeddings and hidden states before projection
-        let inputs_embeds_norm = self.pre_fc_norm_embedding.forward(&inputs_embeds)?;
-        let hidden_states_norm = self.pre_fc_norm_hidden.forward(&hidden_states)?;
-
-        if debug {
-            let emb_f32 = inputs_embeds_norm.to_dtype(candle::DType::F32)?;
-            let hid_f32 = hidden_states_norm.to_dtype(candle::DType::F32)?;
-            eprintln!(
-                "[MTP_H] after norms: embed mean={:.4}, hidden mean={:.4}",
-                emb_f32.mean_all()?.to_scalar::<f32>()?,
-                hid_f32.mean_all()?.to_scalar::<f32>()?
-            );
-        }
-
-        // Concatenate embeddings and hidden states along the last dimension
-        let combined = Tensor::cat(&[&inputs_embeds_norm, &hidden_states_norm], 2)?.contiguous()?;
-
-        // Apply FC layer
-        let h = self.fc.forward(&combined)?.contiguous()?;
-
-        if debug {
-            let h_f32 = h.to_dtype(candle::DType::F32)?;
-            eprintln!(
-                "[MTP_H] after FC: shape={:?}, mean={:.4}",
-                h.dims(),
-                h_f32.mean_all()?.to_scalar::<f32>()?
-            );
-        }
-
-        // Forward through MTP decoder layer
-        // Layer returns (moe_output, attn + input) matching vLLM pattern
-        let layer_idx = spec_step_idx % self.num_mtp_layers;
-        let (hidden_states, residual) = self.layers[layer_idx].forward(&h, None, offset)?;
-
-        let output = (&hidden_states + &residual)?;
-
-        if debug {
-            let out_f32 = output.to_dtype(candle::DType::F32)?;
-            eprintln!(
-                "[MTP_H] output (pre-norm) shape={:?}, mean={:.4}",
-                output.dims(),
-                out_f32.mean_all()?.to_scalar::<f32>()?
-            );
-        }
-
-        // Return PRE-NORM hidden states for chaining
-        // Next MTP step will apply pre_fc_norm_hidden
-        Ok(output)
-    }
-
-    /// Forward pass using SHARED K/V cache from main model (native MTP design).
-    ///
-    /// This is the correct way to run MTP for Qwen3-Next:
-    /// - MTP computes its own Q from the input
-    /// - MTP reads K/V from the main model's cache (does NOT maintain its own)
-    ///
-    /// # Arguments
-    /// * `input_ids` - Token IDs to predict next token for [batch, 1]
-    /// * `embed_tokens` - Embedding layer (shared with main model)
-    /// * `hidden_states` - Hidden states from main model [batch, 1, hidden_size]
-    /// * `lm_head` - LM head for producing logits (shared with main model)
-    /// * `shared_k` - K tensor from main model's last layer cache
-    /// * `shared_v` - V tensor from main model's last layer cache
-    /// * `offset` - Position offset for attention
-    /// * `dtype` - Data type for computation
-    /// * `spec_step_idx` - Speculative step index
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_with_shared_kv(
-        &mut self,
-        input_ids: &Tensor,
-        embed_tokens: &Embedding,
-        hidden_states: &Tensor,
-        lm_head: &QMatMul,
-        shared_k: &Tensor,
-        shared_v: &Tensor,
-        offset: usize,
-        dtype: DType,
-        spec_step_idx: usize,
-    ) -> Result<Tensor> {
-        let debug = std::env::var("MTP_DEBUG").is_ok();
-
-        // Embed the input tokens
-        let inputs_embeds = embed_tokens
-            .forward(input_ids)?
-            .to_dtype(dtype)?
-            .contiguous()?;
-
-        let hidden_states = hidden_states.contiguous()?;
-
-        if debug {
-            eprintln!(
-                "[MTP-SHARED] Using shared KV cache: K={:?}, V={:?}",
-                shared_k.dims(),
-                shared_v.dims()
-            );
-        }
-
-        // Normalize embeddings and hidden states
-        let inputs_embeds_norm = self.pre_fc_norm_embedding.forward(&inputs_embeds)?;
-        let hidden_states_norm = self.pre_fc_norm_hidden.forward(&hidden_states)?;
-
-        // Concatenate and project
-        let combined = Tensor::cat(&[&inputs_embeds_norm, &hidden_states_norm], 2)?.contiguous()?;
-        let h = self.fc.forward(&combined)?.contiguous()?;
-
-        // Forward through MTP decoder layer using SHARED K/V
-        let layer_idx = spec_step_idx % self.num_mtp_layers;
-        let (hidden_states, residual) =
-            self.layers[layer_idx].forward_with_shared_kv(&h, shared_k, shared_v, None, offset)?;
-
-        // Apply fused add+norm
-        let h = self.norm.forward(&(&hidden_states + &residual)?)?;
-
-        // Apply lm_head to get logits
-        let logits = lm_head.forward(&h)?.squeeze(1)?;
-
-        if debug {
-            let logits_f32 = logits.to_dtype(candle::DType::F32)?;
-            let argmax = logits_f32.argmax(0)?.to_scalar::<u32>()?;
-            eprintln!("[MTP-SHARED] output logits: argmax={}", argmax);
-        }
-
-        Ok(logits)
-    }
-
-    /// Forward pass using SHARED K/V returning hidden states for chaining.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_hidden_with_shared_kv(
-        &mut self,
-        input_ids: &Tensor,
-        embed_tokens: &Embedding,
-        hidden_states: &Tensor,
-        shared_k: &Tensor,
-        shared_v: &Tensor,
-        offset: usize,
-        dtype: DType,
-        spec_step_idx: usize,
-    ) -> Result<Tensor> {
-        // Embed the input tokens
-        let inputs_embeds = embed_tokens
-            .forward(input_ids)?
-            .to_dtype(dtype)?
-            .contiguous()?;
-
-        let hidden_states = hidden_states.contiguous()?;
-
-        // Normalize embeddings and hidden states
-        let inputs_embeds_norm = self.pre_fc_norm_embedding.forward(&inputs_embeds)?;
-        let hidden_states_norm = self.pre_fc_norm_hidden.forward(&hidden_states)?;
-
-        // Concatenate and project
-        let combined = Tensor::cat(&[&inputs_embeds_norm, &hidden_states_norm], 2)?.contiguous()?;
-        let h = self.fc.forward(&combined)?.contiguous()?;
-
-        // Forward through MTP decoder layer using SHARED K/V
-        let layer_idx = spec_step_idx % self.num_mtp_layers;
-        let (hidden_states, residual) =
-            self.layers[layer_idx].forward_with_shared_kv(&h, shared_k, shared_v, None, offset)?;
-
-        // Return PRE-NORM hidden states for chaining
-        &hidden_states + &residual
-    }
-
-    /// Clear all KV caches in MTP layers
-    pub fn clear_cache(&mut self) {
-        for layer in &mut self.layers {
-            layer.clear_cache();
         }
     }
 }
@@ -5424,10 +4319,6 @@ pub struct ModelWeights {
     span: tracing::Span,
     span_output: tracing::Span,
     custom_lm_head_scales: Option<Tensor>,
-    /// Multi-Token Prediction module for speculative decoding (optional)
-    mtp: Option<MtpWeights>,
-    /// Model config for MTP loading
-    config: ModelConfig,
     /// Prefetch pipeline coordinator for hiding transfer latency
     prefetch_pipeline: Option<crate::layer_pipeline::PrefetchPipelineCoordinator>,
 }
@@ -5698,7 +4589,6 @@ impl ModelWeights {
             custom_down_block_mults: None,
             gpu_hot_cache: None,
             gpu_device: None,
-            transposed_layout: false,
         };
 
         Ok(MoeBlock {
@@ -5776,8 +4666,6 @@ impl ModelWeights {
             span,
             span_output,
             custom_lm_head_scales: None,
-            mtp: None,
-            config,
             prefetch_pipeline: None,
         })
     }
@@ -5951,8 +4839,6 @@ impl ModelWeights {
             span,
             span_output,
             custom_lm_head_scales: None,
-            mtp: None,
-            config,
             prefetch_pipeline: None,
         })
     }
@@ -6261,47 +5147,6 @@ impl ModelWeights {
         }
     }
 
-    /// Forward pass that returns logits for ALL positions AND hidden states for the last position.
-    /// This is optimal for MTP verification + next-round preparation in a single pass.
-    ///
-    /// Returns: (all_logits [batch, seq_len, vocab], last_hidden_states [batch, 1, hidden])
-    pub fn forward_all_positions_with_hidden(
-        &mut self,
-        input: &Tensor,
-        offset: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        let _enter = self.span.enter();
-        let dims = input.dims();
-        let b = dims.first().copied().unwrap_or(0);
-        let l = dims.get(1).copied().unwrap_or(0);
-        let mut h = self.embed_tokens.forward(input)?.to_dtype(self.dtype)?;
-
-        let causal_mask = if l == 1 {
-            None
-        } else {
-            Some(self.causal_mask(b, l, offset)?)
-        };
-
-        for layer in &mut self.layers {
-            h = layer.forward(&h, causal_mask.as_ref(), offset)?;
-        }
-
-        let h = self.norm.forward(&h)?;
-        let _enter = self.span_output.enter();
-
-        // Get hidden states for the last position (for MTP)
-        let last_hidden = h.narrow(1, l - 1, 1)?;
-
-        // Return logits for ALL positions
-        let logits = if let Some(scales) = &self.custom_lm_head_scales {
-            self.lm_head.forward_with_scales(&h, scales)?
-        } else {
-            self.lm_head.forward(&h)?
-        };
-
-        Ok((logits, last_hidden))
-    }
-
     /// Verification forward pass with PARALLEL intermediate state materialization.
     ///
     /// This method:
@@ -6341,7 +5186,7 @@ impl ModelWeights {
             h = layer.forward_with_state_materialization(&h, causal_mask.as_ref(), offset)?;
         }
 
-        // Save pre-norm hidden states for MTP
+        // Save pre-norm hidden states for callers.
         let all_hidden = h.clone();
 
         // Apply final norm and get logits
@@ -6376,94 +5221,6 @@ impl ModelWeights {
         for layer in &mut self.layers {
             layer.clear_intermediate_states();
         }
-    }
-
-    /// Forward pass that returns both logits and hidden states (for MTP speculative decoding)
-    ///
-    /// Returns: (logits, hidden_states) where hidden_states are PRE-NORM
-    /// (before the final RMS norm). MTP expects pre-norm hidden states because
-    /// it applies its own pre_fc_norm_hidden normalization.
-    pub fn forward_with_hidden_states(
-        &mut self,
-        input: &Tensor,
-        offset: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        let debug = std::env::var("MTP_DEBUG").is_ok();
-
-        // Debug: check cache before forward
-        if debug {
-            let cache_before = self.get_last_full_attention_kv();
-            if let Some((k, _)) = cache_before {
-                eprintln!(
-                    "[forward_with_hidden_states] Cache BEFORE: seq_len={}",
-                    k.dim(2)?
-                );
-            } else {
-                eprintln!("[forward_with_hidden_states] Cache BEFORE: None");
-            }
-        }
-
-        let _enter = self.span.enter();
-        let dims = input.dims();
-        let b = dims.first().copied().unwrap_or(0);
-        let l = dims.get(1).copied().unwrap_or(0);
-        let mut h = self.embed_tokens.forward(input)?.to_dtype(self.dtype)?;
-
-        let causal_mask = if l == 1 {
-            None
-        } else {
-            Some(self.causal_mask(b, l, offset)?)
-        };
-
-        for layer in &mut self.layers {
-            h = layer.forward(&h, causal_mask.as_ref(), offset)?;
-        }
-
-        // Debug: check cache after forward
-        if debug {
-            let cache_after = self.get_last_full_attention_kv();
-            if let Some((k, _)) = cache_after {
-                eprintln!(
-                    "[forward_with_hidden_states] Cache AFTER: seq_len={}, offset={}, input_len={}",
-                    k.dim(2)?,
-                    offset,
-                    l
-                );
-            } else {
-                eprintln!("[forward_with_hidden_states] Cache AFTER: None");
-            }
-        }
-
-        // Save PRE-norm hidden states for MTP
-        // MTP applies its own pre_fc_norm, so we give it raw hidden states
-        let pre_norm_hidden = h.narrow(1, l - 1, 1)?;
-
-        let h = self.norm.forward(&h)?;
-        let _enter = self.span_output.enter();
-        let last_hidden = h.narrow(1, l - 1, 1)?;
-
-        // Debug: print hidden state statistics
-        if std::env::var("MTP_DEBUG").is_ok() {
-            let pre_f32 = pre_norm_hidden.to_dtype(candle::DType::F32)?;
-            let post_f32 = last_hidden.to_dtype(candle::DType::F32)?;
-            eprintln!(
-                "[MAIN] pre_norm mean={:.4}, post_norm mean={:.4}",
-                pre_f32.mean_all()?.to_scalar::<f32>()?,
-                post_f32.mean_all()?.to_scalar::<f32>()?
-            );
-        }
-
-        let logits = if let Some(scales) = &self.custom_lm_head_scales {
-            self.lm_head
-                .forward_with_scales(&last_hidden, scales)?
-                .squeeze(1)?
-        } else {
-            self.lm_head.forward(&last_hidden)?.squeeze(1)?
-        };
-
-        // Return PRE-norm hidden states for MTP
-        // MTP applies its own pre_fc_norm_hidden normalization
-        Ok((logits, pre_norm_hidden))
     }
 
     /// Extract text embeddings by mean-pooling hidden states.
@@ -6540,362 +5297,10 @@ impl ModelWeights {
         Ok(embeddings)
     }
 
-    /// Evaluate MTP prediction accuracy on a sequence.
-    ///
-    /// This method evaluates how accurate the MTP head is at predicting future tokens.
-    /// For each position in the input, it:
-    /// 1. Gets the main model's prediction for the next token
-    /// 2. Gets the MTP head's prediction for the next N tokens
-    /// 3. Compares MTP predictions against actual next tokens (if available)
-    ///
-    /// # Arguments
-    /// * `input` - Token IDs tensor of shape [batch, seq_len]
-    /// * `num_mtp_steps` - Number of MTP prediction steps to evaluate (typically 1-4)
-    ///
-    /// # Returns
-    /// * (accuracy, total_predictions, correct_predictions)
-    ///   - accuracy: Percentage of correct MTP predictions (0.0 - 1.0)
-    ///   - total_predictions: Total MTP predictions made
-    ///   - correct_predictions: Number of correct predictions
-    pub fn evaluate_mtp_accuracy(
-        &mut self,
-        input: &Tensor,
-        num_mtp_steps: usize,
-    ) -> Result<(f32, usize, usize)> {
-        if self.mtp.is_none() {
-            // No MTP head loaded, return 0 accuracy
-            return Ok((0.0, 0, 0));
-        }
-
-        let seq_len = input.dims()[1];
-        if seq_len < num_mtp_steps + 2 {
-            // Need at least num_mtp_steps + 2 tokens to evaluate
-            return Ok((0.0, 0, 0));
-        }
-
-        let mut total_predictions = 0usize;
-        let mut correct_predictions = 0usize;
-
-        // Get the input tokens as a vector
-        let input_tokens: Vec<u32> = input.squeeze(0)?.to_vec1()?;
-
-        // For each starting position where we can evaluate MTP
-        let max_start = seq_len.saturating_sub(num_mtp_steps + 1);
-
-        for start_pos in 0..max_start {
-            // Get prefix up to and including start_pos
-            let prefix_len = start_pos + 1;
-            let prefix = input.narrow(1, 0, prefix_len)?;
-
-            // Clear caches
-            self.clear_kv_cache();
-            if let Some(ref mut mtp) = self.mtp {
-                mtp.clear_cache();
-            }
-
-            // Run main model to get hidden states at start_pos
-            let (main_logits, hidden_states) = self.forward_with_hidden_states(&prefix, 0)?;
-
-            // Get the main model's predicted token (greedy)
-            let main_pred = main_logits.argmax(candle::D::Minus1)?.to_vec1::<u32>()?[0];
-
-            // Now run MTP for num_mtp_steps
-            let mut current_hidden = hidden_states;
-            let mut current_token = main_pred;
-            let mut current_offset = prefix_len;
-
-            for mtp_step in 0..num_mtp_steps {
-                // Check if we have ground truth for this position
-                let target_pos = start_pos + 1 + mtp_step;
-                if target_pos >= seq_len {
-                    break;
-                }
-
-                let target_token = input_tokens[target_pos];
-
-                // Create input tensor for current token
-                let token_input = Tensor::new(&[current_token], &self.device)?.unsqueeze(0)?;
-
-                // Get MTP prediction
-                let mtp = self.mtp.as_mut().unwrap();
-                let mtp_hidden = mtp.forward_hidden(
-                    &token_input,
-                    &self.embed_tokens,
-                    &current_hidden,
-                    current_offset,
-                    self.dtype,
-                    mtp_step,
-                )?;
-
-                // CRITICAL: Must normalize before lm_head - forward_hidden returns pre-norm states
-                let mtp_normalized = mtp.norm.forward(&mtp_hidden)?;
-                let mtp_logits = self.lm_head.forward(&mtp_normalized)?.squeeze(1)?;
-                let mtp_pred = mtp_logits.argmax(candle::D::Minus1)?.to_vec1::<u32>()?[0];
-
-                // Compare prediction to ground truth
-                total_predictions += 1;
-                if mtp_pred == target_token {
-                    correct_predictions += 1;
-                }
-
-                // Update for next step
-                current_hidden = mtp_hidden;
-                current_token = target_token; // Use ground truth for next step evaluation
-                current_offset += 1;
-            }
-        }
-
-        let accuracy = if total_predictions > 0 {
-            correct_predictions as f32 / total_predictions as f32
-        } else {
-            0.0
-        };
-
-        Ok((accuracy, total_predictions, correct_predictions))
-    }
-
-    /// Quick MTP accuracy evaluation on a single sequence position.
-    ///
-    /// This is a lighter-weight version that evaluates MTP from a single position.
-    ///
-    /// # Arguments
-    /// * `input` - Token IDs tensor of shape [batch, seq_len]  
-    /// * `eval_position` - Position to evaluate from (must have num_mtp_steps tokens after it)
-    /// * `num_mtp_steps` - Number of MTP steps to evaluate
-    ///
-    /// # Returns
-    /// * Accuracy as f32 (0.0 - 1.0)
-    pub fn evaluate_mtp_accuracy_at_position(
-        &mut self,
-        input: &Tensor,
-        eval_position: usize,
-        num_mtp_steps: usize,
-    ) -> Result<f32> {
-        if self.mtp.is_none() {
-            return Ok(0.0);
-        }
-
-        let seq_len = input.dims()[1];
-        if eval_position + num_mtp_steps >= seq_len {
-            return Ok(0.0);
-        }
-
-        let input_tokens: Vec<u32> = input.squeeze(0)?.to_vec1()?;
-
-        // Clear caches
-        self.clear_kv_cache();
-        if let Some(ref mut mtp) = self.mtp {
-            mtp.clear_cache();
-        }
-
-        // Get prefix up to eval_position
-        let prefix_len = eval_position + 1;
-        let prefix = input.narrow(1, 0, prefix_len)?;
-
-        // Run main model
-        let (main_logits, hidden_states) = self.forward_with_hidden_states(&prefix, 0)?;
-        let main_pred = main_logits.argmax(candle::D::Minus1)?.to_vec1::<u32>()?[0];
-
-        let mut correct = 0usize;
-        let mut current_hidden = hidden_states;
-        let mut current_token = main_pred;
-        let mut current_offset = prefix_len;
-
-        for mtp_step in 0..num_mtp_steps {
-            let target_pos = eval_position + 1 + mtp_step;
-            let target_token = input_tokens[target_pos];
-
-            let token_input = Tensor::new(&[current_token], &self.device)?.unsqueeze(0)?;
-
-            let mtp = self.mtp.as_mut().unwrap();
-            let mtp_hidden = mtp.forward_hidden(
-                &token_input,
-                &self.embed_tokens,
-                &current_hidden,
-                current_offset,
-                self.dtype,
-                mtp_step,
-            )?;
-
-            // CRITICAL: Must normalize before lm_head - forward_hidden returns pre-norm states
-            let mtp_normalized = mtp.norm.forward(&mtp_hidden)?;
-            let mtp_logits = self.lm_head.forward(&mtp_normalized)?.squeeze(1)?;
-            let mtp_pred = mtp_logits.argmax(candle::D::Minus1)?.to_vec1::<u32>()?[0];
-
-            if mtp_pred == target_token {
-                correct += 1;
-            }
-
-            current_hidden = mtp_hidden;
-            current_token = target_token;
-            current_offset += 1;
-        }
-
-        Ok(correct as f32 / num_mtp_steps as f32)
-    }
-
-    /// Load MTP weights for multi-token prediction speculative decoding.
-    ///
-    /// This must be called after model loading if MTP weights are available in the GGUF.
-    /// MTP enables speculative decoding where multiple tokens are predicted in parallel.
-    ///
-    /// # GPU Placement for Maximum Performance
-    ///
-    /// MTP tensors are always placed on the model's primary device (`self.device`).
-    /// For maximum speculative decoding performance, this should be a CUDA GPU.
-    ///
-    /// When using [`DeviceOffloadMode`] to offload main model expert weights to CPU,
-    /// the model's device remains GPU, so MTP will correctly stay on GPU. This ensures
-    /// fast speculative token generation even when memory constraints require CPU
-    /// offloading of the larger expert weights.
-    ///
-    /// A warning is logged if MTP is loaded to CPU when CUDA is available, as this
-    /// may indicate suboptimal configuration.
-    ///
-    /// # MTP Weight Naming Convention (GGUF)
-    ///
-    /// - Top-level: `mtp.fc.weight`, `mtp.pre_fc_norm_embedding.weight`, `mtp.norm.weight`
-    /// - Layers: `blk.{idx}.mtp.attn_q.weight`, `blk.{idx}.mtp.gate.weight`, etc.
-    /// - Experts are packed: `blk.{idx}.mtp.ffn_gate_exps.weight` (3D tensor)
-    pub fn load_mtp<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let mut file = std::fs::File::open(path.as_ref())?;
-        let content = gguf_file::Content::read(&mut file)?;
-
-        // MTP tensors must be on the same device as the model for compatibility with
-        // embed_tokens and lm_head during forward passes.
-        //
-        // For maximum speculative decoding performance, MTP should be on GPU.
-        // This is automatically ensured when:
-        // - Model is loaded with a CUDA device (recommended)
-        // - DeviceOffloadMode is used (self.device remains GPU, only experts go to CPU)
-        //
-        // Note: If the model is on CPU, MTP must also be on CPU for correctness.
-        // A warning is logged in this case as it may indicate suboptimal configuration.
-        let mtp_device = self.device.clone();
-
-        if matches!(mtp_device, Device::Cuda(_)) {
-            tracing::debug!(
-                "Loading MTP weights to GPU ({:?}) for maximum performance",
-                mtp_device
-            );
-        } else {
-            // Check if CUDA is available but not being used
-            if Device::cuda_if_available(0)
-                .map(|d| matches!(d, Device::Cuda(_)))
-                .unwrap_or(false)
-            {
-                tracing::warn!(
-                    "MTP weights are being loaded to CPU but CUDA is available. \
-                     For maximum speculative decoding performance, load the model with a CUDA device. \
-                     Note: DeviceOffloadMode can be used to offload experts to CPU while keeping \
-                     MTP on GPU."
-                );
-            } else {
-                tracing::debug!("Loading MTP weights to CPU (no CUDA available)");
-            }
-        }
-
-        let mut gg = Gguf::new(content, &mut file, mtp_device.clone());
-
-        // Check if MTP weights exist (top-level FC layer)
-        let fc = match gg.try_qmatmul("mtp.fc.weight")? {
-            Some(fc) => fc,
-            None => {
-                return Err(candle::Error::Msg(
-                    "MTP weights not found in GGUF file".to_string(),
-                ));
-            }
-        };
-
-        // Load pre-FC norms (top-level MTP weights) with Gemma-style +1 correction
-        let pre_fc_norm_embedding = gg.rms_norm_gemma(
-            "mtp.pre_fc_norm_embedding.weight",
-            self.config.rms_norm_eps,
-            self.dtype,
-        )?;
-        let pre_fc_norm_hidden = gg.rms_norm_gemma(
-            "mtp.pre_fc_norm_hidden.weight",
-            self.config.rms_norm_eps,
-            self.dtype,
-        )?;
-
-        // Load final norm (GGUF naming: mtp.norm.weight) with Gemma-style +1 correction
-        let norm = gg.rms_norm_gemma("mtp.norm.weight", self.config.rms_norm_eps, self.dtype)?;
-
-        // Create rotary embedding for MTP on the MTP device (GPU)
-        let rotary = Arc::new(RotaryEmbedding::new(
-            self.dtype,
-            self.config.head_dim,
-            self.config.n_rot,
-            self.config.max_position_embeddings,
-            self.config.rope_freq_base,
-            &mtp_device,
-        )?);
-
-        // Load MTP layers using GGUF naming: blk.{idx}.mtp.*
-        // All MTP layers are placed on GPU for maximum speculative decoding performance
-        let mut layers = Vec::new();
-        for layer_idx in 0..4 {
-            // Check up to 4 MTP layers
-            let prefix = format!("blk.{}.mtp", layer_idx);
-
-            // Check if this MTP layer exists by trying to read its input norm
-            if gg
-                .try_tensor(&format!("{}.in_norm.weight", prefix))?
-                .is_none()
-            {
-                break;
-            }
-
-            let layer = MtpDecoderLayer::new(
-                &mut gg,
-                &prefix,
-                &self.config,
-                rotary.clone(),
-                &mtp_device,
-                layer_idx,
-            )?;
-            layers.push(layer);
-        }
-
-        if layers.is_empty() {
-            return Err(candle::Error::Msg(
-                "No MTP layers found in GGUF file".to_string(),
-            ));
-        }
-
-        let num_mtp_layers = layers.len();
-
-        self.mtp = Some(MtpWeights {
-            fc,
-            pre_fc_norm_embedding,
-            pre_fc_norm_hidden,
-            layers,
-            norm,
-            hidden_size: self.config.hidden_size,
-            num_mtp_layers,
-        });
-
-        Ok(())
-    }
-
-    /// Check if MTP weights are loaded
-    pub fn has_mtp(&self) -> bool {
-        self.mtp.is_some()
-    }
-
-    /// Get the number of MTP layers (for determining max speculation depth)
-    pub fn num_mtp_layers(&self) -> usize {
-        self.mtp.as_ref().map(|m| m.num_mtp_layers).unwrap_or(0)
-    }
-
-    /// Clear all KV caches in the model (main model + MTP)
+    /// Clear all KV caches/state in the model.
     pub fn clear_cache(&mut self) {
         for layer in &mut self.layers {
             layer.clear_cache();
-        }
-        if let Some(ref mut mtp) = self.mtp {
-            mtp.clear_cache();
         }
     }
 
@@ -6928,261 +5333,6 @@ impl ModelWeights {
         for (layer, checkpoint) in self.layers.iter_mut().zip(checkpoints) {
             layer.restore_cache(checkpoint);
         }
-    }
-
-    /// Clear only the MTP cache (keeps main model's KV cache).
-    /// Should be called before each MTP speculation to ensure clean state.
-    pub fn clear_mtp_cache(&mut self) {
-        if let Some(ref mut mtp) = self.mtp {
-            mtp.clear_cache();
-        }
-    }
-
-    /// Get the shared K/V cache from the last full attention layer.
-    /// This is used for native MTP state sharing.
-    fn get_last_full_attention_kv(&self) -> Option<(Tensor, Tensor)> {
-        let debug = std::env::var("MTP_DEBUG").is_ok();
-        let total_layers = self.layers.len();
-
-        // Find the last full attention layer (iterate backwards)
-        for (rev_idx, layer) in self.layers.iter().rev().enumerate() {
-            let actual_idx = total_layers - 1 - rev_idx;
-            if layer.is_full_attention() {
-                if debug {
-                    eprintln!(
-                        "[get_last_full_attention_kv] Using layer {} (of {})",
-                        actual_idx, total_layers
-                    );
-                }
-                return layer.get_shared_kv();
-            }
-        }
-        if debug {
-            eprintln!("[get_last_full_attention_kv] No full attention layer found!");
-        }
-        None
-    }
-
-    /// Forward pass through MTP for speculative token prediction.
-    ///
-    /// Native MTP design:
-    /// - Hidden states from main model are passed as input (this is the "state sharing")
-    /// - MTP has its OWN tiny KV cache for its internal attention layer
-    /// - MTP builds its cache incrementally for speculative tokens
-    ///
-    /// # Arguments
-    /// * `input_id` - Single token ID to predict next token for [batch, 1]
-    /// * `hidden_states` - Hidden states from main model [batch, 1, hidden_size]
-    /// * `offset` - Position offset for MTP's internal attention
-    /// * `spec_step_idx` - Speculative step index (determines which MTP layer to use)
-    ///
-    /// # Returns
-    /// Logits for next token prediction [batch, vocab_size]
-    pub fn forward_mtp(
-        &mut self,
-        input_id: &Tensor,
-        hidden_states: &Tensor,
-        offset: usize,
-        spec_step_idx: usize,
-    ) -> Result<Tensor> {
-        let mtp = self
-            .mtp
-            .as_mut()
-            .ok_or_else(|| candle::Error::Msg("MTP weights not loaded".to_string()))?;
-
-        // MTP uses its own KV cache, hidden states are the shared input
-        mtp.forward(
-            input_id,
-            &self.embed_tokens,
-            hidden_states,
-            &self.lm_head,
-            offset,
-            self.dtype,
-            spec_step_idx,
-        )
-    }
-
-    /// Forward pass through MTP returning both logits and hidden states.
-    ///
-    /// Native MTP design:
-    /// - Hidden states from main model are passed as input (this is the "state sharing")
-    /// - MTP has its OWN tiny KV cache for its internal attention layer
-    /// - Returns hidden states for chaining multiple MTP steps
-    ///
-    /// # Arguments
-    /// * `input_id` - Single token ID to predict next token for [batch, 1]
-    /// * `hidden_states` - Hidden states from main model [batch, 1, hidden_size]
-    /// * `offset` - Position offset for MTP's internal attention
-    /// * `spec_step_idx` - Speculative step index (determines which MTP layer to use)
-    ///
-    /// # Returns
-    /// (logits, hidden_states) - Logits for sampling and hidden states for next step
-    pub fn forward_mtp_with_hidden(
-        &mut self,
-        input_id: &Tensor,
-        hidden_states: &Tensor,
-        offset: usize,
-        spec_step_idx: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        let mtp = self
-            .mtp
-            .as_mut()
-            .ok_or_else(|| candle::Error::Msg("MTP weights not loaded".to_string()))?;
-
-        // MTP uses its own KV cache, hidden states are the shared input
-        let mtp_hidden = mtp.forward_hidden(
-            input_id,
-            &self.embed_tokens,
-            hidden_states,
-            offset,
-            self.dtype,
-            spec_step_idx,
-        )?;
-
-        // Normalize before applying lm_head for logits
-        let normalized = mtp.norm.forward(&mtp_hidden)?;
-        let logits = self.lm_head.forward(&normalized)?.squeeze(1)?;
-
-        // Return logits and PRE-NORM hidden states for next MTP step
-        Ok((logits, mtp_hidden))
-    }
-
-    /// Run speculative decoding with MTP.
-    ///
-    /// This generates `num_speculative` tokens speculatively using MTP, then verifies
-    /// them against the main model. Accepted tokens are returned along with their count.
-    ///
-    /// # Arguments
-    /// * `input` - Input token IDs [batch, seq_len]
-    /// * `offset` - Position offset for attention
-    /// * `num_speculative` - Number of tokens to speculate (typically 1-4)
-    /// * `logits_processor` - Function to sample from logits
-    ///
-    /// # Returns
-    /// (all_logits, accepted_tokens, num_accepted)
-    /// - all_logits: Logits from both speculation and verification [num_tokens, vocab_size]
-    /// - accepted_tokens: Vector of accepted token IDs
-    /// - num_accepted: Number of accepted speculative tokens (0 to num_speculative)
-    pub fn forward_speculative<F>(
-        &mut self,
-        input: &Tensor,
-        offset: usize,
-        num_speculative: usize,
-        mut sample_fn: F,
-    ) -> Result<(Tensor, Vec<u32>, usize)>
-    where
-        F: FnMut(&Tensor) -> Result<u32>,
-    {
-        if self.mtp.is_none() {
-            // No MTP, fall back to regular forward
-            let logits = self.forward(input, offset)?;
-            let token = sample_fn(&logits)?;
-            return Ok((logits, vec![token], 0));
-        }
-
-        // Step 1: Run main model to get first logits and hidden states
-        let (main_logits, hidden_states) = self.forward_with_hidden_states(input, offset)?;
-        let first_token = sample_fn(&main_logits)?;
-
-        // Step 2: Use MTP to speculatively predict next tokens
-        let mut speculative_tokens = vec![first_token];
-        let mut speculative_logits = vec![main_logits.clone()];
-        let mut current_hidden = hidden_states;
-        let mut current_token = first_token;
-        let mut current_offset = offset + input.dims()[1];
-
-        for spec_step_idx in 0..num_speculative {
-            // Create input tensor for the current token
-            let token_input = Tensor::new(&[current_token], &self.device)?.unsqueeze(0)?;
-
-            // Get MTP prediction (pass spec_step_idx to select the correct layer)
-            let mtp = self.mtp.as_mut().unwrap();
-            let mtp_hidden = mtp.forward_hidden(
-                &token_input,
-                &self.embed_tokens,
-                &current_hidden,
-                current_offset,
-                self.dtype,
-                spec_step_idx,
-            )?;
-
-            // Get logits from MTP hidden states
-            // CRITICAL: Must normalize before lm_head - forward_hidden returns pre-norm states
-            let mtp_normalized = mtp.norm.forward(&mtp_hidden)?;
-            let mtp_logits = self.lm_head.forward(&mtp_normalized)?.squeeze(1)?;
-            let next_token = sample_fn(&mtp_logits)?;
-
-            speculative_tokens.push(next_token);
-            speculative_logits.push(mtp_logits);
-            current_hidden = mtp_hidden;
-            current_token = next_token;
-            current_offset += 1;
-        }
-
-        // Step 3: Verify speculative tokens with main model
-        // Concatenate speculative tokens and run through main model
-        let spec_tokens: Vec<u32> = speculative_tokens.clone();
-        let verify_input = Tensor::new(spec_tokens.as_slice(), &self.device)?.unsqueeze(0)?;
-
-        // Clear caches to restart from the original offset
-        self.clear_cache();
-        if let Some(ref mut mtp) = self.mtp {
-            mtp.clear_cache();
-        }
-
-        // Run verification through main model with all tokens
-        let full_input = if input.dims()[1] > 0 {
-            // Concatenate original input with speculative tokens
-            let input_2d = input.squeeze(0)?;
-            let verify_2d = verify_input.squeeze(0)?;
-            Tensor::cat(&[&input_2d, &verify_2d], 0)?.unsqueeze(0)?
-        } else {
-            verify_input
-        };
-
-        let verify_logits = self.forward_all_positions(&full_input, offset)?;
-
-        // Step 4: Verify speculative tokens against main model predictions
-        // For each position, check if the speculative token matches what the main model would predict
-        let mut num_accepted = 0;
-        let mut accepted_tokens = Vec::new();
-
-        // The verify_logits has shape [batch, full_seq_len, vocab]
-        // We need to check positions starting from the end of the original input
-        let original_len = input.dims()[1];
-        let verify_logits_2d = verify_logits.squeeze(0)?; // [full_seq_len, vocab]
-
-        for i in 0..num_speculative {
-            // Position in verify_logits where we check the prediction for speculative_tokens[i]
-            // At position (original_len + i - 1), the model predicts what should be at (original_len + i)
-            let check_pos = original_len + i;
-            if check_pos >= verify_logits_2d.dim(0)? {
-                break;
-            }
-
-            // Get the main model's prediction at this position (greedy)
-            let logits_at_pos = verify_logits_2d.i(check_pos - 1)?;
-            let main_pred = logits_at_pos.argmax(0)?.to_scalar::<u32>()?;
-
-            // Check if MTP's speculative token matches
-            let spec_token = speculative_tokens[i + 1]; // +1 because speculative_tokens[0] is the first token from main model
-            if main_pred == spec_token {
-                num_accepted += 1;
-                accepted_tokens.push(spec_token);
-            } else {
-                // First mismatch - stop accepting
-                break;
-            }
-        }
-
-        // Include the first token (from main model) in accepted tokens
-        let mut final_accepted = vec![first_token];
-        final_accepted.extend(accepted_tokens);
-
-        // Stack all logits
-        let all_logits = Tensor::stack(&speculative_logits, 0)?;
-
-        Ok((all_logits, final_accepted, num_accepted))
     }
 
     pub fn forward_training(
@@ -7262,7 +5412,10 @@ impl ModelWeights {
             });
         }
 
-        let z_loss = total_z_loss.unwrap_or_else(|| Tensor::new(0.0f32, &self.device).unwrap());
+        let z_loss = match total_z_loss {
+            Some(z_loss) => z_loss,
+            None => Tensor::new(0.0f32, &self.device)?,
+        };
         let num_layers = router_stats.len() as f64;
         (z_loss / num_layers)? * z_loss_weight
     }
@@ -7333,7 +5486,10 @@ impl ModelWeights {
             });
         }
 
-        let lb_loss = total_lb_loss.unwrap_or_else(|| Tensor::new(0.0f32, &self.device).unwrap());
+        let lb_loss = match total_lb_loss {
+            Some(lb_loss) => lb_loss,
+            None => Tensor::new(0.0f32, &self.device)?,
+        };
         let num_layers = router_stats.len() as f64;
         (lb_loss / num_layers)? * lb_loss_weight
     }
