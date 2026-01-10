@@ -16,13 +16,15 @@
 The goal of this project is to create artificial intelligence agents that:
 
 - Run as a single process and from a single binary
-- Perform decently on a personal computer of _reasonable_ specifications: 24gb VRAM + 64gb DRAM, or >32gb unified
+- Perform decently on a personal computer of _reasonable_ specifications: 24gb VRAM + 64gb DRAM, or >=64gb unified
 - Are capable of reading and editing their own source code in an agentic loop
 - Support some form of weight modification (evolution/backprop/gradient approximation/etc)
 
 Currently, you can run this project and have it grep around iteself or give markdown explanations of quantum mechanics, etc, but it is not comparable to frontier-level cloud agentic AI. The focus here is reflection and self-improvement, not maximal intelligence or utility.
 
-My honest assessment is that agents spawned from this project are not currently capable of improving either their own weights or the agent/inference code. If that should change, I'll be sure to let folks know.
+My honest assessment is that this project is not currently capable of improving either its own weights or the agent/inference code. If that should change, I'll be sure to let folks know.
+
+I reserve the right to change the architecture and any interfaces of the constituent libraries at any time. Semver reflects only the boundaries of the application (config files, model architecture/weights, etc)
 
 # Paramecia
 
@@ -84,8 +86,9 @@ Reference entry points:
 - A local Qwen3-Next GGUF file (e.g. `Qwen3-Next-*-GGUF/*.gguf`).
 - (Optional) GPU backend:
   - `--features cuda` for NVIDIA CUDA
-  - `--features metal` for Apple Metal
   - `--features flash-attn` to enable Candle’s flash-attention integration (CUDA)
+  - `--features metal` for Apple Metal (please note that I cannot evaluate the performance of Metal on my hardware currently- the model is too big even at q2)
+  - `--features accelerate` for Apple Accelerate
 
 Note: this workspace currently depends on a Candle fork with additional kernels for the Qwen3-Next DeltaNet operations
 

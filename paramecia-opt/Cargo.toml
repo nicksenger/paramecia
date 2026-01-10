@@ -5,8 +5,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-candle = { package = "candle-core", git = "https://github.com/nicksenger/candle.git", branch = "paramecia" }
-candle-nn = { package = "candle-nn", git = "https://github.com/nicksenger/candle.git", branch = "paramecia" }
+candle = { package = "candle-core", path = "../../qzo/candle-core" }
+candle-nn = { package = "candle-nn", path = "../../qzo/candle-nn" }
 paramecia-model = { path = "../paramecia-model" }
 rand = "0.9.0"
 rand_distr = "0.5.1"
@@ -15,12 +15,18 @@ thiserror = "1"
 [dev-dependencies]
 hf-hub = "0.4.1"
 tokenizers = { version = "0.21.0", default-features = false, features = ["onig"] }
-candle-examples = { package = "candle-examples", git = "https://github.com/nicksenger/candle.git", branch = "paramecia" }
+candle-examples = { package = "candle-examples", path = "../../qzo/candle-examples" }
 paramecia-model = { path = "../paramecia-model" }
 hirschberg = { workspace = true }
 
 [features]
 default = []
+accelerate = [
+    "candle/accelerate",
+    "candle-nn/accelerate",
+    "candle-examples/accelerate",
+    "paramecia-model/accelerate",
+]
 cuda = [
     "candle/cuda",
     "candle-nn/cuda",
@@ -33,3 +39,4 @@ metal = [
     "candle-examples/metal",
     "paramecia-model/metal",
 ]
+flash-attn = ["cuda", "paramecia-model/flash-attn"]

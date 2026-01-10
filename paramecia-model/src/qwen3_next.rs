@@ -28,6 +28,11 @@ pub struct LoraAdapter {
 use candle::quantized::{gguf_file, GgmlDType, QStorage, QTensor};
 use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::{Activation, Embedding, Module};
+
+/// Helper function to check if a device is a GPU (CUDA or Metal)
+fn is_gpu_device(device: &Device) -> bool {
+    matches!(device, Device::Cuda(_) | Device::Metal(_))
+}
 use std::io::{Read, Seek};
 use std::path::Path;
 
@@ -1355,15 +1360,14 @@ impl MoeExperts {
         // Note: We expect F32 input (model uses F32 activations to match llama.cpp)
         let hidden_expanded = hidden_states.unsqueeze(1)?;
 
-        // Gate projection: [n_tokens, 1, hidden_dim] @ gate_exps -> [n_tokens, top_k, n_ff]
-        let gate_out = self
-            .gate_exps
-            .indexed_moe_forward(&hidden_expanded, expert_indices)?;
-
-        // Up projection: [n_tokens, 1, hidden_dim] @ up_exps -> [n_tokens, top_k, n_ff]
-        let up_out = self
-            .up_exps
-            .indexed_moe_forward(&hidden_expanded, expert_indices)?;
+        // Try fused gate+up kernel (reads input once, halves memory bandwidth)
+        // Falls back to separate calls if fused kernel not available for this dtype
+        let (gate_out, up_out) = QTensor::indexed_moe_gate_up(
+            &self.gate_exps,
+            &self.up_exps,
+            &hidden_expanded,
+            expert_indices,
+        )?;
 
         // Fused SwiGLU activation: silu(gate) * up
         let activated = crate::ops::fused_swiglu(&gate_out, &up_out)?;
@@ -1395,8 +1399,8 @@ impl MoeExperts {
     fn supports_batched_forward(&self) -> bool {
         use candle::quantized::GgmlDType;
 
-        // Check if we're on CUDA
-        if !matches!(self.compute_device, Device::Cuda(_)) {
+        // Check if we're on a GPU (CUDA or Metal)
+        if !is_gpu_device(&self.compute_device) {
             return false;
         }
 
@@ -1412,11 +1416,11 @@ impl MoeExperts {
                 | GgmlDType::Q8_0
         );
 
-        // All expert projections must be on CUDA for indexed_moe_forward
+        // All expert projections must be on GPU for indexed_moe_forward
         supported
-            && matches!(self.gate_exps.device(), Device::Cuda(_))
-            && matches!(self.up_exps.device(), Device::Cuda(_))
-            && matches!(self.down_exps.device(), Device::Cuda(_))
+            && is_gpu_device(&self.gate_exps.device())
+            && is_gpu_device(&self.up_exps.device())
+            && is_gpu_device(&self.down_exps.device())
     }
 
     fn forward_expert(&mut self, hidden_states: &Tensor, expert_idx: usize) -> Result<Tensor> {
@@ -1976,12 +1980,12 @@ impl MoeBlock {
         let supports_batched = self.experts.supports_batched_forward();
 
         // Check if all experts are on CPU (can use optimized CPU paths)
-        let all_experts_on_cpu = !matches!(self.experts.gate_exps.device(), Device::Cuda(_))
-            && !matches!(self.experts.up_exps.device(), Device::Cuda(_))
-            && !matches!(self.experts.down_exps.device(), Device::Cuda(_));
+        let all_experts_on_cpu = !is_gpu_device(&self.experts.gate_exps.device())
+            && !is_gpu_device(&self.experts.up_exps.device())
+            && !is_gpu_device(&self.experts.down_exps.device());
 
         // Check if hidden states are on GPU (can use GPU-side grouping)
-        let hidden_on_gpu = matches!(hidden_flat.device(), Device::Cuda(_));
+        let hidden_on_gpu = is_gpu_device(hidden_flat.device());
 
         // Always use batched when supported (avoids GPU->CPU sync)
         let use_batched = !training_mode && supports_batched;
@@ -2165,9 +2169,9 @@ impl MoeBlock {
         // Check if we should use parallel processing for remaining
         // Parallel is beneficial when we have multiple experts and ALL weights are on CPU
         // (the parallel path processes entire expert on CPU, so mixed GPU/CPU doesn't work)
-        let all_experts_on_cpu = !matches!(self.experts.gate_exps.device(), Device::Cuda(_))
-            && !matches!(self.experts.up_exps.device(), Device::Cuda(_))
-            && !matches!(self.experts.down_exps.device(), Device::Cuda(_));
+        let all_experts_on_cpu = !is_gpu_device(&self.experts.gate_exps.device())
+            && !is_gpu_device(&self.experts.up_exps.device())
+            && !is_gpu_device(&self.experts.down_exps.device());
         let use_parallel = remaining_experts.len() > 1 && all_experts_on_cpu && !training_mode;
 
         if use_parallel {
@@ -2425,8 +2429,9 @@ impl FullAttention {
             // Append returns dequantized K/V
             let (cached_k, cached_v) = cache.append(&k, &v)?;
 
-            // Prepare storage for q8_0 flash attention if applicable
-            let q8_storage = if ggml_dtype == GgmlDType::Q8_0 && cfg!(feature = "cuda") {
+            // Prepare storage for q8_0 flash attention if applicable (CUDA only)
+            #[cfg(feature = "cuda")]
+            let q8_storage = if ggml_dtype == GgmlDType::Q8_0 {
                 match cache.get_kv_storage() {
                     Ok((k_storage, v_storage, k_layout, v_layout)) => {
                         Some((k_storage, v_storage, k_layout, v_layout))
@@ -2436,6 +2441,8 @@ impl FullAttention {
             } else {
                 None
             };
+            #[cfg(not(feature = "cuda"))]
+            let q8_storage: Option<(candle::quantized::QStorage, candle::quantized::QStorage, candle::Layout, candle::Layout)> = None;
 
             // Convert back to model dtype for fallback attention computation
             let cached_k = cached_k.to_dtype(q.dtype())?.contiguous()?;
@@ -2497,6 +2504,7 @@ impl FullAttention {
                         (cached_k, cached_v, None)
                     };
         // Compute attention - use flash attention when available, otherwise standard SDPA
+        #[cfg(feature = "cuda")]
         let attn_output = if let Some((k_storage, v_storage, k_layout, v_layout)) = q8_storage {
             // Use Q8_0 flash attention kernel
             // q is currently [b, h, l, d], transpose to [b, l, h, d]
@@ -2524,6 +2532,55 @@ impl FullAttention {
             )?
             .reshape((b, l, self.num_heads * self.head_dim))?
         } else {
+            #[cfg(feature = "flash-attn")]
+            {
+                // Standard Flash Attention (F16/BF16)
+                // q, k, v are [b, h, l, d], transpose to [b, l, h, d]
+                let q_perm = q.transpose(1, 2)?.contiguous()?;
+                let k_perm = k.transpose(1, 2)?.contiguous()?;
+                let v_perm = v.transpose(1, 2)?.contiguous()?;
+
+                candle_flash_attn::flash_attn(
+                    &q_perm,
+                    &k_perm,
+                    &v_perm,
+                    (1.0 / (self.head_dim as f64).sqrt()) as f32,
+                    l > 1, // causal
+                )?
+                .reshape((b, l, self.num_heads * self.head_dim))?
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            {
+                // Repeat KV heads for grouped-query attention
+                let k = repeat_kv(k, self.num_kv_groups)?;
+                let v = repeat_kv(v, self.num_kv_groups)?;
+
+                // Compute attention
+                let scale = 1f64 / (self.head_dim as f64).sqrt();
+                let k_t = k.transpose(2, 3)?.contiguous()?;
+                let attn_scores = (q.contiguous()?.matmul(&k_t)? * scale)?;
+                let attn_scores = match attn_mask {
+                    None => attn_scores,
+                    Some(mask) => attn_scores.broadcast_add(mask)?,
+                };
+
+                // Clamp attention scores to prevent softmax overflow during training
+                let attn_scores_clamped = attn_scores.clamp(-100.0, 100.0)?;
+                let attn_weights = candle_nn::ops::softmax_last_dim(&attn_scores_clamped)?;
+                let attn_output = attn_weights.matmul(&v.contiguous()?)?;
+
+                // Reshape attention output
+                attn_output
+                    .transpose(1, 2)?
+                    .reshape((b, l, self.num_heads * self.head_dim))?
+                    .contiguous()?
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
+        let attn_output = {
+            // Suppress unused variable warning when cuda is disabled
+            let _ = &q8_storage;
+            
             #[cfg(feature = "flash-attn")]
             {
                 // Standard Flash Attention (F16/BF16)

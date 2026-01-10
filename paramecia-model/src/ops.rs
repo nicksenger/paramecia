@@ -753,6 +753,7 @@ mod tests {
 /// - Only works with CUDA backend
 /// - Head dimension must be 64, 128, or 256 (common sizes)
 /// - Simplified kernel - not as optimized as llama.cpp's full implementation
+#[cfg(feature = "cuda")]
 pub fn flash_attn_q8(
     q: &Tensor,
     k_storage: &candle::quantized::QStorage,
