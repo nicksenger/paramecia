@@ -599,10 +599,10 @@ impl PreallocatedQuantizedKvCache {
 
         // Underlying row order is position-major:
         //   offset = (seq * (batch * num_kv_heads) + b * num_kv_heads + h) * bytes_per_row + d
-        let rows_per_position = self.batch_size * self.num_kv_heads;
-        let stride_seq = rows_per_position * self.bytes_per_row;
-        let stride_b = self.num_kv_heads * self.bytes_per_row;
+        let _stride_d = 1;
         let stride_h = self.bytes_per_row;
+        let stride_seq = self.num_kv_heads * self.bytes_per_row;
+        let stride_b = self.seq_len * stride_seq;
         let stride_d = 1;
 
         let k_layout =
@@ -2426,10 +2426,16 @@ impl FullAttention {
             let (cached_k, cached_v) = cache.append(&k, &v)?;
 
             // Prepare storage for q8_0 flash attention if applicable
-            // TODO: Re-enable Q8_0 flash-attention once the CUDA kernel is fully verified.
-            // The current kernel still triggers illegal memory accesses; fallback to
-            // dequantized attention for correctness while keeping quantized cache storage.
-            let q8_storage = None;
+            let q8_storage = if ggml_dtype == GgmlDType::Q8_0 && cfg!(feature = "cuda") {
+                match cache.get_kv_storage() {
+                    Ok((k_storage, v_storage, k_layout, v_layout)) => {
+                        Some((k_storage, v_storage, k_layout, v_layout))
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
 
             // Convert back to model dtype for fallback attention computation
             let cached_k = cached_k.to_dtype(q.dtype())?.contiguous()?;
