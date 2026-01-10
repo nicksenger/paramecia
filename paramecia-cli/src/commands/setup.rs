@@ -20,10 +20,7 @@ pub async fn run() -> Result<()> {
     // Get API key
     let api_key: String = Password::with_theme(&ColorfulTheme::default())
         .with_prompt("Enter your API key")
-        .with_confirmation(
-            "Confirm your API key",
-            "API keys don't match, try again",
-        )
+        .with_confirmation("Confirm your API key", "API keys don't match, try again")
         .interact()?;
 
     if api_key.is_empty() {

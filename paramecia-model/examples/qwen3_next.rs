@@ -300,8 +300,7 @@ fn main() -> Result<()> {
 
         let start_at = tokens.len().saturating_sub(args.repeat_last_n);
         let penalty_context = &tokens[start_at..];
-        let logits =
-            utils::apply_repeat_penalty(&logits, args.repeat_penalty, penalty_context)?;
+        let logits = utils::apply_repeat_penalty(&logits, args.repeat_penalty, penalty_context)?;
         let logits =
             utils::apply_presence_penalty(&logits, args.presence_penalty, penalty_context)?;
 

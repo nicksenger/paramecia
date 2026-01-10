@@ -597,7 +597,9 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Print content as it arrives (streaming!)
-            if let Some(content) = &chunk.message.content && !content.is_empty() {
+            if let Some(content) = &chunk.message.content
+                && !content.is_empty()
+            {
                 print!("{}", content);
                 std::io::stdout().flush()?;
                 full_content.push_str(content);
@@ -632,7 +634,9 @@ async fn main() -> anyhow::Result<()> {
         let duration = start.elapsed().as_secs_f64();
 
         // Check for tool calls
-        if let Some(tool_calls) = &result.message.tool_calls && !tool_calls.is_empty() {
+        if let Some(tool_calls) = &result.message.tool_calls
+            && !tool_calls.is_empty()
+        {
             println!("\n[Tool calls detected]");
 
             // Add the assistant message with tool calls to history
@@ -651,7 +655,8 @@ async fn main() -> anyhow::Result<()> {
                 println!("\n> Calling tool: {} with args: {}", tool_name, tool_args);
 
                 // Execute the tool via ToolManager
-                let tool_result = execute_tool_via_manager(&tool_manager, tool_name, &tool_args).await;
+                let tool_result =
+                    execute_tool_via_manager(&tool_manager, tool_name, &tool_args).await;
                 println!(
                     "< Result: {}",
                     if tool_result.len() > 200 {

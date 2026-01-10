@@ -252,7 +252,9 @@ impl LocalBackend {
             }
         }
 
-        if let Ok(device) = Device::cuda_if_available(0) && matches!(device, Device::Cuda(_)) {
+        if let Ok(device) = Device::cuda_if_available(0)
+            && matches!(device, Device::Cuda(_))
+        {
             return Ok(device);
         }
         if let Ok(device) = Device::new_metal(0) {
@@ -608,7 +610,8 @@ impl LocalBackend {
                     .or_else(|| tc.get("function").and_then(|f| f.get("arguments").cloned()))
                     .unwrap_or(serde_json::Value::Null);
 
-                let arguments = serde_json::to_string(&args_value).unwrap_or_else(|_| "{}".to_string());
+                let arguments =
+                    serde_json::to_string(&args_value).unwrap_or_else(|_| "{}".to_string());
 
                 parsed.push(ToolCall {
                     id: tc
@@ -852,7 +855,9 @@ impl LocalBackend {
             generated.push(next_token);
 
             // Track thinking state
-            if let Some(start_token) = self.think_start_token && next_token == start_token {
+            if let Some(start_token) = self.think_start_token
+                && next_token == start_token
+            {
                 in_thinking = true;
                 thinking_tokens = 0;
             }
@@ -869,7 +874,9 @@ impl LocalBackend {
                 }
             }
 
-            if let Some(eos) = self.eos_token && next_token == eos {
+            if let Some(eos) = self.eos_token
+                && next_token == eos
+            {
                 break;
             }
         }
@@ -1357,7 +1364,9 @@ impl LocalBackend {
             generated_token_ids.push(next_token);
 
             // Track thinking state
-            if let Some(start_token) = think_start_token && next_token == start_token {
+            if let Some(start_token) = think_start_token
+                && next_token == start_token
+            {
                 in_thinking = true;
                 thinking_tokens = 0;
             }

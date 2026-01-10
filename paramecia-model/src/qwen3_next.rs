@@ -1935,9 +1935,7 @@ impl MoeBlock {
 
         // Use GPU-grouped path when experts on CPU but hidden states on GPU
         // This keeps expert indices on GPU for sorting, minimizing sync overhead
-        let use_gpu_grouped = !training_mode
-            && all_experts_on_cpu
-            && hidden_on_gpu;
+        let use_gpu_grouped = !training_mode && all_experts_on_cpu && hidden_on_gpu;
 
         let result = if use_batched {
             // Use batched indexed_moe_forward CUDA kernels (fastest - all on GPU)
@@ -2117,9 +2115,7 @@ impl MoeBlock {
         let all_experts_on_cpu = !matches!(self.experts.gate_exps.device(), Device::Cuda(_))
             && !matches!(self.experts.up_exps.device(), Device::Cuda(_))
             && !matches!(self.experts.down_exps.device(), Device::Cuda(_));
-        let use_parallel = remaining_experts.len() > 1
-            && all_experts_on_cpu
-            && !training_mode;
+        let use_parallel = remaining_experts.len() > 1 && all_experts_on_cpu && !training_mode;
 
         if use_parallel {
             // Parallel expert processing using Tokio's blocking pool
@@ -2365,9 +2361,10 @@ impl FullAttention {
             }
 
             // Append new K/V and get dequantized result
-            let cache = self.quantized_cache.as_mut().ok_or_else(|| {
-                candle::Error::Msg("missing quantized KV cache".to_string())
-            })?;
+            let cache = self
+                .quantized_cache
+                .as_mut()
+                .ok_or_else(|| candle::Error::Msg("missing quantized KV cache".to_string()))?;
             let (cached_k, cached_v) = cache.append(&k, &v)?;
 
             // Convert back to model dtype for attention computation
@@ -2732,7 +2729,6 @@ impl FullAttention {
             .map(|c| c.seq_len)
             .unwrap_or(0)
     }
-
 }
 
 // ============================================================================
@@ -3910,24 +3906,27 @@ impl LinearAttention {
             {
                 // Get gate offset, defaulting to zeros if not present.
                 // If we can't create a zero offset, fall back to an empty prefix cache entry.
-                let gate_offset =
-                    match state.gate_cumsum_offset.as_ref().and_then(|t| t.contiguous().ok()) {
-                        Some(offset) => offset,
-                        None => {
-                            // Create zero offset with correct shape: [batch, num_heads]
-                            let (b, num_heads, _, _) = ssm.dims4().unwrap_or((1, 1, 1, 1));
-                            match Tensor::zeros((b, num_heads), ssm.dtype(), ssm.device()) {
-                                Ok(offset) => offset,
-                                Err(err) => {
-                                    tracing::warn!(
-                                        error = %err,
-                                        "Failed to create zero gate offset for prefix cache"
-                                    );
-                                    return PrefixCacheEntry::Empty;
-                                }
+                let gate_offset = match state
+                    .gate_cumsum_offset
+                    .as_ref()
+                    .and_then(|t| t.contiguous().ok())
+                {
+                    Some(offset) => offset,
+                    None => {
+                        // Create zero offset with correct shape: [batch, num_heads]
+                        let (b, num_heads, _, _) = ssm.dims4().unwrap_or((1, 1, 1, 1));
+                        match Tensor::zeros((b, num_heads), ssm.dtype(), ssm.device()) {
+                            Ok(offset) => offset,
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "Failed to create zero gate offset for prefix cache"
+                                );
+                                return PrefixCacheEntry::Empty;
                             }
                         }
-                    };
+                    }
+                };
                 return PrefixCacheEntry::LinearAttention {
                     ssm_state: ssm,
                     conv_state: conv,

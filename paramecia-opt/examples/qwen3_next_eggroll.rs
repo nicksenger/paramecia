@@ -546,7 +546,6 @@ fn main() -> Result<()> {
                     best_score = score;
                     best_generated_text = gen_result.text.clone();
                 }
-
             } else {
                 // Loss mode: compute cross-entropy loss
                 model.clear_kv_cache();
