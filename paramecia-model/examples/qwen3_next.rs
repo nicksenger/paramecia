@@ -26,7 +26,7 @@ struct Args {
     #[arg(long, default_value = "experts")]
     offload: String,
 
-    /// Disable KV-cache quantization (enabled by default with Q4K 4-bit).
+    /// Disable KV-cache quantization (enabled by default with Q8_0 8-bit).
     #[arg(long)]
     no_kv_quant: bool,
 
@@ -159,8 +159,8 @@ fn main() -> Result<()> {
         println!("KV-Cache Quantization: DISABLED (using F16)");
         KvCacheQuantization::F16
     } else {
-        println!("KV-Cache Quantization: ENABLED (Q4K)");
-        KvCacheQuantization::Q4K
+        println!("KV-Cache Quantization: ENABLED (Q8_0)");
+        KvCacheQuantization::Q8_0
     };
 
     // Load model

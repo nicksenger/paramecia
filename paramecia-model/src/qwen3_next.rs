@@ -9,6 +9,7 @@
 //! - llama.cpp qwen3next implementation
 //! - Delta Net: https://arxiv.org/abs/2406.06484
 //!
+
 use crate::models::with_tracing::QMatMul;
 use crate::quantized_nn::RmsNorm;
 #[cfg(not(feature = "flash-attn"))]
@@ -23,6 +24,7 @@ pub struct LoraAdapter {
     /// B matrix: (in_features, rank)
     pub b: Tensor,
 }
+
 use candle::quantized::{gguf_file, GgmlDType, QStorage, QTensor};
 use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::{Activation, Embedding, Module};
@@ -558,6 +560,57 @@ impl PreallocatedQuantizedKvCache {
             .narrow(3, 0, self.head_dim)?;
 
         Ok((k, v))
+    }
+
+    /// Get K/V tensors as quantized storage for Q8_0 flash attention
+    ///
+    /// Returns (k_storage, v_storage, k_layout, v_layout) for direct
+    /// use with Q8_0 flash attention kernel, avoiding dequantization.
+    #[allow(dead_code)]
+    fn get_kv_storage(&self) -> Result<(QStorage, QStorage, candle::Layout, candle::Layout)> {
+        if self.seq_len == 0 {
+            candle::bail!("Cannot get storage from empty cache");
+        }
+
+        // Calculate how many bytes represent the current sequence
+        let rows_per_position = self.batch_size * self.num_kv_heads;
+        let valid_bytes = self.seq_len * rows_per_position * self.bytes_per_row;
+
+        // Create QStorage from the valid portion of the cache
+        let k_storage = QStorage::from_data(
+            std::borrow::Cow::Borrowed(&self.k_cache[..valid_bytes]),
+            &self.device,
+            self.ggml_dtype,
+        )?;
+        let v_storage = QStorage::from_data(
+            std::borrow::Cow::Borrowed(&self.v_cache[..valid_bytes]),
+            &self.device,
+            self.ggml_dtype,
+        )?;
+
+        // Shape: [batch, seq_len, num_kv_heads, head_dim]
+        let k_shape = candle::Shape::from((
+            self.batch_size,
+            self.seq_len,
+            self.num_kv_heads,
+            self.head_dim,
+        ));
+        let v_shape = k_shape.clone();
+
+        // Underlying row order is position-major:
+        //   offset = (seq * (batch * num_kv_heads) + b * num_kv_heads + h) * bytes_per_row + d
+        let rows_per_position = self.batch_size * self.num_kv_heads;
+        let stride_seq = rows_per_position * self.bytes_per_row;
+        let stride_b = self.num_kv_heads * self.bytes_per_row;
+        let stride_h = self.bytes_per_row;
+        let stride_d = 1;
+
+        let k_layout =
+            candle::Layout::new(k_shape, vec![stride_b, stride_seq, stride_h, stride_d], 0);
+        let v_layout =
+            candle::Layout::new(v_shape, vec![stride_b, stride_seq, stride_h, stride_d], 0);
+
+        Ok((k_storage, v_storage, k_layout, v_layout))
     }
 
     /// Clear the cache
@@ -2346,7 +2399,10 @@ impl FullAttention {
         // KV-cache handling with optional quantization
         // For Q8_0/Q4K: use PreallocatedQuantizedKvCache for memory efficiency
         // For F16/BF16: use PreallocatedKvCache with appropriate dtype
-        let (k, v) = if let Some(ggml_dtype) = self.kv_cache_quantization.to_ggml_dtype() {
+        // KV-cache handling with optional quantization
+        // For Q8_0/Q4K: use PreallocatedQuantizedKvCache for memory efficiency
+        // For F16/BF16: use PreallocatedKvCache with appropriate dtype
+        let (k, v, q8_storage) = if let Some(ggml_dtype) = self.kv_cache_quantization.to_ggml_dtype() {
             // Quantized KV cache mode (Q8_0 or Q4K)
             if self.quantized_cache.is_none() {
                 // First call - initialize quantized cache
@@ -2360,17 +2416,25 @@ impl FullAttention {
                 )?);
             }
 
-            // Append new K/V and get dequantized result
+            // Append new K/V to quantized cache
             let cache = self
                 .quantized_cache
                 .as_mut()
                 .ok_or_else(|| candle::Error::Msg("missing quantized KV cache".to_string()))?;
+            
+            // Append returns dequantized K/V
             let (cached_k, cached_v) = cache.append(&k, &v)?;
 
-            // Convert back to model dtype for attention computation
+            // Prepare storage for q8_0 flash attention if applicable
+            // TODO: Re-enable Q8_0 flash-attention once the CUDA kernel is fully verified.
+            // The current kernel still triggers illegal memory accesses; fallback to
+            // dequantized attention for correctness while keeping quantized cache storage.
+            let q8_storage = None;
+
+            // Convert back to model dtype for fallback attention computation
             let cached_k = cached_k.to_dtype(q.dtype())?.contiguous()?;
             let cached_v = cached_v.to_dtype(q.dtype())?.contiguous()?;
-            (cached_k, cached_v)
+            (cached_k, cached_v, q8_storage)
         } else {
             // Non-quantized mode (F16 or BF16)
             // Optionally convert K/V to the cache dtype before storing
@@ -2414,83 +2478,89 @@ impl FullAttention {
                 (k_for_cache, v_for_cache)
             };
 
-            // Convert back to query dtype for attention if cache dtype differs
-            if cached_k.dtype() != q.dtype() {
-                (
-                    cached_k.to_dtype(q.dtype())?.contiguous()?,
-                    cached_v.to_dtype(q.dtype())?.contiguous()?,
-                )
-            } else {
-                (cached_k, cached_v)
-            }
-        };
-
+                        // Convert back to query dtype for attention if cache dtype differs
+                        let (cached_k, cached_v) = if cached_k.dtype() != q.dtype() {
+                            (
+                                cached_k.to_dtype(q.dtype())?.contiguous()?,
+                                cached_v.to_dtype(q.dtype())?.contiguous()?,
+                            )
+                        } else {
+                            (cached_k, cached_v)
+                        };
+            
+                        (cached_k, cached_v, None)
+                    };
         // Compute attention - use flash attention when available, otherwise standard SDPA
-        #[cfg(feature = "flash-attn")]
-        let attn_output = {
-            let input_dtype = q.dtype();
+        let attn_output = if let Some((k_storage, v_storage, k_layout, v_layout)) = q8_storage {
+            // Use Q8_0 flash attention kernel
+            // q is currently [b, h, l, d], transpose to [b, l, h, d]
+            let q_perm = q.transpose(1, 2)?.contiguous()?;
+            let q_l = q_perm.layout();
 
-            // Flash attention only supports F16/BF16, convert if needed
-            let (q_fa, k_fa, v_fa, needs_convert) = if input_dtype == DType::F32 {
-                (
-                    q.to_dtype(DType::F16)?,
-                    k.to_dtype(DType::F16)?,
-                    v.to_dtype(DType::F16)?,
-                    true,
-                )
-            } else {
-                (q, k, v, false)
-            };
+            // Typically apply causal mask if processing more than 1 token
+            let causal = l > 1;
 
-            // Flash attention expects (batch, seq, heads, head_dim) format
-            // Current tensors are (batch, heads, seq, head_dim), so transpose back
-            let q_fa = q_fa.transpose(1, 2)?.contiguous()?;
-            let k_fa = k_fa.transpose(1, 2)?.contiguous()?;
-            let v_fa = v_fa.transpose(1, 2)?.contiguous()?;
+            crate::ops::flash_attn_q8(
+                &q_perm,
+                &k_storage,
+                &v_storage,
+                &q_l,
+                &k_layout,
+                &v_layout,
+                (1.0 / (self.head_dim as f64).sqrt()) as f32,
+                b,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                l,
+                self.cache_seq_len(),
+                causal,
+            )?
+            .reshape((b, l, self.num_heads * self.head_dim))?
+        } else {
+            #[cfg(feature = "flash-attn")]
+            {
+                // Standard Flash Attention (F16/BF16)
+                // q, k, v are [b, h, l, d], transpose to [b, l, h, d]
+                let q_perm = q.transpose(1, 2)?.contiguous()?;
+                let k_perm = k.transpose(1, 2)?.contiguous()?;
+                let v_perm = v.transpose(1, 2)?.contiguous()?;
 
-            let scale = 1f32 / (self.head_dim as f32).sqrt();
-            // Flash attention handles GQA natively and applies causal mask internally
-            let is_causal = attn_mask.is_some();
-            let attn_out = candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, scale, is_causal)?;
-
-            // Convert back to original dtype if we converted
-            let attn_out = if needs_convert {
-                attn_out.to_dtype(input_dtype)?
-            } else {
-                attn_out
-            };
-
-            // Output is (batch, seq, heads, head_dim), reshape to (batch, seq, hidden)
-            attn_out
+                candle_flash_attn::flash_attn(
+                    &q_perm,
+                    &k_perm,
+                    &v_perm,
+                    (1.0 / (self.head_dim as f64).sqrt()) as f32,
+                    l > 1, // causal
+                )?
                 .reshape((b, l, self.num_heads * self.head_dim))?
-                .contiguous()?
-        };
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            {
+                // Repeat KV heads for grouped-query attention
+                let k = repeat_kv(k, self.num_kv_groups)?;
+                let v = repeat_kv(v, self.num_kv_groups)?;
 
-        #[cfg(not(feature = "flash-attn"))]
-        let attn_output = {
-            // Repeat KV heads for grouped-query attention
-            let k = repeat_kv(k, self.num_kv_groups)?;
-            let v = repeat_kv(v, self.num_kv_groups)?;
+                // Compute attention
+                let scale = 1f64 / (self.head_dim as f64).sqrt();
+                let k_t = k.transpose(2, 3)?.contiguous()?;
+                let attn_scores = (q.contiguous()?.matmul(&k_t)? * scale)?;
+                let attn_scores = match attn_mask {
+                    None => attn_scores,
+                    Some(mask) => attn_scores.broadcast_add(mask)?,
+                };
 
-            // Compute attention
-            let scale = 1f64 / (self.head_dim as f64).sqrt();
-            let k_t = k.transpose(2, 3)?.contiguous()?;
-            let attn_scores = (q.contiguous()?.matmul(&k_t)? * scale)?;
-            let attn_scores = match attn_mask {
-                None => attn_scores,
-                Some(mask) => attn_scores.broadcast_add(mask)?,
-            };
+                // Clamp attention scores to prevent softmax overflow during training
+                let attn_scores_clamped = attn_scores.clamp(-100.0, 100.0)?;
+                let attn_weights = candle_nn::ops::softmax_last_dim(&attn_scores_clamped)?;
+                let attn_output = attn_weights.matmul(&v.contiguous()?)?;
 
-            // Clamp attention scores to prevent softmax overflow during training
-            let attn_scores_clamped = attn_scores.clamp(-100.0, 100.0)?;
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_scores_clamped)?;
-            let attn_output = attn_weights.matmul(&v.contiguous()?)?;
-
-            // Reshape attention output
-            attn_output
-                .transpose(1, 2)?
-                .reshape((b, l, self.num_heads * self.head_dim))?
-                .contiguous()?
+                // Reshape attention output
+                attn_output
+                    .transpose(1, 2)?
+                    .reshape((b, l, self.num_heads * self.head_dim))?
+                    .contiguous()?
+            }
         };
 
         // Apply gating if present

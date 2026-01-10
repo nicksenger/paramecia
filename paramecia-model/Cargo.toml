@@ -5,9 +5,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-candle = { package = "candle-core", git = "https://github.com/nicksenger/candle.git", branch = "paramecia" }
-candle-nn = { package = "candle-nn", git = "https://github.com/nicksenger/candle.git", branch = "paramecia" }
-candle-flash-attn = { git = "https://github.com/nicksenger/candle.git", branch = "paramecia", optional = true }
+candle = { package = "candle-core", path = "../../qzo/candle-core" }
+candle-nn = { package = "candle-nn", path = "../../qzo/candle-nn" }
+candle-flash-attn = { path = "../../qzo/candle-flash-attn", optional = true }
 crossbeam = "0.8"
 half = "2.4"
 rand = "0.9.0"
