@@ -10,7 +10,7 @@ pub mod utils;
 
 pub use generation::{LogitsProcessor, Sampling};
 pub use qwen3_next::{
-    DeviceOffloadMode, KvCacheQuantization, LoraAdapter, ModelWeights, MtpWeights, PrefixCache,
+    DeviceOffloadMode, KvCacheQuantization, LoraAdapter, ModelWeights, PrefixCache,
 };
 
 /// Token output stream for streaming text generation

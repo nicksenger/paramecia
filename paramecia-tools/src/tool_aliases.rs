@@ -334,8 +334,9 @@ impl ToolAliasConfig {
                 // Rename required fields
                 for item in required.iter_mut() {
                     if let Value::String(s) = item
-                        && let Some(new_name) = transform.renames.get(s) {
-                            *s = new_name.clone();
+                        && let Some(new_name) = transform.renames.get(s)
+                    {
+                        *s = new_name.clone();
                     }
                 }
 

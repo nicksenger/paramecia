@@ -226,7 +226,8 @@ async fn run_worker(
                 });
 
                 // Run the agent (this is where inference happens)
-                let mut act_future = Box::pin(agent.act_with_cancellation(&prompt, event_tx, cancelled_for_agent));
+                let mut act_future =
+                    Box::pin(agent.act_with_cancellation(&prompt, event_tx, cancelled_for_agent));
                 let mut act_result: Option<Result<(), paramecia_harness::error::VibeError>> = None;
                 let mut shutdown_requested = false;
                 let mut interrupted = false;
@@ -274,7 +275,9 @@ async fn run_worker(
                     Some(Ok(())) => {
                         if interrupted {
                             let _ = result_tx
-                                .send(AgentResult::Error("Agent action was interrupted by user".to_string()))
+                                .send(AgentResult::Error(
+                                    "Agent action was interrupted by user".to_string(),
+                                ))
                                 .await;
                         } else {
                             let _ = result_tx

@@ -842,9 +842,7 @@ impl App {
         self.game_of_life.resize(gol_width, gol_height);
 
         // Render Game of Life as background
-        let gol_cells = self
-            .game_of_life
-            .render(self.color_index, colors::GRADIENT);
+        let gol_cells = self.game_of_life.render(self.color_index, colors::GRADIENT);
         for (y, row) in gol_cells.iter().enumerate() {
             for (x, &(ch, color)) in row.iter().enumerate() {
                 if ch == ' ' {
@@ -1257,8 +1255,7 @@ impl App {
         for (line_idx, line) in content.split('\n').enumerate() {
             let line_start = global_byte_offset;
             let line_end = line_start + line.len();
-            let contains_cursor =
-                cursor_byte.is_some_and(|c| c >= line_start && c <= line_end);
+            let contains_cursor = cursor_byte.is_some_and(|c| c >= line_start && c <= line_end);
 
             let mut line_content = line.to_string();
             if contains_cursor && let Some(cursor) = cursor_byte {

@@ -354,8 +354,10 @@ impl Agent {
         event_tx: mpsc::Sender<AgentEvent>,
     ) -> VibeResult<()> {
         // Reset cancellation flag
-        self.cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
-        self.act_with_cancellation(user_message, event_tx, self.cancelled.clone()).await
+        self.cancelled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.act_with_cancellation(user_message, event_tx, self.cancelled.clone())
+            .await
     }
 
     /// Process a user message and stream events with external cancellation.
@@ -474,7 +476,11 @@ impl Agent {
         }
     }
 
-    async fn conversation_loop(&mut self, tx: mpsc::Sender<AgentEvent>, cancelled: Arc<std::sync::atomic::AtomicBool>) -> VibeResult<()> {
+    async fn conversation_loop(
+        &mut self,
+        tx: mpsc::Sender<AgentEvent>,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> VibeResult<()> {
         loop {
             // Run before-turn middleware
             let context = ConversationContext {
@@ -535,7 +541,8 @@ impl Agent {
 
             // Perform LLM turn
             self.stats.steps += 1;
-            let (should_continue, user_cancelled) = self.perform_llm_turn(&tx, Arc::clone(&cancelled)).await?;
+            let (should_continue, user_cancelled) =
+                self.perform_llm_turn(&tx, Arc::clone(&cancelled)).await?;
 
             if user_cancelled {
                 // User cancelled during tool execution, stop the loop

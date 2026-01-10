@@ -424,7 +424,10 @@ fn normalize_table_block(lines: &[String]) -> Vec<String> {
 
         let replaced = normalize_delimiters(line);
         let trimmed = replaced.trim_matches('|');
-        let cells: Vec<String> = trimmed.split('|').map(|cell| cell.trim().to_string()).collect();
+        let cells: Vec<String> = trimmed
+            .split('|')
+            .map(|cell| cell.trim().to_string())
+            .collect();
 
         if cells.iter().all(|cell| cell.is_empty()) {
             continue;
@@ -542,12 +545,7 @@ impl TableState {
     }
 
     fn column_count(&self) -> usize {
-        let header_columns = self
-            .header_rows
-            .iter()
-            .map(Vec::len)
-            .max()
-            .unwrap_or(0);
+        let header_columns = self.header_rows.iter().map(Vec::len).max().unwrap_or(0);
         let body_columns = self.body_rows.iter().map(Vec::len).max().unwrap_or(0);
         header_columns.max(body_columns)
     }
@@ -560,11 +558,7 @@ fn compute_column_widths(table: &TableState, max_table_width: usize) -> Vec<usiz
     }
 
     let mut column_widths = vec![1usize; column_count];
-    for row in table
-        .header_rows
-        .iter()
-        .chain(table.body_rows.iter())
-    {
+    for row in table.header_rows.iter().chain(table.body_rows.iter()) {
         for (idx, cell) in row.iter().enumerate() {
             column_widths[idx] = column_widths[idx].max(spans_width(cell));
         }
@@ -575,8 +569,8 @@ fn compute_column_widths(table: &TableState, max_table_width: usize) -> Vec<usiz
         return vec![1; column_count];
     }
 
-    let max_content_width = max_table_width
-        .saturating_sub(3usize.saturating_mul(column_count).saturating_add(1));
+    let max_content_width =
+        max_table_width.saturating_sub(3usize.saturating_mul(column_count).saturating_add(1));
     if max_content_width == 0 {
         return vec![1; column_count];
     }
@@ -631,10 +625,7 @@ fn distribute_column_widths(column_widths: Vec<usize>, max_total_content: usize)
 
     let mut remaining = max_total_content.saturating_sub(scaled_widths.iter().sum());
 
-    remainders.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    remainders.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut remainder_idx = 0usize;
     while remaining > 0 && !remainders.is_empty() {
@@ -705,10 +696,7 @@ fn wrap_row_cells(
         .iter()
         .enumerate()
         .map(|(idx, width)| {
-            let cell = row
-                .get(idx)
-                .cloned()
-                .unwrap_or_else(|| vec![Span::raw("")]);
+            let cell = row.get(idx).cloned().unwrap_or_else(|| vec![Span::raw("")]);
             wrap_cell_spans(&cell, *width)
         })
         .collect()
@@ -738,10 +726,7 @@ fn render_table_rows(
                     .and_then(|cell| cell.get(line_idx))
                     .cloned()
                     .unwrap_or_else(Vec::new);
-                let alignment = alignments
-                    .get(col_idx)
-                    .copied()
-                    .unwrap_or(Alignment::Left);
+                let alignment = alignments.get(col_idx).copied().unwrap_or(Alignment::Left);
                 let content_width = spans_width(&line_spans).min(*col_width);
                 let remaining = col_width.saturating_sub(content_width);
                 let (left_pad, right_pad) = match alignment {

@@ -13,10 +13,7 @@ use std::path::Path;
 ///
 /// These messages are injected into the conversation history after the system
 /// prompt to teach the model the correct format for tool calls.
-pub fn generate_multishot_examples(
-    tool_manager: &ToolManager,
-    workdir: &Path,
-) -> Vec<LlmMessage> {
+pub fn generate_multishot_examples(tool_manager: &ToolManager, workdir: &Path) -> Vec<LlmMessage> {
     let mut messages = Vec::new();
 
     // Only add examples for tools that are actually available

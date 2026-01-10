@@ -687,3 +687,93 @@ mod tests {
         Ok(())
     }
 }
+
+/// Flash attention with Q8_0 quantized K/V cache
+///
+/// Uses optimized CUDA kernel that dequantizes K and V on-the-fly during attention
+/// computation, avoiding the memory overhead of dequantizing the
+/// entire KV cache before flash attention.
+///
+/// # Memory Savings
+///
+/// Current approach (dequantize before flash attention):
+///   - Quantized K/V: ~1 GB
+///   - Dequantized K/V: ~4 GB
+///   - Working memory: ~0.5 GB
+///   - Total: ~5.5 GB
+///
+/// With Q8_0 flash attention:
+///   - Quantized K/V: ~1 GB
+///   - Output: ~2 GB
+///   - Working memory: ~0.5 GB
+///   - Total: ~3.5 GB
+///
+/// # Usage Example
+///
+/// ```rust,ignore
+/// use paramecia_model::ops;
+/// use candle::DType;
+///
+/// // K and V are Q8_0 quantized in KV cache
+/// let output = ops::flash_attn_q8(
+///     &q_f32,
+///     &k_storage,
+///     &v_storage,
+///     &q_layout,
+///     &k_layout,
+///     &v_layout,
+///     scale,
+///     batch, num_heads, num_kv_heads, head_dim,
+///     seq_q, seq_k,
+///     causal,
+/// )?;
+/// ```
+///
+/// # Arguments
+///
+/// * `q` - Query tensor: [batch, seq_q, num_heads, head_dim] - F32
+/// * `k_storage` - Key cache as QStorage (Q8_0 quantized)
+/// * `v_storage` - Value cache as QStorage (Q8_0 quantized)
+/// * `scale` - Attention scaling factor (1 / sqrt(head_dim))
+/// * `batch` - Batch size
+/// * `num_heads` - Number of query heads
+/// * `num_kv_heads` - Number of KV heads (for GQA - may be < num_heads)
+/// * `head_dim` - Head dimension (must be 64, 128, or 256)
+/// * `seq_q` - Query sequence length
+/// * `seq_k` - KV cache sequence length
+/// * `causal` - Whether to apply causal masking
+///
+/// # Returns
+///
+/// Output tensor: [batch, seq_q, num_heads, head_dim] - F32
+///
+/// # Limitations
+///
+/// - Only supports Q8_0 quantization (F16/BF16 use existing candle-flash-attn)
+/// - Only works with CUDA backend
+/// - Head dimension must be 64, 128, or 256 (common sizes)
+/// - Simplified kernel - not as optimized as llama.cpp's full implementation
+pub fn flash_attn_q8(
+    q: &Tensor,
+    k_storage: &candle::quantized::QStorage,
+    v_storage: &candle::quantized::QStorage,
+    q_l: &candle::Layout,
+    k_l: &candle::Layout,
+    v_l: &candle::Layout,
+    scale: f32,
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_q: usize,
+    seq_k: usize,
+    causal: bool,
+) -> Result<Tensor> {
+    // Delegate to candle-core's implementation
+    candle::deltanet_ops::flash_attn_q8(
+        q, k_storage, v_storage,
+        q_l, k_l, v_l,
+        scale, batch, num_heads, num_kv_heads, head_dim,
+        seq_q, seq_k, causal,
+    )
+}

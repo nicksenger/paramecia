@@ -109,16 +109,13 @@ fn compute_replicate_score(
     cosine_weight * cosine_sim + hirschberg_weight * hirschberg
 }
 
-/// Result of text generation including MTP statistics.
+/// Result of text generation.
 struct GenerationResult {
     text: String,
     tokens: Vec<u32>,
-    /// MTP acceptance rate (0.0-1.0), None if MTP not used
-    mtp_acceptance_rate: Option<f32>,
 }
 
 /// Generate text from a prompt using greedy sampling.
-/// If MTP is available, uses speculative decoding and tracks acceptance rate.
 fn generate_text(
     model: &mut ModelWeights,
     tokenizer: &Tokenizer,
@@ -127,98 +124,31 @@ fn generate_text(
     device: &Device,
 ) -> Result<GenerationResult> {
     let mut generated_tokens = prompt_tokens.to_vec();
-    let use_mtp = model.has_mtp();
 
-    // Track MTP statistics
-    let mut mtp_total_predictions = 0usize;
-    let mut mtp_accepted_predictions = 0usize;
+    for _ in 0..max_new_tokens {
+        let input = Tensor::new(&generated_tokens[..], device)?.unsqueeze(0)?;
+        model.clear_kv_cache();
+        let logits = model.forward(&input, 0)?;
 
-    if use_mtp {
-        // Use speculative decoding with MTP
-        let num_speculative = 3; // Number of tokens to speculate per step
-        let mut tokens_generated = 0;
+        // Greedy sampling: take argmax
+        let next_token = logits.argmax(candle::D::Minus1)?.to_vec1::<u32>()?[0];
 
-        while tokens_generated < max_new_tokens {
-            let input = Tensor::new(&generated_tokens[..], device)?.unsqueeze(0)?;
-            model.clear_kv_cache();
-
-            // Greedy sampling function
-            let sample_fn = |logits: &Tensor| -> Result<u32> {
-                logits.argmax(candle::D::Minus1)?.to_scalar::<u32>()
-            };
-
-            let (_logits, accepted_tokens, num_accepted) =
-                model.forward_speculative(&input, 0, num_speculative, sample_fn)?;
-
-            // Track MTP acceptance rate
-            mtp_total_predictions += num_speculative;
-            mtp_accepted_predictions += num_accepted;
-
-            // No tokens accepted means generation should stop
-            if accepted_tokens.is_empty() {
-                break;
-            }
-
-            // Add accepted tokens
-            let mut hit_eos = false;
-            for token in accepted_tokens.iter() {
-                // Check for EOS
-                if *token == 151643 {
-                    hit_eos = true;
-                    break;
-                }
-                generated_tokens.push(*token);
-                tokens_generated += 1;
-            }
-
-            if hit_eos {
-                break;
-            }
+        // Check for EOS (assuming token 151643 is EOS for Qwen)
+        if next_token == 151643 {
+            break;
         }
 
-        let text = tokenizer
-            .decode(&generated_tokens, true)
-            .map_err(|e| candle::Error::Msg(format!("Decode error: {}", e)))?;
-
-        let mtp_rate = if mtp_total_predictions > 0 {
-            Some(mtp_accepted_predictions as f32 / mtp_total_predictions as f32)
-        } else {
-            None
-        };
-
-        Ok(GenerationResult {
-            text,
-            tokens: generated_tokens,
-            mtp_acceptance_rate: mtp_rate,
-        })
-    } else {
-        // Fallback: simple greedy decoding without MTP
-        for _ in 0..max_new_tokens {
-            let input = Tensor::new(&generated_tokens[..], device)?.unsqueeze(0)?;
-            model.clear_kv_cache();
-            let logits = model.forward(&input, 0)?;
-
-            // Greedy sampling: take argmax
-            let next_token = logits.argmax(candle::D::Minus1)?.to_vec1::<u32>()?[0];
-
-            // Check for EOS (assuming token 151643 is EOS for Qwen)
-            if next_token == 151643 {
-                break;
-            }
-
-            generated_tokens.push(next_token);
-        }
-
-        let text = tokenizer
-            .decode(&generated_tokens, true)
-            .map_err(|e| candle::Error::Msg(format!("Decode error: {}", e)))?;
-
-        Ok(GenerationResult {
-            text,
-            tokens: generated_tokens,
-            mtp_acceptance_rate: None,
-        })
+        generated_tokens.push(next_token);
     }
+
+    let text = tokenizer
+        .decode(&generated_tokens, true)
+        .map_err(|e| candle::Error::Msg(format!("Decode error: {}", e)))?;
+
+    Ok(GenerationResult {
+        text,
+        tokens: generated_tokens,
+    })
 }
 
 /// Show top predictions from logits
@@ -616,31 +546,9 @@ fn main() -> Result<()> {
                     best_score = score;
                     best_generated_text = gen_result.text.clone();
                 }
-
-                // Set MTP fitness from the generation process (no separate forward pass needed)
-                if let Some(mtp_rate) = gen_result.mtp_acceptance_rate {
-                    optimizer.population_mut()[member_idx].mtp_fitness = Some(mtp_rate);
-                }
             } else {
                 // Loss mode: compute cross-entropy loss
                 model.clear_kv_cache();
-
-                // If MTP is available, use speculative forward to get MTP stats
-                if model.has_mtp() {
-                    let sample_fn = |logits: &Tensor| -> Result<u32> {
-                        logits.argmax(candle::D::Minus1)?.to_scalar::<u32>()
-                    };
-                    let num_speculative = 3;
-                    let (_logits, _accepted, num_accepted) =
-                        model.forward_speculative(&input_ids, 0, num_speculative, sample_fn)?;
-
-                    // MTP acceptance rate from the forward pass
-                    let mtp_rate = num_accepted as f32 / num_speculative as f32;
-                    optimizer.population_mut()[member_idx].mtp_fitness = Some(mtp_rate);
-
-                    // Now compute loss with a fresh forward pass
-                    model.clear_kv_cache();
-                }
 
                 let (logits, _router_stats) = model.forward_training(&input_ids, 0)?;
                 let loss = compute_cross_entropy_loss(&logits, &target_ids)?;
@@ -664,7 +572,7 @@ fn main() -> Result<()> {
             .population()
             .iter()
             .filter_map(|m| m.fitness)
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .max_by(|a, b| a.total_cmp(b))
             .unwrap_or(0.0);
 
         // Perform EGGROLL update
@@ -755,9 +663,6 @@ fn main() -> Result<()> {
         println!("Final Replicate Score: {:.5}", final_score);
         println!("  Cosine Similarity:   {:.5}", final_cosine);
         println!("  Hirschberg Alignment: {:.5}", final_hirschberg);
-        if let Some(mtp_rate) = final_result.mtp_acceptance_rate {
-            println!("  MTP Acceptance Rate:  {:.1}%", mtp_rate * 100.0);
-        }
         println!();
         println!("Summary:");
         println!("  Best score:   {:.5}", best_score);
