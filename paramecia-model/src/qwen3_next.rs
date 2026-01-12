@@ -28,6 +28,11 @@ pub struct LoraAdapter {
 use candle::quantized::{gguf_file, GgmlDType, QStorage, QTensor};
 use candle::{DType, Device, Result, Tensor, D};
 use candle_nn::{Activation, Embedding, Module};
+
+/// Helper function to check if a device is a GPU (CUDA or Metal)
+fn is_gpu_device(device: &Device) -> bool {
+    matches!(device, Device::Cuda(_) | Device::Metal(_))
+}
 use std::io::{Read, Seek};
 use std::path::Path;
 
@@ -423,7 +428,7 @@ impl PreallocatedQuantizedKvCache {
     /// to the pre-allocated buffer at the current position.
     ///
     /// new_k, new_v shape: [batch, num_kv_heads, new_seq_len, head_dim]
-    fn append(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor)> {
+    fn append_quantized(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
         let new_seq_len = new_k.dim(2)?;
         let new_end = self.seq_len + new_seq_len;
 
@@ -457,13 +462,29 @@ impl PreallocatedQuantizedKvCache {
             (new_k.clone(), new_v.clone())
         };
 
-        // Convert to F32 for quantization if needed
-        let new_k_f32 = new_k_padded.to_dtype(DType::F32)?.contiguous()?;
-        let new_v_f32 = new_v_padded.to_dtype(DType::F32)?.contiguous()?;
+        // IMPORTANT: This cache stores quantized bytes in seq-major layout:
+        //   [seq, batch, head, d]
+        // so that the first `seq_len` tokens are a single contiguous prefix in memory.
+        //
+        // This makes appends O(new_tokens) (single memcpy) and enables `valid_bytes`
+        // to be a contiguous slice.
+        let new_k_seq_major = new_k_padded.permute((2, 0, 1, 3))?.contiguous()?;
+        let new_v_seq_major = new_v_padded.permute((2, 0, 1, 3))?.contiguous()?;
+
+        // Quantization currently runs on CPU for CUDA; avoid pointless
+        // CPU->GPU->CPU roundtrips by quantizing on CPU directly.
+        let new_k_cpu = new_k_seq_major
+            .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
+            .contiguous()?;
+        let new_v_cpu = new_v_seq_major
+            .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
+            .contiguous()?;
 
         // Quantize only the new tokens
-        let new_k_qtensor = QTensor::quantize(&new_k_f32.flatten_all()?, self.ggml_dtype)?;
-        let new_v_qtensor = QTensor::quantize(&new_v_f32.flatten_all()?, self.ggml_dtype)?;
+        let new_k_qtensor = QTensor::quantize(&new_k_cpu, self.ggml_dtype)?;
+        let new_v_qtensor = QTensor::quantize(&new_v_cpu, self.ggml_dtype)?;
 
         // Get the raw quantized bytes
         let new_k_bytes = new_k_qtensor.data()?;
@@ -484,7 +505,14 @@ impl PreallocatedQuantizedKvCache {
 
         self.seq_len = new_end;
 
-        // Dequantize and return the full cache up to current position
+        Ok(())
+    }
+
+    /// Backwards-compatible helper: append then dequantize the full cache.
+    ///
+    /// This is expensive (O(seq_len)) and should be avoided on the hot path.
+    fn append(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.append_quantized(new_k, new_v)?;
         self.get_kv()
     }
 
@@ -521,42 +549,26 @@ impl PreallocatedQuantizedKvCache {
             self.ggml_dtype,
         )?;
 
-        // Create QTensor from the storage
+        // Storage is seq-major: [seq, batch, head, d]
         let k_qtensor = QTensor::new(
             k_storage,
-            (
-                self.batch_size * self.num_kv_heads * self.seq_len,
-                self.padded_head_dim,
-            ),
+            (self.seq_len, self.batch_size, self.num_kv_heads, self.padded_head_dim),
         )?;
         let v_qtensor = QTensor::new(
             v_storage,
-            (
-                self.batch_size * self.num_kv_heads * self.seq_len,
-                self.padded_head_dim,
-            ),
+            (self.seq_len, self.batch_size, self.num_kv_heads, self.padded_head_dim),
         )?;
 
         // Dequantize
         let k_deq = k_qtensor.dequantize(&self.device)?;
         let v_deq = v_qtensor.dequantize(&self.device)?;
 
-        // Reshape and trim padding
+        // Convert to [batch, head, seq, d] and trim padding.
         let k = k_deq
-            .reshape((
-                self.batch_size,
-                self.num_kv_heads,
-                self.seq_len,
-                self.padded_head_dim,
-            ))?
+            .permute((1, 2, 0, 3))?
             .narrow(3, 0, self.head_dim)?;
         let v = v_deq
-            .reshape((
-                self.batch_size,
-                self.num_kv_heads,
-                self.seq_len,
-                self.padded_head_dim,
-            ))?
+            .permute((1, 2, 0, 3))?
             .narrow(3, 0, self.head_dim)?;
 
         Ok((k, v))
@@ -588,27 +600,18 @@ impl PreallocatedQuantizedKvCache {
             self.ggml_dtype,
         )?;
 
-        // Shape: [batch, seq_len, num_kv_heads, head_dim]
-        let k_shape = candle::Shape::from((
-            self.batch_size,
-            self.seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ));
+        // Storage is seq-major: [seq, batch, head, d], exposed as [batch, seq, head, d].
+        let k_shape = candle::Shape::from((self.batch_size, self.seq_len, self.num_kv_heads, self.head_dim));
         let v_shape = k_shape.clone();
 
-        // Underlying row order is position-major:
-        //   offset = (seq * (batch * num_kv_heads) + b * num_kv_heads + h) * bytes_per_row + d
-        let _stride_d = 1;
-        let stride_h = self.bytes_per_row;
-        let stride_seq = self.num_kv_heads * self.bytes_per_row;
-        let stride_b = self.seq_len * stride_seq;
+        // Strides are in bytes (packed rows); `*_stride_d` is unused by the kernel.
         let stride_d = 1;
+        let stride_h = self.bytes_per_row;
+        let stride_b = self.num_kv_heads * self.bytes_per_row;
+        let stride_seq = self.batch_size * self.num_kv_heads * self.bytes_per_row;
 
-        let k_layout =
-            candle::Layout::new(k_shape, vec![stride_b, stride_seq, stride_h, stride_d], 0);
-        let v_layout =
-            candle::Layout::new(v_shape, vec![stride_b, stride_seq, stride_h, stride_d], 0);
+        let k_layout = candle::Layout::new(k_shape, vec![stride_b, stride_seq, stride_h, stride_d], 0);
+        let v_layout = candle::Layout::new(v_shape, vec![stride_b, stride_seq, stride_h, stride_d], 0);
 
         Ok((k_storage, v_storage, k_layout, v_layout))
     }
@@ -1355,15 +1358,14 @@ impl MoeExperts {
         // Note: We expect F32 input (model uses F32 activations to match llama.cpp)
         let hidden_expanded = hidden_states.unsqueeze(1)?;
 
-        // Gate projection: [n_tokens, 1, hidden_dim] @ gate_exps -> [n_tokens, top_k, n_ff]
-        let gate_out = self
-            .gate_exps
-            .indexed_moe_forward(&hidden_expanded, expert_indices)?;
-
-        // Up projection: [n_tokens, 1, hidden_dim] @ up_exps -> [n_tokens, top_k, n_ff]
-        let up_out = self
-            .up_exps
-            .indexed_moe_forward(&hidden_expanded, expert_indices)?;
+        // Try fused gate+up kernel (reads input once, halves memory bandwidth)
+        // Falls back to separate calls if fused kernel not available for this dtype
+        let (gate_out, up_out) = QTensor::indexed_moe_gate_up(
+            &self.gate_exps,
+            &self.up_exps,
+            &hidden_expanded,
+            expert_indices,
+        )?;
 
         // Fused SwiGLU activation: silu(gate) * up
         let activated = crate::ops::fused_swiglu(&gate_out, &up_out)?;
@@ -1395,8 +1397,8 @@ impl MoeExperts {
     fn supports_batched_forward(&self) -> bool {
         use candle::quantized::GgmlDType;
 
-        // Check if we're on CUDA
-        if !matches!(self.compute_device, Device::Cuda(_)) {
+        // Check if we're on a GPU (CUDA or Metal)
+        if !is_gpu_device(&self.compute_device) {
             return false;
         }
 
@@ -1412,11 +1414,11 @@ impl MoeExperts {
                 | GgmlDType::Q8_0
         );
 
-        // All expert projections must be on CUDA for indexed_moe_forward
+        // All expert projections must be on GPU for indexed_moe_forward
         supported
-            && matches!(self.gate_exps.device(), Device::Cuda(_))
-            && matches!(self.up_exps.device(), Device::Cuda(_))
-            && matches!(self.down_exps.device(), Device::Cuda(_))
+            && is_gpu_device(&self.gate_exps.device())
+            && is_gpu_device(&self.up_exps.device())
+            && is_gpu_device(&self.down_exps.device())
     }
 
     fn forward_expert(&mut self, hidden_states: &Tensor, expert_idx: usize) -> Result<Tensor> {
@@ -1976,12 +1978,12 @@ impl MoeBlock {
         let supports_batched = self.experts.supports_batched_forward();
 
         // Check if all experts are on CPU (can use optimized CPU paths)
-        let all_experts_on_cpu = !matches!(self.experts.gate_exps.device(), Device::Cuda(_))
-            && !matches!(self.experts.up_exps.device(), Device::Cuda(_))
-            && !matches!(self.experts.down_exps.device(), Device::Cuda(_));
+        let all_experts_on_cpu = !is_gpu_device(&self.experts.gate_exps.device())
+            && !is_gpu_device(&self.experts.up_exps.device())
+            && !is_gpu_device(&self.experts.down_exps.device());
 
         // Check if hidden states are on GPU (can use GPU-side grouping)
-        let hidden_on_gpu = matches!(hidden_flat.device(), Device::Cuda(_));
+        let hidden_on_gpu = is_gpu_device(hidden_flat.device());
 
         // Always use batched when supported (avoids GPU->CPU sync)
         let use_batched = !training_mode && supports_batched;
@@ -2165,9 +2167,9 @@ impl MoeBlock {
         // Check if we should use parallel processing for remaining
         // Parallel is beneficial when we have multiple experts and ALL weights are on CPU
         // (the parallel path processes entire expert on CPU, so mixed GPU/CPU doesn't work)
-        let all_experts_on_cpu = !matches!(self.experts.gate_exps.device(), Device::Cuda(_))
-            && !matches!(self.experts.up_exps.device(), Device::Cuda(_))
-            && !matches!(self.experts.down_exps.device(), Device::Cuda(_));
+        let all_experts_on_cpu = !is_gpu_device(&self.experts.gate_exps.device())
+            && !is_gpu_device(&self.experts.up_exps.device())
+            && !is_gpu_device(&self.experts.down_exps.device());
         let use_parallel = remaining_experts.len() > 1 && all_experts_on_cpu && !training_mode;
 
         if use_parallel {
@@ -2402,109 +2404,142 @@ impl FullAttention {
         // KV-cache handling with optional quantization
         // For Q8_0/Q4K: use PreallocatedQuantizedKvCache for memory efficiency
         // For F16/BF16: use PreallocatedKvCache with appropriate dtype
-        let (k, v, q8_storage) = if let Some(ggml_dtype) = self.kv_cache_quantization.to_ggml_dtype() {
-            // Quantized KV cache mode (Q8_0 or Q4K)
-            if self.quantized_cache.is_none() {
-                // First call - initialize quantized cache
-                self.quantized_cache = Some(PreallocatedQuantizedKvCache::new(
-                    b,
-                    self.num_kv_heads,
-                    self.max_seq_len,
-                    self.head_dim,
-                    ggml_dtype,
-                    k.device(),
-                )?);
-            }
+        let (k, v, q8_storage) =
+            if let Some(ggml_dtype) = self.kv_cache_quantization.to_ggml_dtype() {
+                // Quantized KV cache mode (Q8_0 or Q4K)
+                if self.quantized_cache.is_none() {
+                    // First call - initialize quantized cache
+                    self.quantized_cache = Some(PreallocatedQuantizedKvCache::new(
+                        b,
+                        self.num_kv_heads,
+                        self.max_seq_len,
+                        self.head_dim,
+                        ggml_dtype,
+                        k.device(),
+                    )?);
+                }
 
-            // Append new K/V to quantized cache
-            let cache = self
-                .quantized_cache
-                .as_mut()
-                .ok_or_else(|| candle::Error::Msg("missing quantized KV cache".to_string()))?;
-            
-            // Append returns dequantized K/V
-            let (cached_k, cached_v) = cache.append(&k, &v)?;
+                // Append new K/V to quantized cache
+                let cache = self
+                    .quantized_cache
+                    .as_mut()
+                    .ok_or_else(|| candle::Error::Msg("missing quantized KV cache".to_string()))?;
 
-            // Prepare storage for q8_0 flash attention if applicable
-            let q8_storage = if ggml_dtype == GgmlDType::Q8_0 && cfg!(feature = "cuda") {
-                match cache.get_kv_storage() {
-                    Ok((k_storage, v_storage, k_layout, v_layout)) => {
-                        Some((k_storage, v_storage, k_layout, v_layout))
+                // Ensure the cache write position matches the rotary offset.
+                // This matters for chunked prefill and any scenario where we rewind (e.g. retry/spec decode).
+                if offset != cache.seq_len {
+                    if offset <= cache.seq_len {
+                        cache.truncate(offset);
+                    } else {
+                        candle::bail!(
+                            "KV cache offset mismatch: offset={} but cache has {} tokens",
+                            offset,
+                            cache.seq_len
+                        );
                     }
-                    Err(_) => None,
+                }
+
+                cache.append_quantized(&k, &v)?;
+
+                // Prepare storage for q8_0 flash attention if applicable (CUDA only)
+                #[cfg(feature = "cuda")]
+                let q8_storage = if ggml_dtype == GgmlDType::Q8_0
+                    && std::env::var("PARAMECIA_DISABLE_Q8_FLASH").is_err()
+                {
+                    match cache.get_kv_storage() {
+                        Ok((k_storage, v_storage, k_layout, v_layout)) => {
+                            Some((k_storage, v_storage, k_layout, v_layout))
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "cuda"))]
+                let q8_storage: Option<(
+                    candle::quantized::QStorage,
+                    candle::quantized::QStorage,
+                    candle::Layout,
+                    candle::Layout,
+                )> = None;
+
+                // Only materialize dequantized K/V when we're not using a quantized attention path.
+                if q8_storage.is_some() {
+                    (k, v, q8_storage)
+                } else {
+                    let (cached_k, cached_v) = cache.get_kv()?;
+                    let cached_k = cached_k.to_dtype(q.dtype())?.contiguous()?;
+                    let cached_v = cached_v.to_dtype(q.dtype())?.contiguous()?;
+                    (cached_k, cached_v, q8_storage)
                 }
             } else {
-                None
-            };
-
-            // Convert back to model dtype for fallback attention computation
-            let cached_k = cached_k.to_dtype(q.dtype())?.contiguous()?;
-            let cached_v = cached_v.to_dtype(q.dtype())?.contiguous()?;
-            (cached_k, cached_v, q8_storage)
-        } else {
-            // Non-quantized mode (F16 or BF16)
-            // Optionally convert K/V to the cache dtype before storing
-            let cache_dtype = self.kv_cache_quantization.cache_dtype();
-            let (k_for_cache, v_for_cache) = if let Some(dtype) = cache_dtype {
-                if k.dtype() != dtype {
-                    (
-                        k.to_dtype(dtype)?.contiguous()?,
-                        v.to_dtype(dtype)?.contiguous()?,
-                    )
+                // Non-quantized mode (F16 or BF16)
+                // Optionally convert K/V to the cache dtype before storing
+                let cache_dtype = self.kv_cache_quantization.cache_dtype();
+                let (k_for_cache, v_for_cache) = if let Some(dtype) = cache_dtype {
+                    if k.dtype() != dtype {
+                        (
+                            k.to_dtype(dtype)?.contiguous()?,
+                            v.to_dtype(dtype)?.contiguous()?,
+                        )
+                    } else {
+                        (k, v)
+                    }
                 } else {
                     (k, v)
-                }
-            } else {
-                (k, v)
+                };
+
+                let (cached_k, cached_v) = if let Some(ref mut cache) = self.preallocated_cache {
+                    // Have existing cache, concatenate new K/V
+                    let prev_k = cache.k_cache.narrow(2, 0, cache.seq_len)?;
+                    let prev_v = cache.v_cache.narrow(2, 0, cache.seq_len)?;
+                    let new_k = Tensor::cat(&[&prev_k, &k_for_cache], 2)?.contiguous()?;
+                    let new_v = Tensor::cat(&[&prev_v, &v_for_cache], 2)?.contiguous()?;
+
+                    // Update cache with new values
+                    cache.k_cache = new_k.clone();
+                    cache.v_cache = new_v.clone();
+                    cache.seq_len = new_k.dim(2)?;
+                    cache.max_seq_len = cache.seq_len;
+
+                    (new_k, new_v)
+                } else {
+                    // First call - initialize cache with current K/V
+                    self.preallocated_cache = Some(PreallocatedKvCache {
+                        k_cache: k_for_cache.clone(),
+                        v_cache: v_for_cache.clone(),
+                        seq_len: k_for_cache.dim(2)?,
+                        max_seq_len: k_for_cache.dim(2)?,
+                        batch_size: b,
+                    });
+                    (k_for_cache, v_for_cache)
+                };
+
+                // Convert back to query dtype for attention if cache dtype differs
+                let (cached_k, cached_v) = if cached_k.dtype() != q.dtype() {
+                    (
+                        cached_k.to_dtype(q.dtype())?.contiguous()?,
+                        cached_v.to_dtype(q.dtype())?.contiguous()?,
+                    )
+                } else {
+                    (cached_k, cached_v)
+                };
+
+                (cached_k, cached_v, None)
             };
-
-            let (cached_k, cached_v) = if let Some(ref mut cache) = self.preallocated_cache {
-                // Have existing cache, concatenate new K/V
-                let prev_k = cache.k_cache.narrow(2, 0, cache.seq_len)?;
-                let prev_v = cache.v_cache.narrow(2, 0, cache.seq_len)?;
-                let new_k = Tensor::cat(&[&prev_k, &k_for_cache], 2)?.contiguous()?;
-                let new_v = Tensor::cat(&[&prev_v, &v_for_cache], 2)?.contiguous()?;
-
-                // Update cache with new values
-                cache.k_cache = new_k.clone();
-                cache.v_cache = new_v.clone();
-                cache.seq_len = new_k.dim(2)?;
-                cache.max_seq_len = cache.seq_len;
-
-                (new_k, new_v)
-            } else {
-                // First call - initialize cache with current K/V
-                self.preallocated_cache = Some(PreallocatedKvCache {
-                    k_cache: k_for_cache.clone(),
-                    v_cache: v_for_cache.clone(),
-                    seq_len: k_for_cache.dim(2)?,
-                    max_seq_len: k_for_cache.dim(2)?,
-                    batch_size: b,
-                });
-                (k_for_cache, v_for_cache)
-            };
-
-                        // Convert back to query dtype for attention if cache dtype differs
-                        let (cached_k, cached_v) = if cached_k.dtype() != q.dtype() {
-                            (
-                                cached_k.to_dtype(q.dtype())?.contiguous()?,
-                                cached_v.to_dtype(q.dtype())?.contiguous()?,
-                            )
-                        } else {
-                            (cached_k, cached_v)
-                        };
-            
-                        (cached_k, cached_v, None)
-                    };
         // Compute attention - use flash attention when available, otherwise standard SDPA
+        #[cfg(feature = "cuda")]
         let attn_output = if let Some((k_storage, v_storage, k_layout, v_layout)) = q8_storage {
             // Use Q8_0 flash attention kernel
             // q is currently [b, h, l, d], transpose to [b, l, h, d]
             let q_perm = q.transpose(1, 2)?.contiguous()?;
             let q_l = q_perm.layout();
 
-            // Typically apply causal mask if processing more than 1 token
-            let causal = l > 1;
+            // Use causal masking with an explicit offset into the KV cache.
+            // This keeps correctness for chunked prefill and single-token decode.
+            let seq_k = self.cache_seq_len();
+            let q_offset = seq_k.saturating_sub(l);
+            let causal = true;
 
             crate::ops::flash_attn_q8(
                 &q_perm,
@@ -2519,11 +2554,61 @@ impl FullAttention {
                 self.num_kv_heads,
                 self.head_dim,
                 l,
-                self.cache_seq_len(),
+                seq_k,
+                q_offset,
                 causal,
             )?
             .reshape((b, l, self.num_heads * self.head_dim))?
         } else {
+            #[cfg(feature = "flash-attn")]
+            {
+                // Standard Flash Attention (F16/BF16)
+                // q, k, v are [b, h, l, d], transpose to [b, l, h, d]
+                let q_perm = q.transpose(1, 2)?.contiguous()?;
+                let k_perm = k.transpose(1, 2)?.contiguous()?;
+                let v_perm = v.transpose(1, 2)?.contiguous()?;
+
+                candle_flash_attn::flash_attn(
+                    &q_perm,
+                    &k_perm,
+                    &v_perm,
+                    (1.0 / (self.head_dim as f64).sqrt()) as f32,
+                    l > 1, // causal
+                )?
+                .reshape((b, l, self.num_heads * self.head_dim))?
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            {
+                // Repeat KV heads for grouped-query attention
+                let k = repeat_kv(k, self.num_kv_groups)?;
+                let v = repeat_kv(v, self.num_kv_groups)?;
+
+                // Compute attention
+                let scale = 1f64 / (self.head_dim as f64).sqrt();
+                let k_t = k.transpose(2, 3)?.contiguous()?;
+                let attn_scores = (q.contiguous()?.matmul(&k_t)? * scale)?;
+                let attn_scores = match attn_mask {
+                    None => attn_scores,
+                    Some(mask) => attn_scores.broadcast_add(mask)?,
+                };
+
+                // Clamp attention scores to prevent softmax overflow during training
+                let attn_scores_clamped = attn_scores.clamp(-100.0, 100.0)?;
+                let attn_weights = candle_nn::ops::softmax_last_dim(&attn_scores_clamped)?;
+                let attn_output = attn_weights.matmul(&v.contiguous()?)?;
+
+                // Reshape attention output
+                attn_output
+                    .transpose(1, 2)?
+                    .reshape((b, l, self.num_heads * self.head_dim))?
+                    .contiguous()?
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
+        let attn_output = {
+            // Suppress unused variable warning when cuda is disabled
+            let _ = &q8_storage;
+
             #[cfg(feature = "flash-attn")]
             {
                 // Standard Flash Attention (F16/BF16)
@@ -2573,6 +2658,11 @@ impl FullAttention {
         let final_output = if let Some(gate_tensor) = gate {
             // Gate shape is [b, l, num_heads, head_dim], need to flatten for matching
             let gate_flat = gate_tensor.reshape((b, l, self.num_heads * self.head_dim))?;
+            let gate_flat = if gate_flat.dtype() != attn_output.dtype() {
+                gate_flat.to_dtype(attn_output.dtype())?
+            } else {
+                gate_flat
+            };
             let gate_sigmoid = candle_nn::ops::sigmoid(&gate_flat)?;
             (attn_output * gate_sigmoid)?
         } else {

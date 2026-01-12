@@ -7,7 +7,7 @@ edition = "2021"
 anyhow = "1"
 candle = { package = "candle-core", git = "https://github.com/nicksenger/candle.git", branch = "paramecia" }
 candle-nn = { package = "candle-nn", git = "https://github.com/nicksenger/candle.git", branch = "paramecia" }
-candle-flash-attn = { git = "https://github.com/nicksenger/candle.git", branch = "paramecia", optional = true }
+candle-flash-attn = { package = "candle-flash-attn", git = "https://github.com/nicksenger/candle.git", branch = "paramecia", optional = true }
 crossbeam = "0.8"
 half = "2.4"
 rand = "0.9.0"
@@ -27,6 +27,7 @@ serde_json = "1.0"
 
 [features]
 default = []
+accelerate = ["candle/accelerate", "candle-nn/accelerate", "candle-examples/accelerate"]
 cuda = ["candle/cuda", "candle-nn/cuda", "candle-examples/cuda"]
 metal = ["candle/metal", "candle-nn/metal", "candle-examples/metal"]
 flash-attn = ["cuda", "dep:candle-flash-attn"]

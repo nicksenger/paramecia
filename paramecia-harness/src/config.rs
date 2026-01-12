@@ -82,7 +82,7 @@ pub struct ProviderConfig {
     /// Maximum context length for local inference (default: 16384).
     #[serde(default)]
     pub local_context_length: Option<usize>,
-    /// KV cache quantization mode: "f16", "bf16", "q8", "q4" (default: "q4").
+    /// KV cache quantization mode: "f16", "bf16", "q8", "q4" (default: "q8").
     #[serde(default)]
     pub local_kv_cache_quant: Option<String>,
 }
@@ -583,7 +583,7 @@ fn default_providers() -> Vec<ProviderConfig> {
         local_device: None,
         local_offload: None,        // Defaults to "experts" in backend
         local_context_length: None, // Defaults to 131072 in backend
-        local_kv_cache_quant: None, // Defaults to "f16" in backend
+        local_kv_cache_quant: None, // Defaults to "q8_0" in backend
     }]
 }
 

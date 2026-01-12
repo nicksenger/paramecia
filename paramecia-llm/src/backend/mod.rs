@@ -126,7 +126,7 @@ pub struct ProviderConfig {
     pub local_offload: Option<String>,
     /// Maximum context length for local inference.
     pub local_context_length: Option<usize>,
-    /// KV cache quantization mode: "f16", "bf16", "q8", "q4" (default: "q4").
+    /// KV cache quantization mode: "f16", "bf16", "q8", "q4" (default: "q8").
     /// F16/BF16 provide maximum accuracy, Q8/Q4 reduce memory at cost of some accuracy.
     pub local_kv_cache_quant: Option<String>,
 }

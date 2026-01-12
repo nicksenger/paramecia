@@ -36,7 +36,7 @@ use crate::types::{AvailableTool, FunctionCall, LlmChunk, LlmMessage, LlmUsage, 
 /// `PARAMECIA_CONTEXT_LENGTH` env var. Default: 131072 (128K).
 ///
 /// KV cache quantization can be configured via `local_kv_cache_quant` config or
-/// `PARAMECIA_KV_CACHE_QUANT` env var. Options: "f16", "bf16", "q8", "q4" (default).
+/// `PARAMECIA_KV_CACHE_QUANT` env var. Options: "f16", "bf16", "q8", "q4" (default: Q8_0).
 ///
 /// Memory scaling (approximate, with expert offload for 30B MoE):
 ///   - F16 KV-cache (maximum accuracy):
@@ -47,7 +47,7 @@ use crate::types::{AvailableTool, FunctionCall, LlmChunk, LlmMessage, LlmUsage, 
 ///     - 32K tokens: ~18 GB peak
 ///     - 64K tokens: ~22 GB peak
 ///     - 128K tokens: ~28 GB peak
-///   - Q4 KV-cache (default, ~4x memory reduction):
+///   - Q4 KV-cache (~4x memory reduction):
 ///     - 32K tokens: ~16 GB peak
 ///     - 64K tokens: ~18 GB peak
 ///     - 128K tokens: ~22 GB peak
@@ -107,7 +107,7 @@ impl LocalBackend {
         let offload_mode = Self::parse_offload_mode(offload_str.as_deref());
 
         // Parse KV cache quantization mode from config or environment
-        // Defaults to Q4K for maximum memory efficiency
+        // Defaults to Q8_0 for optimized kernels and strong performance
         let kv_cache_str = provider
             .local_kv_cache_quant
             .clone()
@@ -278,19 +278,19 @@ impl LocalBackend {
         }
     }
 
-    /// Parse KV cache quantization mode from string. Defaults to "q4k".
+    /// Parse KV cache quantization mode from string. Defaults to "q8_0".
     ///
     /// Supported values:
     /// - "f16" / "fp16": Store KV cache as f16 (maximum accuracy)
     /// - "bf16" / "bfloat16": Store KV cache as bf16
     /// - "q8" / "q8_0": Quantize to Q8_0 (8-bit, ~2x memory reduction)
-    /// - "q4" / "q4k" / "q4_k": Quantize to Q4K (4-bit, ~4x memory reduction, default)
+    /// - "q4" / "q4k" / "q4_k": Quantize to Q4K (4-bit, ~4x memory reduction)
     fn parse_kv_cache_quant(hint: Option<&str>) -> KvCacheQuantization {
         match hint {
-            None => KvCacheQuantization::Q4K,
+            None => KvCacheQuantization::Q8_0,
             Some(s) => KvCacheQuantization::from_str(s).unwrap_or_else(|| {
-                tracing::warn!("Unknown KV cache quantization '{}', using 'q4k'", s);
-                KvCacheQuantization::Q4K
+                tracing::warn!("Unknown KV cache quantization '{}', using 'q8_0'", s);
+                KvCacheQuantization::Q8_0
             }),
         }
     }

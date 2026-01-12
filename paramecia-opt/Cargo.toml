@@ -21,6 +21,12 @@ hirschberg = { workspace = true }
 
 [features]
 default = []
+accelerate = [
+    "candle/accelerate",
+    "candle-nn/accelerate",
+    "candle-examples/accelerate",
+    "paramecia-model/accelerate",
+]
 cuda = [
     "candle/cuda",
     "candle-nn/cuda",
@@ -33,3 +39,4 @@ metal = [
     "candle-examples/metal",
     "paramecia-model/metal",
 ]
+flash-attn = ["cuda", "paramecia-model/flash-attn"]

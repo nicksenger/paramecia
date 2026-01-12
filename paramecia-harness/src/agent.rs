@@ -338,6 +338,33 @@ impl Agent {
         &self.messages
     }
 
+    /// Build the active model config.
+    fn active_model_config(&self) -> VibeResult<LlmModelConfig> {
+        let active_model = self.config.get_active_model()?;
+        Ok(LlmModelConfig {
+            name: active_model.name.clone(),
+            temperature: active_model.temperature,
+            top_p: active_model.top_p,
+            top_k: active_model.top_k,
+            min_p: active_model.min_p,
+            repeat_penalty: active_model.repeat_penalty,
+            presence_penalty: active_model.presence_penalty,
+            thinking_budget: active_model.thinking_budget,
+        })
+    }
+
+    /// Recalculate context tokens using the backend tokenizer.
+    async fn refresh_context_tokens(&mut self) -> VibeResult<u32> {
+        let model_config = self.active_model_config()?;
+        let token_count = self
+            .backend
+            .count_tokens(&model_config, &self.messages, None)
+            .await
+            .map_err(VibeError::Llm)?;
+        self.stats.context_tokens = token_count;
+        Ok(token_count)
+    }
+
     /// Set the approval callback.
     pub fn set_approval_callback(&mut self, callback: ApprovalCallback) {
         self.approval_callback = Some(callback);
@@ -374,14 +401,14 @@ impl Agent {
         // Reset the provided cancellation flag
         cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
         // Clean message history before processing
-        self.clean_message_history();
+        self.clean_message_history().await?;
 
         // Add user message
         self.messages.push(LlmMessage::user(user_message));
         self.stats.steps += 1;
 
         // Update context tokens to reflect the current conversation size
-        self.stats.context_tokens = AgentStats::calculate_context_tokens(&self.messages);
+        self.refresh_context_tokens().await?;
 
         // Run conversation loop - events are sent to event_tx as they happen
         self.conversation_loop(event_tx, cancelled).await?;
@@ -390,13 +417,14 @@ impl Agent {
     }
 
     /// Clean message history to ensure valid state.
-    fn clean_message_history(&mut self) {
+    async fn clean_message_history(&mut self) -> VibeResult<()> {
         if self.messages.len() < 2 {
-            return;
+            return Ok(());
         }
 
         self.fill_missing_tool_responses();
-        self.ensure_assistant_after_tools();
+        self.ensure_assistant_after_tools().await?;
+        Ok(())
     }
 
     /// Fill in missing tool responses.
@@ -462,9 +490,9 @@ impl Agent {
     }
 
     /// Ensure there's an assistant message after tool responses.
-    fn ensure_assistant_after_tools(&mut self) {
+    async fn ensure_assistant_after_tools(&mut self) -> VibeResult<()> {
         if self.messages.len() < 2 {
-            return;
+            return Ok(());
         }
 
         if let Some(last) = self.messages.last()
@@ -472,8 +500,9 @@ impl Agent {
         {
             self.messages.push(LlmMessage::assistant("Understood."));
             // Update context tokens to reflect the current conversation size
-            self.stats.context_tokens = AgentStats::calculate_context_tokens(&self.messages);
+            self.refresh_context_tokens().await?;
         }
+        Ok(())
     }
 
     async fn conversation_loop(
@@ -782,7 +811,7 @@ impl Agent {
             }
 
             // Update context tokens to reflect the current conversation size
-            self.stats.context_tokens = AgentStats::calculate_context_tokens(&self.messages);
+            self.refresh_context_tokens().await?;
 
             // Handle tool calls
             let mut user_cancelled = false;
@@ -853,8 +882,7 @@ impl Agent {
                             &response_content,
                         ));
                         // Update context tokens to reflect the current conversation size
-                        self.stats.context_tokens =
-                            AgentStats::calculate_context_tokens(&self.messages);
+                        self.refresh_context_tokens().await?;
                     }
                 }
 
@@ -903,7 +931,7 @@ impl Agent {
             self.messages.push(result.message.clone());
 
             // Update context tokens to reflect the current conversation size
-            self.stats.context_tokens = AgentStats::calculate_context_tokens(&self.messages);
+            self.refresh_context_tokens().await?;
 
             // Send assistant event
             if let Some(content) = &result.message.content
@@ -992,8 +1020,7 @@ impl Agent {
                         &response_content,
                     ));
                     // Update context tokens to reflect the current conversation size
-                    self.stats.context_tokens =
-                        AgentStats::calculate_context_tokens(&self.messages);
+                    self.refresh_context_tokens().await?;
                 }
 
                 // Continue the loop if we had tool calls (unless user cancelled)
@@ -1237,7 +1264,7 @@ impl Agent {
     /// Compact the conversation history by asking the LLM for a summary.
     pub async fn compact(&mut self) -> VibeResult<String> {
         // Clean message history first
-        self.clean_message_history();
+        self.clean_message_history().await?;
 
         // Save current session
         let _ = self
@@ -1259,7 +1286,7 @@ impl Agent {
         self.stats.steps += 1;
 
         // Update context tokens to reflect the current conversation size
-        self.stats.context_tokens = AgentStats::calculate_context_tokens(&self.messages);
+        self.refresh_context_tokens().await?;
 
         // Get summary from LLM
         let active_model = self.config.get_active_model()?;
@@ -1311,10 +1338,7 @@ impl Agent {
         };
 
         // Update context tokens to reflect the current conversation size
-        self.stats.context_tokens = AgentStats::calculate_context_tokens(&self.messages);
-
-        // Calculate new context tokens using the same method as normal operation
-        let new_context = AgentStats::calculate_context_tokens(&self.messages);
+        let new_context = self.refresh_context_tokens().await?;
 
         // Ensure we don't set tokens too close to threshold to prevent infinite loops
         let threshold = self.config.auto_compact_threshold;

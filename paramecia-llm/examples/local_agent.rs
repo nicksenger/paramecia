@@ -361,7 +361,7 @@ async fn main() -> anyhow::Result<()> {
         }),
         local_offload: Some(args.offload.clone()),
         local_context_length: Some(args.context_length),
-        local_kv_cache_quant: None, // Use default (Q4K)
+        local_kv_cache_quant: None, // Use default (Q8_0)
     };
 
     println!("Loading model...");

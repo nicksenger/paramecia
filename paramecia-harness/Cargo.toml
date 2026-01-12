@@ -39,3 +39,10 @@ whoami = "1.5"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+
+[features]
+default = []
+accelerate = ["paramecia-llm/accelerate"]
+cuda = ["paramecia-llm/cuda"]
+metal = ["paramecia-llm/metal"]
+flash-attn = ["cuda", "paramecia-llm/flash-attn"]

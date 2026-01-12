@@ -753,6 +753,7 @@ mod tests {
 /// - Only works with CUDA backend
 /// - Head dimension must be 64, 128, or 256 (common sizes)
 /// - Simplified kernel - not as optimized as llama.cpp's full implementation
+#[cfg(feature = "cuda")]
 pub fn flash_attn_q8(
     q: &Tensor,
     k_storage: &candle::quantized::QStorage,
@@ -767,13 +768,25 @@ pub fn flash_attn_q8(
     head_dim: usize,
     seq_q: usize,
     seq_k: usize,
+    q_offset: usize,
     causal: bool,
 ) -> Result<Tensor> {
     // Delegate to candle-core's implementation
     candle::deltanet_ops::flash_attn_q8(
-        q, k_storage, v_storage,
-        q_l, k_l, v_l,
-        scale, batch, num_heads, num_kv_heads, head_dim,
-        seq_q, seq_k, causal,
+        q,
+        k_storage,
+        v_storage,
+        q_l,
+        k_l,
+        v_l,
+        scale,
+        batch,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_q,
+        seq_k,
+        q_offset,
+        causal,
     )
 }

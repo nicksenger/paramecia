@@ -1,28 +1,19 @@
-> Wealth, fame, power.
-> Gold Roger, the inventor of linear algebra, attained this and everything else the world had to offer,
-> and his dying words drove countless souls to the cloud.
->
-> "You want my tensors? You can have them!"
-> "I left everything I gathered together on huggingface"
-> "Now all you have to do is find it."
->
-> These words lured men to shop online
-> for RAM more expensive than they ever dared to imagine!
-> 
-> This is the time known as the AI Slop Era!
-
 ### Note from the author
 
-The goal of this project is to create artificial intelligence agents that:
+Paramecia are single-celled organisms common in freshwater. In biology, they're often used as models for various cellular functions like genetics and reproduction. 
 
-- Run as a single process and from a single binary
-- Perform decently on a personal computer of _reasonable_ specifications: 24gb VRAM + 64gb DRAM, or >32gb unified
-- Are capable of reading and editing their own source code in an agentic loop
-- Support some form of weight modification (evolution/backprop/gradient approximation/etc)
+The goal of this project is to create small, self-contained artificial intelligence agents with analogous characteristics. Specifically, it's intended to:
 
-Currently, you can run this project and have it grep around iteself or give markdown explanations of quantum mechanics, etc, but it is not comparable to frontier-level cloud agentic AI. The focus here is reflection and self-improvement, not maximal intelligence or utility.
+- [x] Run as a single process, deliverable as a single binary
+- [x] Perform decently on my machine (24gb VRAM + 64gb DRAM)
+- [x] Be capable of reading and editing its own source code
+- [ ] Incrementally modify its own weights and source-code through a self-selection process
 
-My honest assessment is that agents spawned from this project are not currently capable of improving either their own weights or the agent/inference code. If that should change, I'll be sure to let folks know.
+Currently, you can run this project and have it call tools or give markdown explanations of quantum mechanics, etc, but it is not comparable to frontier-level cloud AI. The focus here is reflection and self-improvement, not maximal intelligence or utility.
+
+Please note that it is intended for this project to implement a reinforcement learning process, and that the legal landscape around artificial intelligence experiments of this nature is rapidly evolving. As of today, where I am located (USA), any projects of this kind employing >=10^26 floating point operations must notify authorities.
+
+With my own hardware, it would take ~90,000 years of continuous operation to reach this number, but users and contributors should make sure they are in compliance with any applicable regulations in their own jurisdiction. 
 
 # Paramecia
 
@@ -84,8 +75,9 @@ Reference entry points:
 - A local Qwen3-Next GGUF file (e.g. `Qwen3-Next-*-GGUF/*.gguf`).
 - (Optional) GPU backend:
   - `--features cuda` for NVIDIA CUDA
-  - `--features metal` for Apple Metal
   - `--features flash-attn` to enable Candle’s flash-attention integration (CUDA)
+  - `--features metal` for Apple Metal (please note that I cannot evaluate the performance of Metal on my hardware currently- the model is too big even at q2)
+  - `--features accelerate` for Apple Accelerate
 
 Note: this workspace currently depends on a Candle fork with additional kernels for the Qwen3-Next DeltaNet operations
 

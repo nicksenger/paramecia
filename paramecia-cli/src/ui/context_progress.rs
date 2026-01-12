@@ -35,9 +35,10 @@ impl TokenState {
             return String::new();
         }
         let percentage = self.percentage();
-        let max_k = self.max_tokens / 1000;
-        let current_k = self.current_tokens / 1000;
-        format!("{}% ({}/{}) tokens", percentage, current_k, max_k)
+        format!(
+            "{}% ({}/{}) tokens",
+            percentage, self.current_tokens, self.max_tokens
+        )
     }
 }
 

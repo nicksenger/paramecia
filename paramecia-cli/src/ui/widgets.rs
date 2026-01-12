@@ -1431,7 +1431,7 @@ pub fn render_compact(
         lines.push(Line::from(vec![
             Span::styled("●●● ", Style::default().fg(colors::SUCCESS)),
             Span::styled(
-                format!("Compacted: {}k → {}k tokens", old / 1000, new / 1000),
+                format!("Compacted: {} → {} tokens", old, new),
                 Style::default().fg(colors::SUCCESS),
             ),
         ]));

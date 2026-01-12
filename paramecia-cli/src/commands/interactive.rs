@@ -251,9 +251,8 @@ fn handle_agent_result(app: &mut App, result: AgentResult) {
                 AgentEvent::CompactStart(e) => {
                     app.add_system_message(
                         format!(
-                            "Compacting conversation ({}k tokens > {}k threshold)...",
-                            e.current_context_tokens / 1000,
-                            e.threshold / 1000
+                            "Compacting conversation ({} tokens > {} threshold)...",
+                            e.current_context_tokens, e.threshold
                         ),
                         SystemMessageKind::Info,
                     );
@@ -261,9 +260,8 @@ fn handle_agent_result(app: &mut App, result: AgentResult) {
                 AgentEvent::CompactEnd(e) => {
                     app.add_system_message(
                         format!(
-                            "Compacted: {}k → {}k tokens",
-                            e.old_context_tokens / 1000,
-                            e.new_context_tokens / 1000
+                            "Compacted: {} → {} tokens",
+                            e.old_context_tokens, e.new_context_tokens
                         ),
                         SystemMessageKind::Info,
                     );
@@ -296,11 +294,7 @@ fn handle_agent_result(app: &mut App, result: AgentResult) {
             new_tokens,
         } => {
             app.add_system_message(
-                format!(
-                    "Compacted: {}k → {}k tokens",
-                    old_tokens / 1000,
-                    new_tokens / 1000
-                ),
+                format!("Compacted: {} → {} tokens", old_tokens, new_tokens),
                 SystemMessageKind::Info,
             );
             app.update_tokens(new_tokens, app.token_context.1);

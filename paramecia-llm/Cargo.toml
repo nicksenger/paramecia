@@ -41,6 +41,7 @@ required-features = []
 
 [features]
 default = []
+accelerate = ["candle/accelerate", "paramecia-model/accelerate"]
 cuda = ["candle/cuda", "paramecia-model/cuda"]
 metal = ["candle/metal", "paramecia-model/metal"]
 flash-attn = ["cuda", "paramecia-model/flash-attn"]
