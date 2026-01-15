@@ -10,7 +10,7 @@ pub mod streaming_parser;
 pub mod types;
 pub mod xml_tool_parser;
 
-pub use backend::{Backend, BackendFactory, LocalBackend};
+pub use backend::{Backend, BackendFactory, LocalBackend, VentureBackend};
 pub use chat_template::{ChatTemplate, ChatTemplateError, QWEN3_NEXT_CHAT_TEMPLATE};
 pub use error::{LlmError, LlmResult};
 pub use format::ApiToolFormatHandler;

@@ -7,19 +7,23 @@ use std::time::Duration;
 
 /// Type of backend to use.
 ///
-/// Currently only Local is supported for local-only operation.
+/// Currently only Local is supported for local-only operation,
+/// and Venture for OpenAI-compatible APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendType {
     /// Local quantized backend using the Qwen3 architecture.
     #[default]
     Local,
+    /// Venture OpenAI-compatible API backend.
+    Venture,
 }
 
 impl std::fmt::Display for BackendType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Local => write!(f, "local"),
+            Self::Venture => write!(f, "venture"),
         }
     }
 }
@@ -30,8 +34,9 @@ impl std::str::FromStr for BackendType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "local" => Ok(Self::Local),
+            "venture" => Ok(Self::Venture),
             _ => Err(format!(
-                "Unknown backend type: {s}. Only 'local' is supported."
+                "Unknown backend type: {s}. Only 'local' and 'venture' are supported."
             )),
         }
     }
@@ -53,6 +58,11 @@ impl BackendFactory {
         match provider.backend {
             BackendType::Local => {
                 let backend = crate::backend::local::LocalBackend::new(provider.clone(), timeout)
+                    .map_err(|e| e.to_string())?;
+                Ok(Arc::new(backend))
+            }
+            BackendType::Venture => {
+                let backend = crate::backend::venture::VentureBackend::new(provider.clone(), timeout)
                     .map_err(|e| e.to_string())?;
                 Ok(Arc::new(backend))
             }

@@ -2,29 +2,30 @@
 
 Paramecia are single-celled organisms common in freshwater. In biology, they're often used as models for various cellular functions like genetics and reproduction. 
 
-The goal of this project is to create small, self-contained artificial intelligence agents with analogous characteristics. Specifically, it's intended to:
+The goal of this project is to create small, self-contained agents with analogous characteristics. Specifically, it's intended to:
 
 - [x] Run as a single process, deliverable as a single binary
 - [x] Perform decently on my machine (24gb VRAM + 64gb DRAM)
 - [x] Be capable of reading and editing its own source code
-- [ ] Incrementally modify its own weights and source-code through a self-selection process
+- [ ] Incrementally modify its own weights and source-code without human intervention
 
-Currently, you can run this project and have it call tools or give markdown explanations of quantum mechanics, etc, but it is not comparable to frontier-level cloud AI. The focus here is reflection and self-improvement, not maximal intelligence or utility.
+Currently, you can run this project and talk to it about One Piece, etc, but it is not comparable to frontier-level cloud next-token predictors. The focus here is reflection and self-improvement, not utility.
 
-Please note that it is intended for this project to implement a reinforcement learning process, and that the legal landscape around artificial intelligence experiments of this nature is rapidly evolving. As of today, where I am located (USA), any projects of this kind employing >=10^26 floating point operations must notify authorities.
+Please note that the ultimate goal of this project is to implement what could be considered a recursive self-improvement process, and that the legal landscape around artificial intelligence experiments of this nature is rapidly evolving. As of today, where I am located (USA), any projects of this kind employing >=10^26 floating point operations must notify authorities.
 
-With my own hardware, it would take ~90,000 years of continuous operation to reach this number, but users and contributors should make sure they are in compliance with any applicable regulations in their own jurisdiction. 
+To put things in perspective, with my own hardware it would take ~90,000 years of continuous operation to reach this number, but users and contributors should make sure that they are acting in compliance with any applicable regulations in their own jurisdiction.
 
 # Paramecia
 
-Paramecia is an offline, single-process agentic CLI. It provides an agentic loop that:
+Paramecia is an offline, single-process agentic CLI. It currently uses GGUF-quantized Qwen3-Next-80B-A3B-MoE for inference.
 
-- Builds a structured chat prompt (system prompt + user instructions + project context)
-- Streams tokens from a local quantized LLM backend
-- Parses/executes tool calls (builtins and MCP servers) with explicit user approval modes
-- Maintains session logs and supports resuming prior conversations
+## Project Roadmap
 
-Today, the only supported LLM backend is fully local inference for quantized Qwen3-Next GGUF models.
+The project will be conducted in 3 phases: 
+
+1. [ ] **Scaffolding** (current): all necessary utilities regarding basic execution, optimization, code modification, and inference will be prepared. Coding will be performed with the assistance of state-of-the-art next-token-prediction utilities.
+2. [ ] **Priming**: the model will be fine-tuned on a collection of tokens related to its construction.
+3. [ ] **Inception**: this one's a surprise :)
 
 ## Workspace overview
 
@@ -45,7 +46,7 @@ This repository is a Cargo workspace with the following crates:
 
 Key capabilities:
 
-- **GGUF loading with quantized weights** via Candle’s GGUF support, with lightweight helpers (`quantized_var_builder`).
+- **GGUF loading with quantized weights** via Candle’s GGUF support
 - **Hybrid Qwen3-Next architecture support**:
   - Full-attention layers (with RoPE and Q projections)
   - Linear attention / “Gated Delta Net” recurrent layers
@@ -57,7 +58,6 @@ Key capabilities:
   - Preallocated (O(1) append) caches to avoid quadratic `cat` behavior.
   - Optional **quantized KV cache** (`KvCacheQuantization`, default Q4K) for long-context memory scaling.
 - **Prefix caching** (`PrefixCache`) to reuse shared conversation prefixes across turns (restore K/V and recurrent state).
-- **Optional speculative decoding via MTP** (`MtpWeights`), including “state sharing” with the main model’s cache.
 - **Sampling + logit processing** (`generation`) and utilities for repetition/presence penalties.
 
 Reference entry points:
@@ -79,7 +79,7 @@ Reference entry points:
   - `--features metal` for Apple Metal (please note that I cannot evaluate the performance of Metal on my hardware currently- the model is too big even at q2)
   - `--features accelerate` for Apple Accelerate
 
-Note: this workspace currently depends on a Candle fork with additional kernels for the Qwen3-Next DeltaNet operations
+Note: this workspace currently depends on a Candle fork with additional kernels for the Qwen3-Next DeltaNet operations and quantized flash attention.
 
 ### Build and run
 

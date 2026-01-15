@@ -5,13 +5,46 @@ use thiserror::Error;
 /// Errors that can occur during LLM operations.
 #[derive(Debug, Error)]
 pub enum LlmError {
+    /// HTTP request failed.
+    #[error("HTTP request failed: {0}")]
+    RequestFailed(#[from] reqwest::Error),
+
     /// Failed to parse response.
     #[error("Failed to parse response: {0}")]
     ParseError(String),
 
+    /// API returned an error.
+    #[error("API error from {provider} ({status}): {message}")]
+    ApiError {
+        /// Name of the provider.
+        provider: String,
+        /// HTTP status code.
+        status: u16,
+        /// Error message from the API.
+        message: String,
+    },
+
+    /// Rate limit exceeded.
+    #[error("Rate limit exceeded for {provider}. Retry after: {retry_after:?}")]
+    RateLimited {
+        /// Name of the provider.
+        provider: String,
+        /// Seconds to wait before retrying.
+        retry_after: Option<u64>,
+    },
+
     /// Invalid configuration.
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+
+    /// Missing API key.
+    #[error("Missing API key for {provider}. Set {env_var} environment variable.")]
+    MissingApiKey {
+        /// Name of the provider.
+        provider: String,
+        /// Environment variable name.
+        env_var: String,
+    },
 
     /// Request timeout.
     #[error("Request timed out after {seconds} seconds")]

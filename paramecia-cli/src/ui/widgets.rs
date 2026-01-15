@@ -1246,49 +1246,123 @@ pub fn render_user_command_message(msg: &UserCommandMessage) -> Vec<Line<'static
     lines
 }
 
-/// Render an error message.
+/// Render an error message with word wrapping for long lines.
 /// margin-top: 0
-pub fn render_error_message(msg: &ErrorMessage) -> Vec<Line<'static>> {
+pub fn render_error_message(msg: &ErrorMessage, width: u16) -> Vec<Line<'static>> {
     let border_style = Style::default().fg(colors::MUTED);
     let error_style = Style::default().fg(colors::ERROR).bold();
-    let content_lines: Vec<&str> = msg.content.lines().collect();
-    let line_count = content_lines.len().max(1);
 
+    // First, wrap the content to fit within the available width
+    // Account for the "  ⎢ " prefix (4 chars)
+    let prefix_width = 4;
+    let available_width = usize::from(width.saturating_sub(prefix_width as u16)).max(10);
+
+    let mut wrapped_lines: Vec<String> = Vec::new();
+    for line in msg.content.lines() {
+        if line.is_empty() {
+            wrapped_lines.push(String::new());
+        } else {
+            // Wrap long lines
+            let mut remaining = line;
+            while !remaining.is_empty() {
+                let (chunk, rest) = split_text_at_width(remaining, available_width);
+                wrapped_lines.push(chunk.to_string());
+                remaining = rest.trim_start();
+            }
+        }
+    }
+
+    if wrapped_lines.is_empty() {
+        wrapped_lines.push(msg.content.clone());
+    }
+
+    let line_count = wrapped_lines.len();
     let mut lines = Vec::new();
 
-    for (i, line) in content_lines.iter().enumerate() {
+    for (i, line) in wrapped_lines.iter().enumerate() {
         let border = if i == line_count - 1 { "⎣" } else { "⎢" };
         lines.push(Line::from(vec![
             Span::styled(format!("  {border} "), border_style),
-            Span::styled(line.to_string(), error_style),
-        ]));
-    }
-
-    if lines.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("  ⎣ ", border_style),
-            Span::styled(msg.content.clone(), error_style),
+            Span::styled(line.clone(), error_style),
         ]));
     }
 
     lines
 }
 
-/// Render a warning message.
+/// Split text at approximately the given width, preferring to break at word boundaries.
+fn split_text_at_width(text: &str, max_width: usize) -> (&str, &str) {
+    if text.is_empty() || display_width(text) <= max_width {
+        return (text, "");
+    }
+
+    // Find the best break point
+    let mut best_break = 0;
+    let mut current_width = 0;
+
+    for (i, c) in text.char_indices() {
+        let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+        if current_width + char_width > max_width {
+            // If we haven't found a good break point, just break here
+            if best_break == 0 {
+                best_break = i;
+            }
+            break;
+        }
+        current_width += char_width;
+
+        // Prefer breaking at spaces
+        if c == ' ' {
+            best_break = i + 1;
+        }
+    }
+
+    // If we went through the whole string, return it all
+    if best_break == 0 {
+        best_break = text.len();
+    }
+
+    (&text[..best_break], &text[best_break..])
+}
+
+/// Render a warning message with word wrapping for long lines.
 /// margin-top: 0
-pub fn render_warning_message(msg: &WarningMessage) -> Vec<Line<'static>> {
+pub fn render_warning_message(msg: &WarningMessage, width: u16) -> Vec<Line<'static>> {
     let border_style = Style::default().fg(colors::MUTED);
     let warning_style = Style::default().fg(colors::WARNING);
-    let content_lines: Vec<&str> = msg.content.lines().collect();
-    let line_count = content_lines.len().max(1);
 
+    // First, wrap the content to fit within the available width
+    // Account for the "  ⎢ " prefix (4 chars)
+    let prefix_width = 4;
+    let available_width = usize::from(width.saturating_sub(prefix_width as u16)).max(10);
+
+    let mut wrapped_lines: Vec<String> = Vec::new();
+    for line in msg.content.lines() {
+        if line.is_empty() {
+            wrapped_lines.push(String::new());
+        } else {
+            // Wrap long lines
+            let mut remaining = line;
+            while !remaining.is_empty() {
+                let (chunk, rest) = split_text_at_width(remaining, available_width);
+                wrapped_lines.push(chunk.to_string());
+                remaining = rest.trim_start();
+            }
+        }
+    }
+
+    if wrapped_lines.is_empty() {
+        wrapped_lines.push(msg.content.clone());
+    }
+
+    let line_count = wrapped_lines.len();
     let mut lines = Vec::new();
 
-    for (i, line) in content_lines.iter().enumerate() {
+    for (i, line) in wrapped_lines.iter().enumerate() {
         let border = if i == line_count - 1 { "⎣" } else { "⎢" };
         lines.push(Line::from(vec![
-            Span::styled(format!("  {} ", border), border_style),
-            Span::styled(line.to_string(), warning_style),
+            Span::styled(format!("  {border} "), border_style),
+            Span::styled(line.clone(), warning_style),
         ]));
     }
 

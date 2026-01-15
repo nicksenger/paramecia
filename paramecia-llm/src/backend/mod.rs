@@ -1,9 +1,11 @@
 //! LLM backend implementations.
 
 mod factory;
+mod venture;
 mod local;
 
 pub use factory::{BackendFactory, BackendType};
+pub use venture::VentureBackend;
 pub use local::LocalBackend;
 
 use async_trait::async_trait;
@@ -47,7 +49,7 @@ pub struct ModelConfig {
     /// Can be set via `PARAMECIA_PRESENCE_PENALTY` env var.
     pub presence_penalty: f32,
     /// Thinking budget in tokens (default: 500).
-    /// After this many tokens are generated, </think> is injected to end thinking.
+    /// After this many tokens are generated,  is injected to end thinking.
     /// Set to 0 to disable.
     pub thinking_budget: usize,
 }
