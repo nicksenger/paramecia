@@ -67,8 +67,8 @@ impl VentureBackend {
     }
 
     /// Get the venture file path for this session.
-    fn venture_file_path(&self) -> PathBuf {
-        Self::ventures_dir().join(format!("{}.txt", self.venture_id))
+    fn venture_file_path(&self, model_name: &str) -> PathBuf {
+        Self::ventures_dir().join(model_name).join(format!("{}.txt", self.venture_id))
     }
 
     /// Format a message in ChatML format.
@@ -107,7 +107,7 @@ impl VentureBackend {
     }
 
     /// Save the conversation to the ventures directory.
-    async fn save_conversation(&self, messages: &[LlmMessage], response: &LlmMessage) {
+    async fn save_conversation(&self, messages: &[LlmMessage], response: &LlmMessage, model_name: &str) {
         // Create all messages including the response
         let mut all_messages = messages.to_vec();
         all_messages.push(response.clone());
@@ -115,7 +115,8 @@ impl VentureBackend {
         let content = Self::format_conversation_chatml(&all_messages);
 
         let ventures_dir = Self::ventures_dir();
-        let file_path = self.venture_file_path();
+        let file_path = self.venture_file_path(model_name);
+        let model_dir = ventures_dir.join(model_name);
 
         tracing::info!(
             "VentureBackend: saving conversation ({} bytes) to {}",
@@ -124,8 +125,8 @@ impl VentureBackend {
         );
 
         // Create directory if needed and write file
-        if let Err(e) = tokio::fs::create_dir_all(&ventures_dir).await {
-            tracing::error!("Failed to create ventures directory {}: {e}", ventures_dir.display());
+        if let Err(e) = tokio::fs::create_dir_all(&model_dir).await {
+            tracing::error!("Failed to create model directory {}: {e}", model_dir.display());
             return;
         }
 
@@ -530,6 +531,7 @@ struct VentureSavingStream {
     accumulated_tool_calls: std::sync::Arc<std::sync::Mutex<Vec<ToolCall>>>,
     venture_file_path: PathBuf,
     ventures_dir: PathBuf,
+    model_name: String,
     saved: bool,
 }
 
@@ -570,8 +572,9 @@ impl VentureSavingStream {
         let formatted = VentureBackend::format_conversation_chatml(&all_messages);
 
         // Use blocking IO since we're in Drop
-        if let Err(e) = std::fs::create_dir_all(&self.ventures_dir) {
-            tracing::error!("Failed to create ventures directory {}: {e}", self.ventures_dir.display());
+        let model_dir = self.ventures_dir.join(&self.model_name);
+        if let Err(e) = std::fs::create_dir_all(&model_dir) {
+            tracing::error!("Failed to create model directory {}: {e}", model_dir.display());
             return;
         }
 
@@ -686,7 +689,7 @@ impl Backend for VentureBackend {
         let response_message = Self::convert_response_message(message);
 
         // Save the conversation to the ventures directory
-        self.save_conversation(messages, &response_message).await;
+        self.save_conversation(messages, &response_message, &model.name).await;
 
         Ok(LlmChunk {
             message: response_message,
@@ -761,8 +764,9 @@ impl Backend for VentureBackend {
 
         // Capture data needed for saving the conversation
         let input_messages = messages.to_vec();
-        let venture_file_path = self.venture_file_path();
+        let venture_file_path = self.venture_file_path(&model.name);
         let ventures_dir = Self::ventures_dir();
+        let model_name = model.name.clone();
 
         // Track accumulated response content
         let accumulated_content = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -886,6 +890,7 @@ impl Backend for VentureBackend {
             accumulated_tool_calls,
             venture_file_path,
             ventures_dir,
+            model_name,
             saved: false,
         };
 

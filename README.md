@@ -1,5 +1,3 @@
-### Note from the author
-
 Paramecia are single-celled organisms common in freshwater. In biology, they're often used as models for various cellular functions like genetics and reproduction. 
 
 The goal of this project is to create small, self-contained agents with analogous characteristics. Specifically, it's intended to:

@@ -589,9 +589,9 @@ fn default_providers() -> Vec<ProviderConfig> {
 
 fn default_models() -> Vec<ModelConfig> {
     vec![ModelConfig {
-        name: "devstral".to_string(),
+        name: "codemonkey-d-luffy".to_string(),
         provider: "local".to_string(),
-        alias: Some("local".to_string()),
+        alias: Some("luffy".to_string()),
         temperature: default_temperature(),
         top_p: default_top_p(),
         top_k: default_top_k(),
