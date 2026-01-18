@@ -13,10 +13,8 @@ use crate::types::{AvailableTool, FunctionCall, LlmChunk, LlmMessage, LlmUsage, 
 
 /// OpenAI-compatible API backend
 ///
-/// Since this backend is intended for use of external models, it dumps all conversations into a "venture"
-/// directory in the paramecia config directory (generally ~/.paramecia) in ChatML format. 
-///
-/// This is strictly for debugging purposes, since the external ecosystem is volatile and unpredictable.
+/// Since this backend is intended for use of external models, it dumps all conversations into
+/// {paramecia_config_dir}/ventures/{model_name} in ChatML format for debugging purposes. 
 pub struct VentureBackend {
     client: reqwest::Client,
     provider: ProviderConfig,
@@ -115,8 +113,9 @@ impl VentureBackend {
         let content = Self::format_conversation_chatml(&all_messages);
 
         let ventures_dir = Self::ventures_dir();
-        let file_path = self.venture_file_path(model_name);
-        let model_dir = ventures_dir.join(model_name);
+        let sanitized_model_name = model_name.replace('/', "_");
+        let file_path = self.venture_file_path(&sanitized_model_name);
+        let model_dir = ventures_dir.join(&sanitized_model_name);
 
         tracing::info!(
             "VentureBackend: saving conversation ({} bytes) to {}",
@@ -572,7 +571,8 @@ impl VentureSavingStream {
         let formatted = VentureBackend::format_conversation_chatml(&all_messages);
 
         // Use blocking IO since we're in Drop
-        let model_dir = self.ventures_dir.join(&self.model_name);
+        let sanitized_model_name = self.model_name.replace('/', "_");
+        let model_dir = self.ventures_dir.join(&sanitized_model_name);
         if let Err(e) = std::fs::create_dir_all(&model_dir) {
             tracing::error!("Failed to create model directory {}: {e}", model_dir.display());
             return;
@@ -764,9 +764,10 @@ impl Backend for VentureBackend {
 
         // Capture data needed for saving the conversation
         let input_messages = messages.to_vec();
-        let venture_file_path = self.venture_file_path(&model.name);
         let ventures_dir = Self::ventures_dir();
         let model_name = model.name.clone();
+        let sanitized_model_name = model_name.replace('/', "_");
+        let venture_file_path = self.venture_file_path(&sanitized_model_name);
 
         // Track accumulated response content
         let accumulated_content = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
