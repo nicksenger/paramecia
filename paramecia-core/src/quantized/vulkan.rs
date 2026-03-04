@@ -489,53 +489,28 @@ impl QVulkanStorage {
     }
 
     pub fn quantize_onto(&mut self, src: &crate::CpuStorage) -> Result<()> {
-        // Quantize on CPU, then upload to GPU
-        let f32_data = src.as_slice::<f32>()?;
+        // Keep Vulkan behavior aligned with CPU/CUDA/Metal by quantizing through
+        // the CPU quantized storage implementation, then uploading raw bytes.
+        let src_f32 = src.as_slice::<f32>()?;
+        let mut qcpu_storage = crate::Device::Cpu.qzeros(src_f32.len(), self.dtype)?;
 
-        // Use CPU quantization
-        use super::k_quants::*;
-        let block_size = self.dtype.block_size();
-        let type_size = self.dtype.type_size();
-        let num_blocks = f32_data.len() / block_size;
-        self.byte_count = num_blocks * type_size;
-
-        macro_rules! quantize_blocks {
-            ($ty:ty) => {{
-                let mut blocks = vec![<$ty>::zeros(); num_blocks];
-                <$ty as GgmlType>::from_float(f32_data, &mut blocks);
-                let bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
-                        blocks.as_ptr() as *const u8,
-                        num_blocks * std::mem::size_of::<$ty>(),
-                    )
-                };
-                self.cpu_data = bytes.to_vec();
-            }};
+        match &mut qcpu_storage {
+            QStorage::Cpu(storage) => storage.from_float(src_f32),
+            _ => crate::bail!("Vulkan quantize_onto: internal error creating CPU qstorage"),
         }
 
-        match self.dtype {
-            GgmlDType::Q8_0 => quantize_blocks!(BlockQ8_0),
-            GgmlDType::Q4_0 => quantize_blocks!(BlockQ4_0),
-            GgmlDType::Q4_1 => quantize_blocks!(BlockQ4_1),
-            GgmlDType::Q5_0 => quantize_blocks!(BlockQ5_0),
-            GgmlDType::Q5_1 => quantize_blocks!(BlockQ5_1),
-            GgmlDType::Q8_1 => quantize_blocks!(BlockQ8_1),
-            GgmlDType::Q2K => quantize_blocks!(BlockQ2K),
-            GgmlDType::Q3K => quantize_blocks!(BlockQ3K),
-            GgmlDType::Q4K => quantize_blocks!(BlockQ4K),
-            GgmlDType::Q5K => quantize_blocks!(BlockQ5K),
-            GgmlDType::Q6K => quantize_blocks!(BlockQ6K),
-            GgmlDType::Q8K => quantize_blocks!(BlockQ8K),
-            other => crate::bail!("Vulkan quantize_onto: unsupported dtype {:?}", other),
+        let data = qcpu_storage.data()?;
+        self.byte_count = data.len();
+        self.cpu_data = data.into_owned();
+
+        if self.cpu_data.is_empty() {
+            self.buffer = None;
+            return Ok(());
         }
 
-        // Upload to GPU
-        if !self.cpu_data.is_empty() {
-            let gpu_buf = self.device.allocate_buffer(self.cpu_data.len() as u64)?;
-            self.device.upload_to_buffer(&self.cpu_data, &gpu_buf)?;
-            self.buffer = Some(Arc::new(gpu_buf));
-        }
-
+        let gpu_buf = self.device.allocate_buffer(self.cpu_data.len() as u64)?;
+        self.device.upload_to_buffer(&self.cpu_data, &gpu_buf)?;
+        self.buffer = Some(Arc::new(gpu_buf));
         Ok(())
     }
 
