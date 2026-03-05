@@ -75,6 +75,3 @@ qwen35_27b = [
 [build-dependencies]
 paramecia-wit = { path = "../paramecia-wit" }
 
-[[example]]
-name = "controller"
-path = "examples/controller.rs"

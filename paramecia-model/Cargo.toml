@@ -26,14 +26,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 
-[[example]]
-name = "list_tensors"
-required-features = []
-
-[[example]]
-name = "combine_mtp_gguf"
-required-features = []
-
 [features]
 default = []
 accelerate = ["paramecia-core/accelerate", "paramecia-nn/accelerate"]
