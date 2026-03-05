@@ -50,7 +50,7 @@ paramecia-visualizer = { path = "paramecia-visualizer" }
 
 # Type level
 glowstick = { path = "../glowstick" }
-inception = { path = "../inception/inception" }
+inception = { path = "../inception2/inception" }
 
 # Async runtime
 tokio = { version = "1.44", features = ["full"] }

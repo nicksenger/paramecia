@@ -34,6 +34,76 @@ pub trait CombinatorTraceExt<Ctx>: Combinator<Ctx> {
 
 impl<Ctx, C> CombinatorTraceExt<Ctx> for C where C: Combinator<Ctx> {}
 
+use typosaurus::collections::graph::{self, Combine, Empty};
+use typosaurus::collections::set::{Set, Union};
+use typosaurus::num::consts::{U0, U1, U2, U3, U42};
+use typosaurus::{graph, set};
+pub struct Node<T, U>(PhantomData<T>, PhantomData<U>);
+#[inception(property = ArrowGraph, types)]
+pub trait ArrowNode {
+    #[induce(
+        base = typosaurus::collections::set::Empty,
+        merge = <(<Head as ArrowNode>::Id, <Tail as ArrowNode>::Id) as Union>::Out where { (<Head as ArrowNode>::Id, <Tail as ArrowNode>::Id): Union },
+        merge_variant = <(<Head as ArrowNode>::Id, <Tail as ArrowNode>::Id) as Union>::Out where { (<Head as ArrowNode>::Id, <Tail as ArrowNode>::Id): Union },
+        join = set![U0]
+    )]
+    type Id;
+
+    #[induce(
+        base = Empty,
+        merge = Combine<<Head as ArrowNode>::Graph, Tail> where { (<Head as ArrowNode>::Graph, Tail): graph::Merge },
+        merge_variant = Combine<<Head as ArrowNode>::Graph, Tail> where { (<Head as ArrowNode>::Graph, Tail): graph::Merge },
+        join = <Fields as ArrowNode>::Graph
+    )]
+    type Graph;
+}
+
+#[cfg(test)]
+mod graphtest {
+    use typosaurus::collections::{
+        graph::{Topo, Topological},
+        list::Len,
+    };
+
+    use super::*;
+
+    pub struct Foo;
+    type FooId = set![U1];
+    #[primitive(property = ArrowGraph)]
+    impl ArrowNode for Foo {
+        type Id = FooId;
+        type Graph = graph! {(FooId, ()): []};
+    }
+    pub struct Bar;
+    type BarId = set![U2];
+    #[primitive(property = ArrowGraph)]
+    impl ArrowNode for Bar {
+        type Id = BarId;
+        type Graph = graph! {(BarId, ()): []};
+    }
+    pub struct Baz;
+    type BazId = set![U3];
+    #[primitive(property = ArrowGraph)]
+    impl ArrowNode for Baz {
+        type Id = BazId;
+        type Graph = graph! {(BazId, ()): []};
+    }
+
+    #[derive(Inception)]
+    #[inception(properties = [ArrowGraph])]
+    pub struct Waldo(Foo, Bar, Foo);
+
+    #[derive(Inception)]
+    #[inception(properties = [ArrowGraph])]
+    pub struct Corge(Waldo, Waldo, Baz);
+
+    #[test]
+    fn test_arrowgraph() {
+        type X = <Waldo as ArrowNode>::Graph;
+        println!("{}", std::any::type_name::<X>());
+    }
+}
+
 #[inception(property = Arrow, signature(input = In, output = Out))]
 pub trait Combinator<Ctx = ()> {
     type In;
