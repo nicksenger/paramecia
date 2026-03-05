@@ -402,6 +402,7 @@ impl Vis for LayerFfnResidualOp {
 type LayerFfnPrepareResult = Result<LayerFfnPrepared>;
 type LayerFfnMoeLift = LiftResult<LayerFfnMoeOp, LayerFfnPrepareResult, LayerFfnMoeOut>;
 type LayerFfnMoeResult = Result<LayerFfnMoeOut>;
+type LayerForwardOut = (TypedTensor<Hidden3>, Option<(Tensor, Tensor)>);
 type LayerFfnResidualLift = LiftResult<
     LayerFfnResidualOp,
     LayerFfnMoeResult,
@@ -452,7 +453,7 @@ impl LayerWeights {
         mask: Option<&Tensor>,
         offset: usize,
         mode: LayerForwardMode,
-    ) -> Result<(TypedTensor<Hidden3>, Option<(Tensor, Tensor)>)> {
+    ) -> Result<LayerForwardOut> {
         let input_dtype = x.inner().dtype();
         let t_start = if mode == LayerForwardMode::WithStats {
             use std::sync::OnceLock;

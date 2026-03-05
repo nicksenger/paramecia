@@ -62,3 +62,4 @@ metal = [
     "dep:paramecia-metal",
 ]
 vulkan = ["dep:ash", "dep:gpu-allocator", "dep:paramecia-vulkan", "dep:bytemuck", "dep:libc", "dep:crossbeam"]
+ug = []

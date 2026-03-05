@@ -1,5 +1,6 @@
 // Comprehensive tests comparing coopmat vs standard implementations
 // for all quantization types and operations
+#![cfg(feature = "vulkan")]
 
 use paramecia_core::quantized::GgmlDType;
 use paramecia_core::{quantized, Device, Module, Result, Tensor};

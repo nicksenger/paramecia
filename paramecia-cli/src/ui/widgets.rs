@@ -1855,7 +1855,7 @@ pub fn render_input_box<'a>(
     // Show placeholder when empty
     let content_span = if content.is_empty() {
         Span::styled(
-            "Ask something specific...",
+            "Prompt something...",
             Style::default().fg(colors::FOREGROUND_MUTED).italic(),
         )
     } else {

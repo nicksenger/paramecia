@@ -54,6 +54,10 @@ type TTopFlat = TTensor<Shape2<T, Tk>>;
 type TTopX = TTensor<Shape1<T>>;
 type TWeightCol = TTensor<Shape2<T, U1>>;
 type TBlockMults = TTensor<BlockMults1>;
+type MoeDispatchPrefetchShape = (usize, usize, usize);
+type MoeDispatchPrefetchOut = (THiddenFlat, TTopFlat, TTopFlat, MoeDispatchPrefetchShape);
+type CpuFusedExpertAssignment = (usize, Vec<u32>, Vec<f32>);
+type CpuFusedExpertAssignments = Vec<CpuFusedExpertAssignment>;
 type RemapTopIndicesFlow = MapErr<
     TensorRemapIndicesOp<Shape3<B, N, Tk>, Shape1<E>>,
     TTopIndices,
@@ -1805,21 +1809,7 @@ impl std::fmt::Debug for RouteTopK {
 
 #[derive(Inception)]
 #[inception(properties = [Arrow, Visualize])]
-pub(super) struct MoeRoute(
-    MapErr<
-        QMatMulOp<Shape2<E, S>, Shape3<B, N, S>, Shape3<B, N, E>>,
-        THidden,
-        TRouterLogits,
-        paramecia_tensor::Error,
-        paramecia_core::Error,
-    >,
-    MapOk<
-        RouteTopK,
-        TRouterLogits,
-        (TRouterLogits, TTopWeights, TTopIndices),
-        paramecia_core::Error,
-    >,
-);
+pub(super) struct MoeRoute(MoeRouteProjectOp, MoeRouteTopKOp);
 impl std::fmt::Debug for MoeRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MoeRoute").finish()
@@ -1837,6 +1827,20 @@ impl MoeRoute {
         )
     }
 }
+
+type MoeRouteProjectOp = MapErr<
+    QMatMulOp<Shape2<E, S>, Shape3<B, N, S>, Shape3<B, N, E>>,
+    THidden,
+    TRouterLogits,
+    paramecia_tensor::Error,
+    paramecia_core::Error,
+>;
+type MoeRouteTopKOp = MapOk<
+    RouteTopK,
+    TRouterLogits,
+    (TRouterLogits, TTopWeights, TTopIndices),
+    paramecia_core::Error,
+>;
 
 type MoeRouteJoinResult = std::result::Result<
     (THidden, (TRouterLogits, TTopWeights, TTopIndices)),
@@ -2276,7 +2280,7 @@ impl MoeExperts {
         n_tokens: usize,
         top_k: usize,
         num_experts: usize,
-    ) -> Result<Vec<(usize, Vec<u32>, Vec<f32>)>> {
+    ) -> Result<CpuFusedExpertAssignments> {
         let expected_pairs = n_tokens.checked_mul(top_k).ok_or_else(|| {
             paramecia_core::Error::Msg("forward_batched_cpu_fused: token/top_k product over".into())
         })?;
@@ -3180,7 +3184,7 @@ impl MoeBlock {
         hidden_states: THidden,
         expert_indices: TTopIndices,
         expert_weights: TTopWeights,
-    ) -> Result<(THiddenFlat, TTopFlat, TTopFlat, (usize, usize, usize))> {
+    ) -> Result<MoeDispatchPrefetchOut> {
         let prepared = self
             .dispatch_prep
             .traced_forward(&mut (), (hidden_states, expert_indices, expert_weights))?;

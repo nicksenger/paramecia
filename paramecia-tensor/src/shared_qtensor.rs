@@ -52,11 +52,11 @@ impl<S: Shape> SharedQTensor<S> {
             return Err(Error::RankMismatch {
                 context: "Typed SharedQTensor construction",
                 typed_shape: std::any::type_name::<S>(),
-                caller,
+                caller: caller.into_boxed_str(),
                 runtime_rank: runtime_shape.len(),
                 type_level_rank: S::RANK,
-                runtime_shape,
-                type_level_shape,
+                runtime_shape: runtime_shape.into_boxed_slice(),
+                type_level_shape: type_level_shape.into_boxed_slice(),
             });
         }
 
@@ -70,12 +70,12 @@ impl<S: Shape> SharedQTensor<S> {
                 return Err(Error::DimensionMismatch {
                     context: "Typed SharedQTensor construction",
                     typed_shape: std::any::type_name::<S>(),
-                    caller,
+                    caller: caller.clone().into_boxed_str(),
                     dim,
                     runtime: a,
                     type_level: b,
-                    runtime_shape,
-                    type_level_shape,
+                    runtime_shape: runtime_shape.clone().into_boxed_slice(),
+                    type_level_shape: type_level_shape.clone().into_boxed_slice(),
                 });
             }
         }

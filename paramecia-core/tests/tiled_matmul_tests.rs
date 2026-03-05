@@ -1,5 +1,6 @@
 // Hierarchical Tiled MatMul Tests
 // Tests for verifying correctness of tiled matmul kernels vs non-tiled implementations
+#![cfg(feature = "vulkan")]
 
 use paramecia_core::{
     quantized::{GgmlDType, QMatMul, QTensor},

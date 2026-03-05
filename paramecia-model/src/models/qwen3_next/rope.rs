@@ -139,6 +139,7 @@ impl std::fmt::Debug for RotaryEmbedding {
 }
 
 impl RotaryEmbedding {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         dtype: DType,
         head_dim: usize,

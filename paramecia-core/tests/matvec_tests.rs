@@ -3,6 +3,7 @@
 // Tests the specialized mat-vec kernels (m=1) against the general matmul kernels
 // to ensure correctness. The mat-vec kernels should produce identical or nearly
 // identical results to the matmul kernels when m=1.
+#![cfg(feature = "vulkan")]
 
 use paramecia_core::{
     quantized::{GgmlDType, QMatMul, QTensor},
