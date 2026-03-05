@@ -40,10 +40,6 @@ anyhow = "1"
 paramecia-harness = { workspace = true }
 paramecia-tools = { workspace = true }
 
-[[example]]
-name = "local_agent"
-required-features = []
-
 [features]
 default = []
 accelerate = ["paramecia-core/accelerate", "paramecia-engine/accelerate"]

@@ -54,18 +54,3 @@ qwen35_4b = ["paramecia-model/qwen35_4b"]
 qwen35_9b = ["paramecia-model/qwen35_9b"]
 qwen35_27b = ["paramecia-model/qwen35_27b"]
 
-[[example]]
-name = "inspect_tuning"
-required-features = []
-
-[[example]]
-name = "fuse"
-required-features = []
-
-[[example]]
-name = "prune_experts"
-required-features = []
-
-[[example]]
-name = "prune_layers"
-required-features = []

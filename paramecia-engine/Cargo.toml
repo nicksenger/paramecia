@@ -66,14 +66,3 @@ qwen35_27b = [
     "paramecia-opt/qwen35_27b",
 ]
 
-[[example]]
-name = "qwen3_next"
-required-features = []
-
-[[example]]
-name = "qwen3_next_quzo"
-required-features = []
-
-[[example]]
-name = "qwen3_next_distill"
-required-features = []
