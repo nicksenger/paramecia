@@ -10,3 +10,4 @@ glowstick = { workspace = true }
 inception = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+typosaurus = { path = "../../typosaurus" }
