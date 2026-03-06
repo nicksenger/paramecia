@@ -90,6 +90,13 @@ struct Membership {
     depth: usize,
 }
 
+type SubgraphIndexData = (
+    HashMap<usize, SubgraphInfo>,
+    HashMap<usize, usize>,
+    HashMap<usize, usize>,
+    HashMap<usize, Vec<Membership>>,
+);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VisibleOwner {
     RealNode(usize),
@@ -404,9 +411,9 @@ impl ModelVisualizer {
                 }
                 if received_trace_snapshot && !self.received_first_trace_snapshot {
                     self.received_first_trace_snapshot = true;
-                    return iced_sugiyama::force_review::<Message>(
-                        iced_sugiyama::Id::new(MODEL_GRAPH_WIDGET_ID),
-                    );
+                    return iced_sugiyama::force_review::<Message>(iced_sugiyama::Id::new(
+                        MODEL_GRAPH_WIDGET_ID,
+                    ));
                 }
             }
         }
@@ -1439,14 +1446,7 @@ fn next_display_id(next_id: &mut usize) -> Option<u32> {
     Some(id)
 }
 
-fn index_subgraphs(
-    roots: &[ArrowSubGraph],
-) -> (
-    HashMap<usize, SubgraphInfo>,
-    HashMap<usize, usize>,
-    HashMap<usize, usize>,
-    HashMap<usize, Vec<Membership>>,
-) {
+fn index_subgraphs(roots: &[ArrowSubGraph]) -> SubgraphIndexData {
     let mut subgraph_by_id = HashMap::new();
     let mut parent_by_subgraph = HashMap::new();
     let mut depth_by_subgraph = HashMap::new();
@@ -1987,7 +1987,8 @@ fn edge_label_container_style(_theme: &iced::Theme) -> iced::widget::container::
             color: Color::TRANSPARENT,
             ..Border::default()
         },
-        ..iced::widget::container::Style::default()
+        text_color: None,
+        shadow: Shadow::default(),
     }
 }
 
@@ -2004,7 +2005,6 @@ fn chat_overlay_container_style(_theme: &iced::Theme) -> iced::widget::container
             offset: iced::Vector::new(0.0, 1.0),
             blur_radius: 4.0,
         },
-        ..iced::widget::container::Style::default()
     }
 }
 

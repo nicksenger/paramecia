@@ -1,4 +1,5 @@
 // Tests comparing coopmat vs standard implementations for DeltaNet operations
+#![cfg(feature = "vulkan")]
 
 use paramecia_core::deltanet_ops::{delta_net_autoregressive_step, delta_net_parallel_with_states};
 use paramecia_core::{Device, Result, Tensor};

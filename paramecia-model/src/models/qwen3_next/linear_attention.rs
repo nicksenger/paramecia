@@ -40,6 +40,8 @@ type TSharedSsmConv = paramecia_tensor::SharedQTensor<Shape2<QkvDim, ConvKernel>
 type TCausalMask = paramecia_tensor::Tensor<Shape4<U1, U1, C, C>>;
 type TDInner = paramecia_tensor::Tensor<Shape3<B, N, DInner>>;
 type DeltaNet4Shape = Shape4<B, N, DtRank, DState>;
+type NamedQTensorRef<'a> = (&'static str, &'a paramecia_core::quantized::QTensor);
+type BetaAlphaQtensorsForSave<'a> = (Option<NamedQTensorRef<'a>>, Option<NamedQTensorRef<'a>>);
 
 // ── Arrow-composed flows ──────────────────────────────────────────────────
 
@@ -228,12 +230,7 @@ pub(super) enum BetaAlphaProjection {
 
 impl BetaAlphaProjection {
     /// Returns tensor refs for serialization as (name_suffix, qtensor).
-    pub(super) fn qtensors_for_save(
-        &self,
-    ) -> (
-        Option<(&'static str, &paramecia_core::quantized::QTensor)>,
-        Option<(&'static str, &paramecia_core::quantized::QTensor)>,
-    ) {
+    pub(super) fn qtensors_for_save(&self) -> BetaAlphaQtensorsForSave<'_> {
         match self {
             Self::Fused(fused) => (fused.qtensor().map(|qt| ("ssm_ba", qt)), None),
             Self::Split { beta, alpha } => (

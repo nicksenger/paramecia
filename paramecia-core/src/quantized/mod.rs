@@ -1019,7 +1019,7 @@ impl QTensor {
     }
 
     pub fn storage(&self) -> &QStorage {
-        &*self.storage
+        &self.storage
     }
 
     pub fn dequantize(&self, device: &Device) -> Result<Tensor> {

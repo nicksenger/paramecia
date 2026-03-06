@@ -623,7 +623,7 @@ fn render_dot(graph: &Graph, plan: &RenderPlan) -> String {
     out
 }
 
-fn flatten_subgraphs<'a>(subgraphs: &'a [SubGraph]) -> Vec<&'a SubGraph> {
+fn flatten_subgraphs(subgraphs: &[SubGraph]) -> Vec<&SubGraph> {
     fn walk<'a>(sg: &'a SubGraph, out: &mut Vec<&'a SubGraph>) {
         out.push(sg);
         for child in &sg.children {

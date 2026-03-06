@@ -750,27 +750,7 @@ impl std::fmt::Debug for MtpSharedExpertForward {
 
 #[derive(Inception)]
 #[inception(properties = [Arrow, Visualize])]
-struct MtpRoute(
-    MapErr<
-        QMatMulOp<Shape2<E, S>, Shape3<B, N, S>, Shape3<B, N, E>>,
-        THidden,
-        TRouterLogits,
-        paramecia_tensor::Error,
-        paramecia_core::Error,
-    >,
-    MapOk<
-        MapErr<
-            TensorTopkFromLogitsOp<Shape3<B, N, E>, Shape3<B, N, Tk>, Shape3<B, N, Tk>>,
-            TRouterLogits,
-            (TTopWeights, TTopIndices),
-            paramecia_tensor::Error,
-            paramecia_core::Error,
-        >,
-        TRouterLogits,
-        (TTopWeights, TTopIndices),
-        paramecia_core::Error,
-    >,
-);
+struct MtpRoute(MtpRouteProjectOp, MtpRouteTopKOp);
 impl std::fmt::Debug for MtpRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MtpRoute").finish()
@@ -786,6 +766,23 @@ impl MtpRoute {
         )
     }
 }
+
+type MtpRouteProjectOp = MapErr<
+    QMatMulOp<Shape2<E, S>, Shape3<B, N, S>, Shape3<B, N, E>>,
+    THidden,
+    TRouterLogits,
+    paramecia_tensor::Error,
+    paramecia_core::Error,
+>;
+type MtpTopKSelectOp = MapErr<
+    TensorTopkFromLogitsOp<Shape3<B, N, E>, Shape3<B, N, Tk>, Shape3<B, N, Tk>>,
+    TRouterLogits,
+    (TTopWeights, TTopIndices),
+    paramecia_tensor::Error,
+    paramecia_core::Error,
+>;
+type MtpRouteTopKOp =
+    MapOk<MtpTopKSelectOp, TRouterLogits, (TTopWeights, TTopIndices), paramecia_core::Error>;
 
 type MtpDispatchHiddenFlatOp = MapErr<
     FlattenPrefix2Op<Shape3<B, N, S>, Shape2<T, S>>,

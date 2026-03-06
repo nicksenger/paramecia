@@ -11,11 +11,11 @@ pub enum Error {
     RankMismatch {
         context: &'static str,
         typed_shape: &'static str,
-        caller: String,
+        caller: Box<str>,
         runtime_rank: usize,
         type_level_rank: usize,
-        runtime_shape: Vec<usize>,
-        type_level_shape: Vec<usize>,
+        runtime_shape: Box<[usize]>,
+        type_level_shape: Box<[usize]>,
     },
 
     #[error(
@@ -24,12 +24,12 @@ pub enum Error {
     DimensionMismatch {
         context: &'static str,
         typed_shape: &'static str,
-        caller: String,
+        caller: Box<str>,
         dim: usize,
         runtime: usize,
         type_level: usize,
-        runtime_shape: Vec<usize>,
-        type_level_shape: Vec<usize>,
+        runtime_shape: Box<[usize]>,
+        type_level_shape: Box<[usize]>,
     },
 
     #[error("{0}")]
@@ -104,11 +104,11 @@ where
             return Err(Error::RankMismatch {
                 context: "Typed tensor conversion (core Tensor -> Tensor<S>)",
                 typed_shape: std::any::type_name::<S>(),
-                caller,
+                caller: caller.into_boxed_str(),
                 runtime_rank: t.rank(),
                 type_level_rank: S::RANK,
-                runtime_shape,
-                type_level_shape,
+                runtime_shape: runtime_shape.into_boxed_slice(),
+                type_level_shape: type_level_shape.into_boxed_slice(),
             });
         }
 
@@ -123,12 +123,12 @@ where
                 return Err(Error::DimensionMismatch {
                     context: "Typed tensor conversion (core Tensor -> Tensor<S>)",
                     typed_shape: std::any::type_name::<S>(),
-                    caller,
+                    caller: caller.clone().into_boxed_str(),
                     dim,
                     runtime: a,
                     type_level: b,
-                    runtime_shape,
-                    type_level_shape,
+                    runtime_shape: runtime_shape.clone().into_boxed_slice(),
+                    type_level_shape: type_level_shape.clone().into_boxed_slice(),
                 });
             }
         }

@@ -1,4 +1,5 @@
 // Comprehensive tests comparing coopmat vs standard implementations for GEMM
+#![cfg(feature = "vulkan")]
 
 use paramecia_core::{DType, Device, Result, Tensor};
 

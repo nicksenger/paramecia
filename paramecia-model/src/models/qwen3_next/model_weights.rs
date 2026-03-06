@@ -2187,7 +2187,7 @@ impl ModelWeights {
         per_device_masks: &[(String, Tensor)],
         offset: usize,
         mode: LayerForwardMode,
-    ) -> Result<(TypedTensor<Hidden3>, Option<Vec<(Tensor, Tensor)>>)> {
+    ) -> Result<LayerRunState> {
         let is_multi = self.layer_device_map.is_multi_gpu();
         let num_layers = self.layers.len();
         let collect_stats = mode == LayerForwardMode::WithStats;
@@ -2581,13 +2581,9 @@ impl ModelWeights {
             .as_deref()
             .map(|a| a == "qwen35" || a == "qwen35moe")
             .or_else(|| {
-                if md_get_opt(&["qwen35moe.block_count", "qwen3_5_moe.block_count"]).is_some() {
-                    Some(true)
-                } else if md_get_opt(&["qwen35.block_count", "qwen3_5.block_count"]).is_some() {
-                    Some(true)
-                } else {
-                    None
-                }
+                md_get_opt(&["qwen35moe.block_count", "qwen3_5_moe.block_count"])
+                    .or_else(|| md_get_opt(&["qwen35.block_count", "qwen3_5.block_count"]))
+                    .map(|_| true)
             })
             .unwrap_or(false);
 
