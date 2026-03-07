@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 
 use inception::*;
 
+mod graph_primitives;
 pub mod node_trace;
 pub mod vis;
 use vis::{Graph, Vis, Visualize};
@@ -34,74 +35,39 @@ pub trait CombinatorTraceExt<Ctx>: Combinator<Ctx> {
 
 impl<Ctx, C> CombinatorTraceExt<Ctx> for C where C: Combinator<Ctx> {}
 
-use typosaurus::collections::graph::{self, Combine, Empty};
-use typosaurus::collections::set::{Set, Union};
-use typosaurus::num::consts::{U0, U1, U2, U3, U42};
-use typosaurus::{graph, set};
-pub struct Node<T, U>(PhantomData<T>, PhantomData<U>);
+use typosaurus::cmp::Equality;
+use typosaurus::collections::list::{self, List as TList};
+use typosaurus::collections::sp::Node;
+use typosaurus::num::consts::U0;
+
+pub struct Id<T>(T);
+impl<T, U> Equality<Id<U>> for Id<T>
+where
+    T: Equality<U>,
+{
+    type Out = <T as Equality<U>>::Out;
+}
+
+#[inception(property = Ident, types)]
+pub trait Identified {
+    #[induce(
+        base = list::Empty,
+        merge = TList<(<Head as Identified>::Id, <Tail as Identified>::Id)>,
+        merge_variant = TList<(<Head as Identified>::Id, <Tail as Identified>::Id)>,
+        join = TList<(U0, <Fields as Identified>::Id)>
+    )]
+    type Id;
+}
+
 #[inception(property = ArrowGraph, types)]
 pub trait ArrowNode {
     #[induce(
-        base = typosaurus::collections::set::Empty,
-        merge = <(<Head as ArrowNode>::Id, <Tail as ArrowNode>::Id) as Union>::Out where { (<Head as ArrowNode>::Id, <Tail as ArrowNode>::Id): Union },
-        merge_variant = <(<Head as ArrowNode>::Id, <Tail as ArrowNode>::Id) as Union>::Out where { (<Head as ArrowNode>::Id, <Tail as ArrowNode>::Id): Union },
-        join = set![U0]
-    )]
-    type Id;
-
-    #[induce(
-        base = Empty,
-        merge = Combine<<Head as ArrowNode>::Graph, Tail> where { (<Head as ArrowNode>::Graph, Tail): graph::Merge },
-        merge_variant = Combine<<Head as ArrowNode>::Graph, Tail> where { (<Head as ArrowNode>::Graph, Tail): graph::Merge },
-        join = <Fields as ArrowNode>::Graph
+        base = list::Empty,
+        merge = TList<(<Head as ArrowNode>::Graph, <Tail as ArrowNode>::Graph)>,
+        merge_variant = TList<(<Head as ArrowNode>::Graph, <Tail as ArrowNode>::Graph)>,
+        join = TList<(Node<<Self as Identified>::Id, ()>, <Fields as ArrowNode>::Graph)> where { Self: Identified }
     )]
     type Graph;
-}
-
-#[cfg(test)]
-mod graphtest {
-    use typosaurus::collections::{
-        graph::{Topo, Topological},
-        list::Len,
-    };
-
-    use super::*;
-
-    pub struct Foo;
-    type FooId = set![U1];
-    #[primitive(property = ArrowGraph)]
-    impl ArrowNode for Foo {
-        type Id = FooId;
-        type Graph = graph! {(FooId, ()): []};
-    }
-    pub struct Bar;
-    type BarId = set![U2];
-    #[primitive(property = ArrowGraph)]
-    impl ArrowNode for Bar {
-        type Id = BarId;
-        type Graph = graph! {(BarId, ()): []};
-    }
-    pub struct Baz;
-    type BazId = set![U3];
-    #[primitive(property = ArrowGraph)]
-    impl ArrowNode for Baz {
-        type Id = BazId;
-        type Graph = graph! {(BazId, ()): []};
-    }
-
-    #[derive(Inception)]
-    #[inception(properties = [ArrowGraph])]
-    pub struct Waldo(Foo, Bar, Foo);
-
-    #[derive(Inception)]
-    #[inception(properties = [ArrowGraph])]
-    pub struct Corge(Waldo, Waldo, Baz);
-
-    #[test]
-    fn test_arrowgraph() {
-        type X = <Waldo as ArrowNode>::Graph;
-        println!("{}", std::any::type_name::<X>());
-    }
 }
 
 #[inception(property = Arrow, signature(input = In, output = Out))]
@@ -1969,5 +1935,103 @@ mod test {
         let mut flow = Then::new(InjectConst::<usize, usize>::new(100), AddIndex);
         // (5, 100) -> AddIndex -> Ok(105)
         assert_eq!(Combinator::forward(&mut flow, &mut (), 5), Ok(105));
+    }
+}
+#[cfg(test)]
+mod graphtest {
+    use std::marker::PhantomData;
+
+    use typosaurus::collections::sp::{Graph, Node, Parallel, SPEdges, SPNodes, TopologicalSort};
+    use typosaurus::num::consts::*;
+    use typosaurus::{assert_type_eq, list};
+
+    use super::*;
+
+    pub struct Foo;
+    #[primitive(property = ArrowGraph)]
+    impl ArrowNode for Foo {
+        type Graph = Node<U1, ()>;
+    }
+    #[primitive(property = Ident)]
+    impl Identified for Foo {
+        type Id = U1;
+    }
+    pub struct Bar;
+    #[primitive(property = ArrowGraph)]
+    impl ArrowNode for Bar {
+        type Graph = Node<U2, ()>;
+    }
+    #[primitive(property = Ident)]
+    impl Identified for Bar {
+        type Id = U2;
+    }
+    pub struct Baz;
+    #[primitive(property = ArrowGraph)]
+    impl ArrowNode for Baz {
+        type Graph = Node<U3, ()>;
+    }
+    #[primitive(property = Ident)]
+    impl Identified for Baz {
+        type Id = U3;
+    }
+    pub struct Qux;
+    #[primitive(property = ArrowGraph)]
+    impl ArrowNode for Qux {
+        type Graph = Node<U42, ()>;
+    }
+    pub struct Fork<T, U>(PhantomData<T>, PhantomData<U>);
+    #[primitive(property = ArrowGraph)]
+    impl<T, U> ArrowNode for Fork<T, U>
+    where
+        T: ArrowNode,
+        U: ArrowNode,
+    {
+        type Graph = Parallel<<T as ArrowNode>::Graph, <U as ArrowNode>::Graph>;
+    }
+
+    #[derive(Inception)]
+    #[inception(properties = [ArrowGraph, Ident])]
+    struct Waldo(Foo, Bar, Baz);
+
+    #[derive(Inception)]
+    #[inception(properties = [ArrowGraph])]
+    struct Corge(Baz, Waldo);
+
+    #[derive(Inception)]
+    #[inception(properties = [ArrowGraph])]
+    struct Fred(Corge, Corge);
+
+    #[derive(Inception)]
+    #[inception(properties = [ArrowGraph])]
+    struct Spam(Foo, Bar, Baz);
+
+    #[derive(Inception)]
+    #[inception(properties = [ArrowGraph])]
+    struct Phlugh(Foo, Fork<Spam, Baz>, Baz, Baz, Foo);
+
+    #[derive(Inception)]
+    #[inception(properties = [ArrowGraph])]
+    struct Chip(Foo, Fork<Bar, Baz>, Qux);
+
+    #[test]
+    fn test_id() {
+        type ID = <Waldo as Identified>::Id;
+        assert_type_eq!(ID, list![U0, U1, U2, U3]);
+
+        type G = <Waldo as ArrowNode>::Graph;
+
+        type E = SPEdges<G>;
+        assert_type_eq!(E, list![(list![U0, U1, U2, U3], U1), (U1, U2), (U2, U3)]);
+
+        type N = SPNodes<G>;
+        assert_type_eq!(
+            N,
+            list![Node<list![U0, U1, U2, U3], ()>, Node<U1, ()>, Node<U2, ()>, Node<U3, ()>]
+        );
+
+        assert_type_eq!(
+            <Graph<N, E> as TopologicalSort>::Out,
+            list![list![U0, U1, U2, U3], U1, U2, U3]
+        );
     }
 }
