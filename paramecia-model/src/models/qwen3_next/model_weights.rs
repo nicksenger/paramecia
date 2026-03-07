@@ -5935,14 +5935,3 @@ impl ArrowNode for GeneralHeadNormApplyOp {
 }
 
 impl_qwen_leaf_node!(U177, GeneralHeadOutputOp);
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn foo() {
-        type G = <ModelWeights as ArrowNode>::Graph;
-        println!("{}", std::any::type_name::<G>());
-    }
-}

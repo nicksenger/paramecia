@@ -10,4 +10,4 @@ glowstick = { workspace = true }
 inception = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-typosaurus = { path = "../../typosaurus" }
+typosaurus = { git = "https://github.com/nicksenger/typosaurus.git", branch = "paramecia" }
