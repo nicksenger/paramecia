@@ -17,6 +17,7 @@ pub mod flatten;
 pub mod flatten_prefix2;
 pub mod from_vec_on_device;
 pub mod gather;
+mod graph_nodes;
 pub mod group_topk_assignments;
 pub mod index_add_dim0;
 pub mod index_select_dim0;

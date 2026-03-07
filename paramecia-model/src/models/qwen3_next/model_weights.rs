@@ -5,6 +5,7 @@ use paramecia_arrow::{
     Arrow, Combinator, CombinatorTraceExt, If, LiftResult, MapErr, SwitchRef, Then, TryFoldRange,
     WrapOk,
 };
+use paramecia_arrow::{ArrowGraph, ArrowNode, Ident, Identified};
 use paramecia_core::quantized::{gguf_file, QTensor, SharedQTensor};
 use paramecia_core::{DType, Device, Result, Tensor, D};
 use paramecia_nn::{Activation, Embedding, Module};
@@ -19,6 +20,11 @@ use std::io::{Read, Seek};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{trace, warn};
+use typosaurus::collections::sp::Node;
+use typosaurus::num::consts::{
+    U147, U148, U149, U150, U151, U152, U153, U154, U155, U156, U157, U158, U159, U160, U161, U162,
+    U163, U164, U165, U166, U167, U168, U169, U170, U171, U172, U173, U174, U175, U176, U177,
+};
 
 use super::config::{DeviceOffloadMode, KvCacheQuantization, LayerDeviceMap};
 use super::expert_cache::{should_cache_experts, ExpertCache};
@@ -5823,5 +5829,120 @@ impl ModelWeights {
         }
 
         Ok(true)
+    }
+}
+
+macro_rules! impl_qwen_leaf_node {
+    ($id:ty, $ty:ty) => {
+        #[primitive(property = Ident)]
+        impl Identified for $ty {
+            type Id = $id;
+        }
+
+        #[primitive(property = ArrowGraph)]
+        impl ArrowNode for $ty {
+            type Graph = Node<<Self as Identified>::Id, Self>;
+        }
+    };
+}
+
+impl_qwen_leaf_node!(U147, LayerRunTransferOp);
+impl_qwen_leaf_node!(U148, LayerRunForwardOp);
+#[primitive(property = Ident)]
+impl Identified for LayerLoopInvokeRunOp {
+    type Id = U149;
+}
+#[primitive(property = ArrowGraph)]
+impl ArrowNode for LayerLoopInvokeRunOp {
+    type Graph = <LayerRunOp as ArrowNode>::Graph;
+}
+
+impl_qwen_leaf_node!(U150, LayerLoopCollectStatsOp);
+impl_qwen_leaf_node!(U151, DecodeLayerTransferOp);
+impl_qwen_leaf_node!(U152, DecodeLayerForwardOp);
+impl_qwen_leaf_node!(U153, TrainResolveOp);
+impl_qwen_leaf_node!(U154, TrainAttnNormOp);
+impl_qwen_leaf_node!(U155, TrainAttnForwardOp);
+impl_qwen_leaf_node!(U156, TrainFfnPrepOp);
+impl_qwen_leaf_node!(U157, TrainLastForwardMoeOp);
+impl_qwen_leaf_node!(U158, TrainLastFinalizeOp);
+impl_qwen_leaf_node!(U159, TrainNonLastPrefetchOp);
+impl_qwen_leaf_node!(U160, TrainNonLastFinalizeOp);
+impl_qwen_leaf_node!(U161, PrefetchResolveOp);
+impl_qwen_leaf_node!(U162, PrefetchAttnNormOp);
+impl_qwen_leaf_node!(U163, PrefetchAttnForwardOp);
+impl_qwen_leaf_node!(U164, PrefetchFfnPrepOp);
+impl_qwen_leaf_node!(U165, PrefetchLastForwardMoeOp);
+impl_qwen_leaf_node!(U166, PrefetchLastFinalizeOp);
+impl_qwen_leaf_node!(U167, PrefetchNonLastPrefetchOp);
+impl_qwen_leaf_node!(U168, PrefetchNonLastFinalizeOp);
+impl_qwen_leaf_node!(U169, ModelEmbedForwardOp);
+impl_qwen_leaf_node!(U170, ModelEmbedFinalizeOp);
+#[primitive(property = Ident)]
+impl Identified for DecodeLayerLoopExec {
+    type Id = U171;
+}
+#[primitive(property = ArrowGraph)]
+impl ArrowNode for DecodeLayerLoopExec {
+    type Graph = <TryFoldRange<DecodeLayerStepOp, TypedTensor<Hidden3>, paramecia_core::Error> as ArrowNode>::Graph;
+}
+
+#[primitive(property = Ident)]
+impl Identified for PrefetchLayerLoopExec {
+    type Id = U172;
+}
+#[primitive(property = ArrowGraph)]
+impl ArrowNode for PrefetchLayerLoopExec {
+    type Graph = Node<<Self as Identified>::Id, Self>;
+}
+
+#[primitive(property = Ident)]
+impl Identified for CaptureLayerLoopExec {
+    type Id = U173;
+}
+#[primitive(property = ArrowGraph)]
+impl ArrowNode for CaptureLayerLoopExec {
+    type Graph =
+        <TryFoldRange<LayerLoopStepOp, LayerRunState, paramecia_core::Error> as ArrowNode>::Graph;
+}
+
+#[primitive(property = Ident)]
+impl Identified for NormalLayerLoopExec {
+    type Id = U174;
+}
+#[primitive(property = ArrowGraph)]
+impl ArrowNode for NormalLayerLoopExec {
+    type Graph =
+        <TryFoldRange<LayerLoopStepOp, LayerRunState, paramecia_core::Error> as ArrowNode>::Graph;
+}
+
+#[primitive(property = Ident)]
+impl Identified for GeneralHeadToPrimaryOp {
+    type Id = U175;
+}
+#[primitive(property = ArrowGraph)]
+impl ArrowNode for GeneralHeadToPrimaryOp {
+    type Graph = Node<<Self as Identified>::Id, Self>;
+}
+
+#[primitive(property = Ident)]
+impl Identified for GeneralHeadNormApplyOp {
+    type Id = U176;
+}
+#[primitive(property = ArrowGraph)]
+impl ArrowNode for GeneralHeadNormApplyOp {
+    type Graph = <NormHiddenFlow as ArrowNode>::Graph;
+}
+
+impl_qwen_leaf_node!(U177, GeneralHeadOutputOp);
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn foo() {
+        type G = <ModelWeights as ArrowNode>::Graph;
+        println!("{}", std::any::type_name::<G>());
     }
 }

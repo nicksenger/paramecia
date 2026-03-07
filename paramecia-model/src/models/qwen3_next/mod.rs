@@ -38,10 +38,13 @@ use crate::quantized_nn::RmsNorm;
 use inception::{primitive, Inception};
 use paramecia_arrow::vis::{Graph, Vis, Visualize};
 use paramecia_arrow::{Arrow, Combinator, CombinatorTraceExt, Fanout, LiftResult, WithUnitCtx};
+use paramecia_arrow::{ArrowGraph, ArrowNode, Ident, Identified};
 use paramecia_core::{DType, Device, Result, Tensor};
 use paramecia_nn::Module;
 use paramecia_tensor::residual_add::ResidualAddOp;
 use paramecia_tensor::Tensor as TypedTensor;
+use typosaurus::collections::sp::Node;
+use typosaurus::num::consts::{U107, U108, U109, U110, U111};
 
 use full_attention::{FullAttention, FullAttentionForwardGraph};
 use linear_attention::{LinearAttention, LinearAttentionForwardGraph};
@@ -615,4 +618,47 @@ impl LayerWeights {
             AttentionLayer::Linear(attn) => attn.restore_state_from_prefix(entry),
         }
     }
+}
+
+macro_rules! impl_qwen_leaf_node {
+    ($id:ty, $ty:ty) => {
+        #[primitive(property = Ident)]
+        impl Identified for $ty {
+            type Id = $id;
+        }
+
+        #[primitive(property = ArrowGraph)]
+        impl ArrowNode for $ty {
+            type Graph = Node<<Self as Identified>::Id, Self>;
+        }
+    };
+}
+
+#[primitive(property = Ident)]
+impl Identified for LayerAttnPrepareOp {
+    type Id = U107;
+}
+#[primitive(property = ArrowGraph)]
+impl ArrowNode for LayerAttnPrepareOp {
+    type Graph = <Fanout<TypedTensor<Hidden3>> as ArrowNode>::Graph;
+}
+
+impl_qwen_leaf_node!(U108, LayerAttnDispatchOp);
+#[primitive(property = Ident)]
+impl Identified for LayerFfnPrepareOp {
+    type Id = U109;
+}
+#[primitive(property = ArrowGraph)]
+impl ArrowNode for LayerFfnPrepareOp {
+    type Graph = <Fanout<TypedTensor<Hidden3>> as ArrowNode>::Graph;
+}
+
+impl_qwen_leaf_node!(U110, LayerFfnMoeOp);
+#[primitive(property = Ident)]
+impl Identified for LayerFfnResidualOp {
+    type Id = U111;
+}
+#[primitive(property = ArrowGraph)]
+impl ArrowNode for LayerFfnResidualOp {
+    type Graph = <ResidualAddHiddenFlow as ArrowNode>::Graph;
 }

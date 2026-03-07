@@ -17,6 +17,13 @@ use paramecia_arrow::{
     GroupByIndexOp, LiftResult, MapErr, MapOk, OptionThen, Swap2, Then, TryFoldRange,
     TryFoldSliceMut, TryFromOp, TryIndexMutCtx, WrapOk, Zip, Zip3, ZipOk, ZipOk3, ZipVecOp,
 };
+use paramecia_arrow::{ArrowGraph, ArrowNode, Ident, Identified};
+use typosaurus::collections::list::List as TList;
+use typosaurus::collections::sp::Node;
+use typosaurus::num::consts::{
+    U130, U131, U132, U133, U134, U135, U136, U137, U138, U139, U140, U141, U142, U143, U144, U145,
+    U146,
+};
 
 use paramecia_tensor::dims3::Dims3Op;
 use paramecia_tensor::flatten::FlattenOp;
@@ -2730,4 +2737,90 @@ impl MtpHead {
         let state = fold.traced_forward(&mut step_ctx, (init_state, 0..depth_limit))?;
         Ok(state.logits)
     }
+}
+
+macro_rules! impl_qwen_leaf_node {
+    ($id:ty, $ty:ty) => {
+        #[primitive(property = Ident)]
+        impl Identified for $ty {
+            type Id = $id;
+        }
+
+        #[primitive(property = ArrowGraph)]
+        impl ArrowNode for $ty {
+            type Graph = Node<<Self as Identified>::Id, Self>;
+        }
+    };
+}
+
+impl_qwen_leaf_node!(U130, MtpGatePrepOp);
+impl_qwen_leaf_node!(U131, MtpDispatchExpertLoopOp);
+#[primitive(property = Ident)]
+impl Identified for MtpPrepareHiddenStepOp {
+    type Id = U132;
+}
+#[primitive(property = ArrowGraph)]
+impl ArrowNode for MtpPrepareHiddenStepOp {
+    type Graph = <MtpHiddenDispatchPrepFlow as ArrowNode>::Graph;
+}
+
+#[primitive(property = Ident)]
+impl Identified for MtpPrepareRouteStepOp {
+    type Id = U133;
+}
+#[primitive(property = ArrowGraph)]
+impl ArrowNode for MtpPrepareRouteStepOp {
+    type Graph = TList<(
+        <MtpRoutingVecFlow as ArrowNode>::Graph,
+        TList<(
+            <MtpRoutingCastHostOp as ArrowNode>::Graph,
+            <Swap2<Vec<f32>, Vec<u32>> as ArrowNode>::Graph,
+        )>,
+    )>;
+}
+
+#[primitive(property = Ident)]
+impl Identified for MtpMoeBlockForwardFlow {
+    type Id = U134;
+}
+#[primitive(property = ArrowGraph)]
+impl ArrowNode for MtpMoeBlockForwardFlow {
+    type Graph = Node<<Self as Identified>::Id, Self>;
+}
+
+impl_qwen_leaf_node!(U135, MtpBatchedEmbedOp);
+impl_qwen_leaf_node!(U136, MtpBatchedProjectBlocksOp);
+impl_qwen_leaf_node!(U137, MtpBatchedFinalizeOp);
+impl_qwen_leaf_node!(U138, MtpTrainingDepthResolveOp);
+impl_qwen_leaf_node!(U139, MtpTrainingDepthProjectBlocksOp);
+impl_qwen_leaf_node!(U140, MtpTrainingDepthFinalizeOp);
+impl_qwen_leaf_node!(U141, MtpTrainingWeightedDepthResolveOp);
+impl_qwen_leaf_node!(U142, MtpTrainingWeightedDepthProjectBlocksOp);
+impl_qwen_leaf_node!(U143, MtpTrainingWeightedDepthFinalizeOp);
+
+#[primitive(property = Ident)]
+impl<'a> Identified for RmsNormHiddenOp<'a> {
+    type Id = U144;
+}
+#[primitive(property = ArrowGraph)]
+impl<'a> ArrowNode for RmsNormHiddenOp<'a> {
+    type Graph = Node<<Self as Identified>::Id, Self>;
+}
+
+#[primitive(property = Ident)]
+impl<'a> Identified for MtpAttnForwardOp<'a> {
+    type Id = U145;
+}
+#[primitive(property = ArrowGraph)]
+impl<'a> ArrowNode for MtpAttnForwardOp<'a> {
+    type Graph = Node<<Self as Identified>::Id, Self>;
+}
+
+#[primitive(property = Ident)]
+impl<'a> Identified for MtpMoeForwardOp<'a> {
+    type Id = U146;
+}
+#[primitive(property = ArrowGraph)]
+impl<'a> ArrowNode for MtpMoeForwardOp<'a> {
+    type Graph = Node<<Self as Identified>::Id, Self>;
 }

@@ -11,6 +11,7 @@ use paramecia_arrow::{
     Second, SetInsertOp, Switch, Then, Third, TryFoldRange, TryFoldVec, TryFromOp, WrapOk, Zip,
     Zip3, ZipOk, ZipOk3,
 };
+use paramecia_arrow::{ArrowGraph, ArrowNode, Ident, Identified};
 use paramecia_core::quantized::{GgmlDType, QStorage, QTensor, SharedQTensor};
 use paramecia_core::{DType, Device, Result, Tensor};
 use paramecia_nn::Activation;
@@ -39,6 +40,11 @@ use std::io::{Read, Seek};
 use std::ops::Deref;
 use std::sync::Arc;
 use tracing::debug;
+use typosaurus::collections::sp::Node;
+use typosaurus::num::consts::{
+    U112, U113, U114, U115, U116, U117, U118, U119, U120, U121, U122, U123, U124, U125, U126, U127,
+    U128, U129,
+};
 
 type TQMatMul<S> = paramecia_tensor::QMatMul<S>;
 type THidden = TTensor<Shape3<B, N, S>>;
@@ -3546,3 +3552,53 @@ impl MoeBlock {
         Ok(())
     }
 }
+
+macro_rules! impl_qwen_leaf_node {
+    ($id:ty, $ty:ty) => {
+        #[primitive(property = Ident)]
+        impl Identified for $ty {
+            type Id = $id;
+        }
+
+        #[primitive(property = ArrowGraph)]
+        impl ArrowNode for $ty {
+            type Graph = Node<<Self as Identified>::Id, Self>;
+        }
+    };
+}
+
+impl_qwen_leaf_node!(U112, MoePrefetchInferenceCondOp);
+impl_qwen_leaf_node!(U113, MoePrefetchTrainingCondOp);
+impl_qwen_leaf_node!(U114, MoeSequentialParallelCondOp);
+impl_qwen_leaf_node!(U115, PrefetchInferenceExpertOp);
+impl_qwen_leaf_node!(U116, PrefetchTrainingExpertOp);
+impl_qwen_leaf_node!(U117, PrepareGpuCachedDispatchOp);
+impl_qwen_leaf_node!(U118, ApplyGpuCachedForwardOp);
+impl_qwen_leaf_node!(U119, FinalizeGpuCachedDispatchOp);
+impl_qwen_leaf_node!(U120, PrepareSequentialDispatchOp);
+impl_qwen_leaf_node!(U121, ApplySequentialExpertForwardOp);
+impl_qwen_leaf_node!(U122, FinalizeSequentialDispatchOp);
+
+#[primitive(property = Ident)]
+impl<'a> Identified for CpuFusedCountExpertStepOp<'a> {
+    type Id = U123;
+}
+#[primitive(property = ArrowGraph)]
+impl<'a> ArrowNode for CpuFusedCountExpertStepOp<'a> {
+    type Graph = Node<<Self as Identified>::Id, Self>;
+}
+
+#[primitive(property = Ident)]
+impl<'a> Identified for CpuFusedAssignPairStepOp<'a> {
+    type Id = U124;
+}
+#[primitive(property = ArrowGraph)]
+impl<'a> ArrowNode for CpuFusedAssignPairStepOp<'a> {
+    type Graph = Node<<Self as Identified>::Id, Self>;
+}
+
+impl_qwen_leaf_node!(U125, CpuFusedCollectAssignmentsStepOp);
+impl_qwen_leaf_node!(U126, MoePathUseCpuFusedCondOp);
+impl_qwen_leaf_node!(U127, MoePathUseBatchedCondOp);
+impl_qwen_leaf_node!(U128, MoePathUseGpuGroupedCondOp);
+impl_qwen_leaf_node!(U129, MoePathExtractHiddenOp);
