@@ -2455,6 +2455,7 @@ dependencies = [
 [[package]]
 name = "glowstick"
 version = "0.2.0"
+source = "git+https://github.com/nicksenger/glowstick.git?branch=paramecia#e3471c8f50b1cf18aa64806cdcddf4031177b08f"
 dependencies = [
  "typosaurus",
 ]
@@ -2852,6 +2853,7 @@ dependencies = [
 [[package]]
 name = "iced-sugiyama"
 version = "0.1.0"
+source = "git+https://github.com/nicksenger/iced-sugiyama.git?branch=paramecia#30388e3a22d15a220546dbde3e7283651b7157de"
 dependencies = [
  "iced",
  "lyon_algorithms",
@@ -3164,6 +3166,7 @@ dependencies = [
 [[package]]
 name = "inception"
 version = "0.1.0"
+source = "git+https://github.com/nicksenger/Inception.git?branch=paramecia#dbd3208c0dcf23f8b76acebea4401e193ae2291d"
 dependencies = [
  "inception-macros",
 ]
@@ -3171,6 +3174,7 @@ dependencies = [
 [[package]]
 name = "inception-macros"
 version = "0.1.0"
+source = "git+https://github.com/nicksenger/Inception.git?branch=paramecia#dbd3208c0dcf23f8b76acebea4401e193ae2291d"
 dependencies = [
  "deluxe",
  "proc-macro2",
@@ -5577,6 +5581,7 @@ dependencies = [
 [[package]]
 name = "rust-sugiyama"
 version = "0.4.0"
+source = "git+https://github.com/nicksenger/rust-sugiyama.git?branch=paramecia#81485c5eef2f88475000c8fb5d07b577ba316a31"
 dependencies = [
  "log",
  "petgraph 0.8.3",
@@ -6883,6 +6888,7 @@ checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 [[package]]
 name = "typosaurus"
 version = "0.2.0"
+source = "git+https://github.com/nicksenger/typosaurus.git?branch=paramecia#54a36f9e6acee0edaa6af6f08bac75f5f24caabb"
 dependencies = [
  "typenum",
 ]
