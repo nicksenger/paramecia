@@ -53,6 +53,10 @@ qwen35_0p8b = [
     "paramecia-model/qwen35_0p8b",
     "paramecia-opt/qwen35_0p8b",
 ]
+qwen35_2b = [
+    "paramecia-model/qwen35_2b",
+    "paramecia-opt/qwen35_2b",
+]
 qwen35_4b = [
     "paramecia-model/qwen35_4b",
     "paramecia-opt/qwen35_4b",
@@ -65,4 +69,3 @@ qwen35_27b = [
     "paramecia-model/qwen35_27b",
     "paramecia-opt/qwen35_27b",
 ]
-

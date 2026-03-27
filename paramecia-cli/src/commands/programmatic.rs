@@ -59,6 +59,13 @@ pub async fn run(
         // Clear disabled_tools when enabled_tools is set
         config.disabled_tools.clear();
     }
+    if !tui_args.builtin_tools.is_empty() {
+        config.builtin_tools = tui_args.builtin_tools.clone();
+    }
+    if tui_args.no_builtin_tools {
+        config.no_builtin_tools = true;
+        config.builtin_tools.clear();
+    }
 
     let agent: SharedAgent = Rc::new(RefCell::new(Some(
         Agent::with_options(config, mode, tui_args.max_turns, None).await?,

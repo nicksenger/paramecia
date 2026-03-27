@@ -2809,7 +2809,11 @@ pub fn flash_attn_q8(
     seq_k: usize,
     q_offset: usize,
     causal: bool,
+    prefer_mma: bool,
 ) -> Result<Tensor> {
+    #[cfg(not(feature = "cuda"))]
+    let _ = prefer_mma;
+
     // Validate shapes
     let q_dims = q.dims();
     let k_dims = k_l.shape().dims();
@@ -2883,7 +2887,7 @@ pub fn flash_attn_q8(
         if let crate::Device::Cuda(_) = q.device() {
             return crate::cuda_backend::deltanet::flash_attn_q8(
                 q, k_storage, v_storage, q_l, k_l, v_l, scale, b, h, h_k, d, seq_q, seq_k,
-                q_offset, causal,
+                q_offset, causal, prefer_mma,
             );
         }
     }

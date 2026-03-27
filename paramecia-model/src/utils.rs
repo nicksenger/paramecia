@@ -131,9 +131,38 @@ pub fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
         Ok(xs)
     } else {
         let (b_sz, n_kv_head, seq_len, head_dim) = xs.dims4()?;
-        // Using cat is faster than a broadcast as it avoids going through a potentially
-        // strided copy.
-        // https://github.com/huggingface/candle/pull/2043
-        Tensor::cat(&vec![&xs; n_rep], 2)?.reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
+        xs.unsqueeze(2)?
+            .expand((b_sz, n_kv_head, n_rep, seq_len, head_dim))?
+            .contiguous()?
+            .reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repeat_kv;
+    use paramecia_core::{Device, Result, Tensor};
+
+    #[test]
+    fn repeat_kv_repeats_each_head_in_order() -> Result<()> {
+        let xs = Tensor::from_vec(
+            vec![
+                1.0f32, 2.0, // head 0
+                3.0, 4.0, // head 1
+            ],
+            (1, 2, 2, 1),
+            &Device::Cpu,
+        )?;
+
+        let repeated = repeat_kv(xs, 2)?;
+        let values = repeated.flatten_all()?.to_vec1::<f32>()?;
+
+        assert_eq!(
+            values,
+            vec![
+                1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0,
+            ]
+        );
+        Ok(())
     }
 }

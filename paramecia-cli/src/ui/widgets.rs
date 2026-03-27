@@ -1624,7 +1624,7 @@ pub fn render_interrupt() -> Vec<Line<'static>> {
     vec![Line::from(vec![
         Span::styled("  ⎣ ", Style::default().fg(colors::MUTED)),
         Span::styled(
-            "Interrupted · What would you like Paramecia to do instead?",
+            "Interrupted · What would you like the Agent to do instead?",
             Style::default().fg(colors::WARNING),
         ),
     ])]

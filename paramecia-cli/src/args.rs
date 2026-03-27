@@ -68,6 +68,15 @@ pub struct TuiArgs {
     #[arg(long = "enabled-tools", value_name = "TOOL")]
     pub enabled_tools: Vec<String>,
 
+    /// Enable only specific builtin tools. MCP tools remain available regardless.
+    /// Accepts a comma-separated list such as `--builtin-tools=grep,read_file`.
+    #[arg(long = "builtin-tools", value_name = "TOOL", value_delimiter = ',')]
+    pub builtin_tools: Vec<String>,
+
+    /// Disable all builtin tools. MCP tools remain available regardless.
+    #[arg(long = "no-builtin-tools", default_value_t = false)]
+    pub no_builtin_tools: bool,
+
     /// Output format for programmatic mode (-p): 'text' for human-readable (default),
     /// 'json' for all messages at end, 'streaming' for newline-delimited JSON per message.
     #[arg(long, value_name = "FORMAT", default_value = "text")]

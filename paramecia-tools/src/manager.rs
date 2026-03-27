@@ -1,7 +1,7 @@
 //! Tool discovery and management.
 
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
@@ -234,20 +234,35 @@ impl ToolManager {
     /// Create a new tool manager with default builtin tools.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_configs_and_builtin_filter(HashMap::new(), &[], false)
+    }
+
+    /// Create a new tool manager with configuration overrides and a builtin allowlist.
+    #[must_use]
+    pub fn with_configs_and_builtin_filter(
+        configs: HashMap<String, ToolConfig>,
+        builtin_tools: &[String],
+        disable_all_builtins: bool,
+    ) -> Self {
         let mut manager = Self {
             factories: HashMap::new(),
             instances: RwLock::new(HashMap::new()),
             default_configs: HashMap::new(),
-            config_overrides: HashMap::new(),
+            config_overrides: configs,
         };
 
+        let builtin_filter = (!disable_all_builtins && !builtin_tools.is_empty())
+            .then(|| builtin_tools.iter().map(String::as_str).collect::<HashSet<_>>());
+
         // Register builtin tools
-        manager.register_builtin::<Bash>();
-        manager.register_builtin::<ReadFile>();
-        manager.register_builtin::<WriteFile>();
-        manager.register_builtin::<SearchReplace>();
-        manager.register_builtin::<Grep>();
-        manager.register_builtin::<Todo>();
+        if !disable_all_builtins {
+            manager.register_builtin::<Bash>(builtin_filter.as_ref());
+            manager.register_builtin::<ReadFile>(builtin_filter.as_ref());
+            manager.register_builtin::<WriteFile>(builtin_filter.as_ref());
+            manager.register_builtin::<SearchReplace>(builtin_filter.as_ref());
+            manager.register_builtin::<Grep>(builtin_filter.as_ref());
+            manager.register_builtin::<Todo>(builtin_filter.as_ref());
+        }
 
         manager
     }
@@ -255,18 +270,21 @@ impl ToolManager {
     /// Create a tool manager with configuration overrides.
     #[must_use]
     pub fn with_configs(configs: HashMap<String, ToolConfig>) -> Self {
-        let mut manager = Self::new();
-        manager.config_overrides = configs;
-        manager
+        Self::with_configs_and_builtin_filter(configs, &[], false)
     }
 
     /// Register a builtin tool type.
-    fn register_builtin<T>(&mut self)
+    fn register_builtin<T>(&mut self, builtin_filter: Option<&HashSet<&str>>)
     where
         T: Tool + Default + 'static,
     {
         let default_tool = T::default();
         let name = default_tool.name().to_string();
+        if let Some(filter) = builtin_filter
+            && !filter.contains(name.as_str())
+        {
+            return;
+        }
         let default_config = default_tool.config().clone();
 
         self.default_configs.insert(name.clone(), default_config);
@@ -454,6 +472,31 @@ mod tests {
         assert!(tools.contains(&"search_replace".to_string()));
         assert!(tools.contains(&"grep".to_string()));
         assert!(tools.contains(&"todo".to_string()));
+    }
+
+    #[test]
+    fn test_builtin_tools_can_be_filtered() {
+        let manager = ToolManager::with_configs_and_builtin_filter(
+            HashMap::new(),
+            &["grep".to_string(), "read_file".to_string()],
+            false,
+        );
+        let tools = manager.available_tools();
+
+        assert!(tools.contains(&"grep".to_string()));
+        assert!(tools.contains(&"read_file".to_string()));
+        assert!(!tools.contains(&"bash".to_string()));
+        assert!(!tools.contains(&"write_file".to_string()));
+        assert!(!tools.contains(&"search_replace".to_string()));
+        assert!(!tools.contains(&"todo".to_string()));
+    }
+
+    #[test]
+    fn test_builtin_tools_can_be_disabled_entirely() {
+        let manager = ToolManager::with_configs_and_builtin_filter(HashMap::new(), &[], true);
+        let tools = manager.available_tools();
+
+        assert!(tools.is_empty());
     }
 
     #[test]

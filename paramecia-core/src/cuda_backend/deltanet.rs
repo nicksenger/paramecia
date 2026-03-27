@@ -1135,6 +1135,7 @@ pub fn flash_attn_q8(
     seq_k: usize,
     q_offset: usize,
     causal: bool,
+    prefer_mma: bool,
 ) -> Result<Tensor> {
     // Validate shapes
     let q_dims = q.dims();
@@ -1189,7 +1190,7 @@ pub fn flash_attn_q8(
         if let Device::Cuda(_) = q.device() {
             return flash_attn_q8_cuda(
                 &q, k_storage, v_storage, q_l, k_l, v_l, scale, b, h, h_k, d, seq_q, seq_k,
-                q_offset, causal,
+                q_offset, causal, prefer_mma,
             );
         }
     }
@@ -1217,6 +1218,7 @@ fn flash_attn_q8_cuda(
     seq_k: usize,
     q_offset: usize,
     causal: bool,
+    prefer_mma: bool,
 ) -> Result<Tensor> {
     // Extract storage and device
     let dev = match &*q.storage() {
@@ -1286,7 +1288,7 @@ fn flash_attn_q8_cuda(
 
     // Use MMA tensor core kernel for prefill (seq_q > 1) on Ampere+ GPUs
     // PARAMECIA_NO_MMA_FA=1 disables for benchmarking
-    let mma_fa = std::env::var("PARAMECIA_NO_MMA_FA").as_deref() != Ok("1");
+    let mma_fa = prefer_mma && std::env::var("PARAMECIA_NO_MMA_FA").as_deref() != Ok("1");
     if seq_q > 1 && mma_fa && crate::quantized::cuda::has_mma_support() {
         use core::ffi::c_void;
         let stream_i64 = stream.cu_stream() as i64;

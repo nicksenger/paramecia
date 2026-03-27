@@ -86,6 +86,12 @@ qwen35_0p8b = [
     "paramecia-host/qwen35_0p8b",
     "paramecia-harness/qwen35_0p8b",
 ]
+qwen35_2b = [
+    "paramecia-text/qwen35_2b",
+    "paramecia-engine/qwen35_2b",
+    "paramecia-host/qwen35_2b",
+    "paramecia-harness/qwen35_2b",
+]
 qwen35_4b = [
     "paramecia-text/qwen35_4b",
     "paramecia-engine/qwen35_4b",

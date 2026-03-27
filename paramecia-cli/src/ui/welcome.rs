@@ -8,6 +8,81 @@ use ratatui::{
 
 use super::widgets::colors;
 
+#[cfg(feature = "qwen3next_80b_a3b")]
+const BUILD_FEATURE_NAME: &str = "qwen3next_80b_a3b";
+#[cfg(feature = "qwen35moe_35b_a3b")]
+const BUILD_FEATURE_NAME: &str = "qwen35moe_35b_a3b";
+#[cfg(feature = "qwen35moe_122b_a10b")]
+const BUILD_FEATURE_NAME: &str = "qwen35moe_122b_a10b";
+#[cfg(feature = "qwen35moe_397b_a17b")]
+const BUILD_FEATURE_NAME: &str = "qwen35moe_397b_a17b";
+#[cfg(feature = "qwen35_0p8b")]
+const BUILD_FEATURE_NAME: &str = "qwen35_0p8b";
+#[cfg(feature = "qwen35_2b")]
+const BUILD_FEATURE_NAME: &str = "qwen35_2b";
+#[cfg(feature = "qwen35_4b")]
+const BUILD_FEATURE_NAME: &str = "qwen35_4b";
+#[cfg(feature = "qwen35_9b")]
+const BUILD_FEATURE_NAME: &str = "qwen35_9b";
+#[cfg(feature = "qwen35_27b")]
+const BUILD_FEATURE_NAME: &str = "qwen35_27b";
+#[cfg(not(any(
+    feature = "qwen3next_80b_a3b",
+    feature = "qwen35moe_35b_a3b",
+    feature = "qwen35moe_122b_a10b",
+    feature = "qwen35moe_397b_a17b",
+    feature = "qwen35_0p8b",
+    feature = "qwen35_2b",
+    feature = "qwen35_4b",
+    feature = "qwen35_9b",
+    feature = "qwen35_27b"
+)))]
+const BUILD_FEATURE_NAME: &str = "qwen35_0p8b";
+
+fn build_feature_display_name() -> String {
+    format_build_feature_name(BUILD_FEATURE_NAME)
+}
+
+fn format_build_feature_name(feature_name: &str) -> String {
+    let mut parts = feature_name.split('_');
+    let family = match parts.next().unwrap_or_default() {
+        "qwen35" => "Qwen 3.5".to_string(),
+        "qwen35moe" => "Qwen 3.5 MoE".to_string(),
+        "qwen3next" => "Qwen 3 Next".to_string(),
+        other => title_case_token(other),
+    };
+
+    let mut display_parts = vec![family];
+    for part in parts {
+        display_parts.push(format_build_feature_part(part));
+    }
+    display_parts.join(" ")
+}
+
+fn format_build_feature_part(part: &str) -> String {
+    if let Some(number) = part.strip_prefix('a').and_then(|value| value.strip_suffix('b')) {
+        return format!("A{}b", number.replace('p', "."));
+    }
+
+    if let Some(number) = part.strip_suffix('b') {
+        return format!("{}b", number.replace('p', "."));
+    }
+
+    title_case_token(part)
+}
+
+fn title_case_token(token: &str) -> String {
+    let mut chars = token.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut value = first.to_uppercase().collect::<String>();
+            value.push_str(chars.as_str());
+            value
+        }
+        None => String::new(),
+    }
+}
+
 /// Welcome banner widget.
 pub struct WelcomeBanner {
     /// Configuration.
@@ -79,6 +154,7 @@ impl WelcomeBanner {
         const BLOCK: &str = "▇▇";
         const SPACE: &str = "  ";
         const LOGO_TEXT_GAP: &str = "   ";
+        let build_label = build_feature_display_name();
 
         // Get model and server counts
         let model_count = self.config.models.len();
@@ -112,7 +188,7 @@ impl WelcomeBanner {
         // Calculate maximum text width to ensure all lines have same total width
         let max_text_width = [
             format!("PARAMECIA v{}", env!("CARGO_PKG_VERSION")).len(),
-            format!("Model: {}", self.config.active_model).len(),
+            format!("Model: {build_label}").len(),
             format!("{model_count} {models_text} · {mcp_server_count} {servers_text}").len(),
             0, // Line 4 has no text
             display_workdir.len(),
@@ -157,13 +233,11 @@ impl WelcomeBanner {
                 Span::raw(SPACE),
                 Span::styled(BLOCK, Style::default().fg(get_line_color(1))),
                 Span::styled(
-                    format!("{LOGO_TEXT_GAP}Model: {}", self.config.active_model),
+                    format!("{LOGO_TEXT_GAP}Model: {build_label}"),
                     Style::default().fg(colors::MUTED),
                 ),
                 Span::raw(
-                    " ".repeat(
-                        max_text_width - format!("Model: {}", self.config.active_model).len(),
-                    ),
+                    " ".repeat(max_text_width - format!("Model: {build_label}").len()),
                 ),
             ]),
             // Line 3: middle bar - "  ▇▇▇▇▇▇▇▇    " (2 + 8 + 4 = 14)
@@ -207,5 +281,29 @@ impl WelcomeBanner {
                 Span::raw(" ".repeat(max_text_width - display_workdir.len())),
             ]),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_build_feature_name;
+
+    #[test]
+    fn formats_dense_qwen_features() {
+        assert_eq!(format_build_feature_name("qwen35_2b"), "Qwen 3.5 2b");
+        assert_eq!(format_build_feature_name("qwen35_9b"), "Qwen 3.5 9b");
+        assert_eq!(format_build_feature_name("qwen35_0p8b"), "Qwen 3.5 0.8b");
+    }
+
+    #[test]
+    fn formats_moe_and_next_features() {
+        assert_eq!(
+            format_build_feature_name("qwen35moe_35b_a3b"),
+            "Qwen 3.5 MoE 35b A3b"
+        );
+        assert_eq!(
+            format_build_feature_name("qwen3next_80b_a3b"),
+            "Qwen 3 Next 80b A3b"
+        );
     }
 }

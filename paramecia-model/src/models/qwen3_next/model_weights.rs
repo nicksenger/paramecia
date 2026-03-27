@@ -70,6 +70,8 @@ const MODEL_NODE_LABEL: &str = "Qwen3.5-122B-A10B";
 const MODEL_NODE_LABEL: &str = "Qwen3.5-397B-A17B";
 #[cfg(feature = "qwen35_0p8b")]
 const MODEL_NODE_LABEL: &str = "Qwen3.5-0.8B";
+#[cfg(feature = "qwen35_2b")]
+const MODEL_NODE_LABEL: &str = "Qwen3.5-2B";
 #[cfg(feature = "qwen35_4b")]
 const MODEL_NODE_LABEL: &str = "Qwen3.5-4B";
 #[cfg(feature = "qwen35_9b")]
@@ -82,6 +84,7 @@ const MODEL_NODE_LABEL: &str = "Qwen3.5-27B";
     feature = "qwen35moe_122b_a10b",
     feature = "qwen35moe_397b_a17b",
     feature = "qwen35_0p8b",
+    feature = "qwen35_2b",
     feature = "qwen35_4b",
     feature = "qwen35_9b",
     feature = "qwen35_27b"
@@ -110,6 +113,9 @@ pub(super) struct ModelConfig {
     /// This is not a switch to adjacent-pair rotation; Qwen3.5 still uses
     /// half-split RoPE rotation semantics.
     pub(super) rope_interleaved: bool,
+    /// mRoPE frequency sections from GGUF metadata.
+    /// When present, these select which RoPE position stream feeds each pair.
+    pub(super) rope_dimension_sections: Option<[usize; 4]>,
     pub(super) num_experts: usize,
     pub(super) num_experts_per_tok: usize,
     pub(super) ssm_d_inner: usize,
@@ -2623,6 +2629,13 @@ impl ModelWeights {
             rope_freq_base,
             n_rot,
             rope_interleaved,
+            rope_dimension_sections: rope_dimension_sections.as_ref().map(|sections| {
+                let mut padded = [0; 4];
+                for (dst, src) in padded.iter_mut().zip(sections.iter().copied()) {
+                    *dst = src;
+                }
+                padded
+            }),
             num_experts,
             num_experts_per_tok,
             ssm_d_inner,
@@ -2776,6 +2789,7 @@ impl ModelWeights {
                             config.max_position_embeddings,
                             config.rope_freq_base,
                             config.rope_interleaved,
+                            config.rope_dimension_sections,
                             config.yarn_config.as_ref(),
                             dev,
                         )?);
@@ -3025,6 +3039,7 @@ impl ModelWeights {
             config.max_position_embeddings,
             config.rope_freq_base,
             config.rope_interleaved,
+            config.rope_dimension_sections,
             config.yarn_config.as_ref(),
             device,
         )?);
@@ -3224,6 +3239,7 @@ impl ModelWeights {
             config.max_position_embeddings,
             config.rope_freq_base,
             config.rope_interleaved,
+            config.rope_dimension_sections,
             config.yarn_config.as_ref(),
             &primary_device,
         )?);
@@ -3268,6 +3284,7 @@ impl ModelWeights {
                 config.max_position_embeddings,
                 config.rope_freq_base,
                 config.rope_interleaved,
+                config.rope_dimension_sections,
                 config.yarn_config.as_ref(),
                 &last_layer_device,
             )?)
@@ -3345,6 +3362,7 @@ impl ModelWeights {
             config.max_position_embeddings,
             config.rope_freq_base,
             config.rope_interleaved,
+            config.rope_dimension_sections,
             config.yarn_config.as_ref(),
             device,
         )?);
@@ -3432,6 +3450,7 @@ impl ModelWeights {
             config.max_position_embeddings,
             config.rope_freq_base,
             config.rope_interleaved,
+            config.rope_dimension_sections,
             config.yarn_config.as_ref(),
             device,
         )?);
@@ -3543,6 +3562,7 @@ impl ModelWeights {
             config.max_position_embeddings,
             config.rope_freq_base,
             config.rope_interleaved,
+            config.rope_dimension_sections,
             config.yarn_config.as_ref(),
             device,
         )?);
@@ -3653,6 +3673,7 @@ impl ModelWeights {
             config.max_position_embeddings,
             config.rope_freq_base,
             config.rope_interleaved,
+            config.rope_dimension_sections,
             config.yarn_config.as_ref(),
             device,
         )?);
@@ -3804,6 +3825,7 @@ impl ModelWeights {
             config.max_position_embeddings,
             config.rope_freq_base,
             config.rope_interleaved,
+            config.rope_dimension_sections,
             config.yarn_config.as_ref(),
             &primary_device,
         )?);
@@ -3821,6 +3843,7 @@ impl ModelWeights {
                         config.max_position_embeddings,
                         config.rope_freq_base,
                         config.rope_interleaved,
+                        config.rope_dimension_sections,
                         config.yarn_config.as_ref(),
                         dev,
                     )?);

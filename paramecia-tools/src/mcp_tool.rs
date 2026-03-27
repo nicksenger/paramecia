@@ -12,6 +12,7 @@ pub struct McpTool {
     name: String,
     description: String,
     parameters_schema: serde_json::Value,
+    prompt: String,
     client: Arc<McpClient>,
     config: ToolConfig,
 }
@@ -23,9 +24,24 @@ impl McpTool {
             name: remote_tool.name.clone(),
             description: remote_tool.description.clone().unwrap_or_default(),
             parameters_schema: remote_tool.input_schema.clone(),
+            prompt: Self::build_prompt(remote_tool),
             client,
             config: ToolConfig::default(),
         }
+    }
+
+    fn build_prompt(remote_tool: &RemoteTool) -> String {
+        let description = remote_tool
+            .description
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("Remote MCP tool.");
+        let parameters = serde_json::to_string_pretty(&remote_tool.input_schema)
+            .unwrap_or_else(|_| remote_tool.input_schema.to_string());
+
+        format!(
+            "{description}\n\n**Parameters Schema:**\n```json\n{parameters}\n```"
+        )
     }
 }
 
@@ -41,6 +57,10 @@ impl Tool for McpTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         self.parameters_schema.clone()
+    }
+
+    fn prompt(&self) -> Option<&str> {
+        Some(&self.prompt)
     }
 
     fn config(&self) -> &ToolConfig {

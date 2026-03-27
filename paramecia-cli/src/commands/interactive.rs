@@ -57,6 +57,13 @@ pub async fn run(
         config.enabled_tools = tui_args.enabled_tools.clone();
         config.disabled_tools.clear();
     }
+    if !tui_args.builtin_tools.is_empty() {
+        config.builtin_tools = tui_args.builtin_tools.clone();
+    }
+    if tui_args.no_builtin_tools {
+        config.no_builtin_tools = true;
+        config.builtin_tools.clear();
+    }
 
     apply_tui_overrides(&mut config);
 

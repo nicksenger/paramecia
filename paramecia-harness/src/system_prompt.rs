@@ -162,21 +162,28 @@ fn convert_tool_examples_to_xml(prompt: &str) -> String {
 fn load_tool_prompts(tool_manager: &ToolManager, tool_call_format: &str) -> Vec<String> {
     let mut prompts = Vec::new();
     let use_xml = tool_call_format != "json_in_xml";
+    let mut tool_names = tool_manager.available_tools();
+    tool_names.sort();
 
-    for tool_name in tool_manager.available_tools() {
+    for tool_name in tool_names {
         if let Ok(tool_arc) = tool_manager.get(&tool_name)
             && let Ok(Some(prompt)) =
                 tool_arc.blocking_inspect(|tool| tool.prompt().map(str::to_string))
         {
-            if use_xml {
-                prompts.push(convert_tool_examples_to_xml(&prompt));
+            let prompt = if use_xml {
+                convert_tool_examples_to_xml(&prompt)
             } else {
-                prompts.push(prompt);
-            }
+                prompt
+            };
+            prompts.push(format_tool_prompt(&tool_name, &prompt));
         }
     }
 
     prompts
+}
+
+fn format_tool_prompt(tool_name: &str, prompt: &str) -> String {
+    format!("Tool: `{tool_name}`\n\n{}", prompt.trim())
 }
 
 /// Build the universal system prompt.
@@ -189,7 +196,12 @@ fn load_tool_prompts(tool_manager: &ToolManager, tool_call_format: &str) -> Vec<
 /// - Project context
 /// - Project documentation
 pub fn get_universal_system_prompt(config: &ParameciaConfig) -> String {
-    let tool_manager = ToolManager::with_configs(config.tools.clone());
+    let tool_manager =
+        ToolManager::with_configs_and_builtin_filter(
+            config.tools.clone(),
+            &config.builtin_tools,
+            config.no_builtin_tools,
+        );
     get_universal_system_prompt_with_tools(&tool_manager, config)
 }
 
@@ -226,7 +238,10 @@ pub fn get_universal_system_prompt_with_tools(
         // Tool prompts (converted to match configured tool_call_format)
         let tool_prompts = load_tool_prompts(tool_manager, config.tool_call_format());
         if !tool_prompts.is_empty() {
-            sections.push(tool_prompts.join("\n---\n"));
+            sections.push(format!(
+                "Here is a list of tools you have available:\n\n{}",
+                tool_prompts.join("\n\n---\n\n")
+            ));
         }
 
         // User instructions
@@ -406,5 +421,83 @@ mod tests {
             "Should not contain JSON, got: {}",
             result
         );
+    }
+
+    #[test]
+    fn test_format_tool_prompt_includes_name_header() {
+        let result = format_tool_prompt("todo", "Manage a structured todo list.");
+        assert!(result.starts_with("Tool: `todo`"));
+        assert!(result.contains("Manage a structured todo list."));
+    }
+
+    #[test]
+    fn test_universal_system_prompt_has_delineated_tool_section() {
+        let mut config = ParameciaConfig::default();
+        config.include_project_context = false;
+        config.instructions.clear();
+
+        let tool_manager =
+            ToolManager::with_configs_and_builtin_filter(
+                config.tools.clone(),
+                &config.builtin_tools,
+                config.no_builtin_tools,
+            );
+        let prompt = get_universal_system_prompt_with_tools(&tool_manager, &config);
+
+        assert!(prompt.contains("The operating system is"));
+        assert!(prompt.contains("The current working directory is:"));
+        assert!(prompt.contains("Here is a list of tools you have available:"));
+        assert!(prompt.contains("Tool: `bash`"));
+        assert!(prompt.contains("Tool: `grep`"));
+        assert!(prompt.contains("Tool: `read_file`"));
+        assert!(prompt.contains("Tool: `search_replace`"));
+        assert!(prompt.contains("Tool: `todo`"));
+        assert!(prompt.contains("Tool: `write_file`"));
+    }
+
+    #[test]
+    fn test_universal_system_prompt_respects_builtin_tool_filter() {
+        let mut config = ParameciaConfig::default();
+        config.include_project_context = false;
+        config.instructions.clear();
+        config.builtin_tools = vec!["grep".to_string(), "read_file".to_string()];
+
+        let tool_manager =
+            ToolManager::with_configs_and_builtin_filter(
+                config.tools.clone(),
+                &config.builtin_tools,
+                config.no_builtin_tools,
+            );
+        let prompt = get_universal_system_prompt_with_tools(&tool_manager, &config);
+
+        assert!(prompt.contains("Tool: `grep`"));
+        assert!(prompt.contains("Tool: `read_file`"));
+        assert!(!prompt.contains("Tool: `bash`"));
+        assert!(!prompt.contains("Tool: `write_file`"));
+        assert!(!prompt.contains("Tool: `search_replace`"));
+        assert!(!prompt.contains("Tool: `todo`"));
+    }
+
+    #[test]
+    fn test_universal_system_prompt_can_disable_all_builtin_tools() {
+        let mut config = ParameciaConfig::default();
+        config.include_project_context = false;
+        config.instructions.clear();
+        config.no_builtin_tools = true;
+
+        let tool_manager = ToolManager::with_configs_and_builtin_filter(
+            config.tools.clone(),
+            &config.builtin_tools,
+            config.no_builtin_tools,
+        );
+        let prompt = get_universal_system_prompt_with_tools(&tool_manager, &config);
+
+        assert!(!prompt.contains("Here is a list of tools you have available:"));
+        assert!(!prompt.contains("Tool: `bash`"));
+        assert!(!prompt.contains("Tool: `grep`"));
+        assert!(!prompt.contains("Tool: `read_file`"));
+        assert!(!prompt.contains("Tool: `search_replace`"));
+        assert!(!prompt.contains("Tool: `todo`"));
+        assert!(!prompt.contains("Tool: `write_file`"));
     }
 }

@@ -417,13 +417,64 @@ impl std::fmt::Debug for FullAttention {
     }
 }
 
+#[cfg_attr(not(any(feature = "cuda", feature = "vulkan")), allow(dead_code))]
 impl FullAttention {
-    #[cfg(any(feature = "cuda", feature = "vulkan"))]
+    const DEFAULT_Q8_FLASH_ENABLED: bool = true;
+
+    #[cfg(feature = "qwen3next_80b_a3b")]
+    const DEFAULT_Q8_FLASH_MMA_ENABLED: bool = true;
+    #[cfg(not(feature = "qwen3next_80b_a3b"))]
+    const DEFAULT_Q8_FLASH_MMA_ENABLED: bool = false;
+
     #[inline]
     pub(super) fn q8_flash_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var("PARAMECIA_DISABLE_Q8_FLASH").is_err())
+        *ENABLED.get_or_init(|| {
+            Self::resolve_q8_flash_enabled(
+                std::env::var("PARAMECIA_ENABLE_Q8_FLASH").ok(),
+                std::env::var("PARAMECIA_DISABLE_Q8_FLASH").is_ok(),
+            )
+        })
+    }
+
+    #[inline]
+    pub(super) fn q8_flash_mma_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            Self::resolve_q8_flash_mma_enabled(
+                std::env::var("PARAMECIA_ENABLE_Q8_FLASH_MMA").ok(),
+                std::env::var("PARAMECIA_DISABLE_Q8_FLASH_MMA").is_ok(),
+                std::env::var("PARAMECIA_NO_MMA_FA").ok(),
+            )
+        })
+    }
+
+    #[inline]
+    fn resolve_q8_flash_enabled(enable: Option<String>, disable: bool) -> bool {
+        if enable.as_deref() == Some("1") {
+            return true;
+        }
+        if disable {
+            return false;
+        }
+        Self::DEFAULT_Q8_FLASH_ENABLED
+    }
+
+    #[inline]
+    fn resolve_q8_flash_mma_enabled(
+        enable: Option<String>,
+        disable: bool,
+        no_mma: Option<String>,
+    ) -> bool {
+        if enable.as_deref() == Some("1") {
+            return true;
+        }
+        if disable || no_mma.as_deref() == Some("1") {
+            return false;
+        }
+        Self::DEFAULT_Q8_FLASH_MMA_ENABLED
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -751,6 +802,7 @@ impl FullAttention {
                 seq_k,
                 q_offset,
                 causal,
+                Self::q8_flash_mma_enabled(),
             )?
             .reshape((b, l, self.num_heads * self.head_dim))?
         } else {
@@ -769,9 +821,7 @@ impl FullAttention {
             let attn_scores = (q.contiguous()?.matmul(&k_t)? * scale)?;
             let attn_scores = Self::apply_attn_mask(attn_scores, typed_attn_mask.as_ref())?;
 
-            // Clamp attention scores to prevent softmax overflow during training
-            let attn_scores_clamped = attn_scores.clamp(-100.0, 100.0)?;
-            let attn_weights = paramecia_nn::ops::softmax_last_dim(&attn_scores_clamped)?;
+            let attn_weights = paramecia_nn::ops::softmax_last_dim(&attn_scores)?;
             let attn_output = attn_weights.matmul(&v.contiguous()?)?;
 
             // Reshape attention output
@@ -800,9 +850,7 @@ impl FullAttention {
             let attn_scores = (q.contiguous()?.matmul(&k_t)? * scale)?;
             let attn_scores = Self::apply_attn_mask(attn_scores, typed_attn_mask.as_ref())?;
 
-            // Clamp attention scores to prevent softmax overflow during training
-            let attn_scores_clamped = attn_scores.clamp(-100.0, 100.0)?;
-            let attn_weights = paramecia_nn::ops::softmax_last_dim(&attn_scores_clamped)?;
+            let attn_weights = paramecia_nn::ops::softmax_last_dim(&attn_scores)?;
             let attn_output = attn_weights.matmul(&v.contiguous()?)?;
 
             // Reshape attention output
@@ -1083,5 +1131,34 @@ impl FullAttention {
             .as_ref()
             .map(|c| c.seq_len)
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FullAttention;
+
+    #[test]
+    fn q8_flash_default_stays_enabled_without_env_overrides() {
+        assert!(FullAttention::resolve_q8_flash_enabled(None, false));
+    }
+
+    #[test]
+    fn q8_flash_mma_env_overrides_default() {
+        assert!(FullAttention::resolve_q8_flash_mma_enabled(
+            Some("1".to_string()),
+            true,
+            Some("1".to_string())
+        ));
+        assert!(!FullAttention::resolve_q8_flash_mma_enabled(
+            None,
+            true,
+            None,
+        ));
+        assert!(!FullAttention::resolve_q8_flash_mma_enabled(
+            None,
+            false,
+            Some("1".to_string())
+        ));
     }
 }
