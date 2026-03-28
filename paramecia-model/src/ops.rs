@@ -824,6 +824,7 @@ pub fn flash_attn_q8(
     seq_k: usize,
     q_offset: usize,
     causal: bool,
+    prefer_mma: bool,
 ) -> Result<Tensor> {
     // Delegate to candle-core's implementation
     paramecia_core::deltanet_ops::flash_attn_q8(
@@ -842,5 +843,6 @@ pub fn flash_attn_q8(
         seq_k,
         q_offset,
         causal,
+        prefer_mma,
     )
 }

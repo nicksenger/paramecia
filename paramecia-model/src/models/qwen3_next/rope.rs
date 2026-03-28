@@ -123,6 +123,8 @@ pub(super) struct RotaryEmbedding {
     /// For Qwen3.5 this does NOT imply adjacent-pair rotation (`rope_i`); rotation
     /// remains the standard half-split rotary transform.
     interleaved: bool,
+    /// mRoPE frequency sections from GGUF metadata.
+    sections: Option<[usize; 4]>,
     /// YARN attention scale factor (1.0 if YARN disabled)
     yarn_attn_scale: f32,
 }
@@ -133,6 +135,7 @@ impl std::fmt::Debug for RotaryEmbedding {
             .field("n_rot", &self.n_rot)
             .field("head_dim", &self.head_dim)
             .field("interleaved", &self.interleaved)
+            .field("sections", &self.sections)
             .field("yarn_attn_scale", &self.yarn_attn_scale)
             .finish()
     }
@@ -147,20 +150,15 @@ impl RotaryEmbedding {
         max_position_embeddings: usize,
         rope_theta: f64,
         interleaved: bool,
+        sections: Option<[usize; 4]>,
         yarn_config: Option<&YarnConfig>,
         dev: &Device,
     ) -> Result<Self> {
-        // Only compute frequencies for the first n_rot dimensions.
-        // The frequency exponent uses n_rot as the base (matching llama.cpp).
-        let max_seq_len = max_position_embeddings;
-
-        // Compute base inverse frequencies
         let mut inv_freq: Vec<f32> = (0..n_rot)
             .step_by(2)
             .map(|i| 1f32 / rope_theta.powf(i as f64 / n_rot as f64) as f32)
             .collect();
 
-        // Apply YARN frequency scaling if configured
         let yarn_attn_scale = if let Some(yarn) = yarn_config {
             if yarn.is_enabled() {
                 Self::apply_yarn_scaling(&mut inv_freq, n_rot, yarn);
@@ -172,20 +170,95 @@ impl RotaryEmbedding {
             1.0
         };
 
-        let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
-        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(dtype)?
-            .reshape((max_seq_len, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
+        let freqs = Tensor::from_vec(
+            Self::build_frequency_cache(max_position_embeddings, &inv_freq, sections, interleaved),
+            (max_position_embeddings, inv_freq.len()),
+            dev,
+        )?
+        .to_dtype(dtype)?;
         Ok(Self {
             sin: freqs.sin()?.try_into()?,
             cos: freqs.cos()?.try_into()?,
             n_rot,
             head_dim,
             interleaved,
+            sections,
             yarn_attn_scale,
         })
+    }
+
+    fn build_frequency_cache(
+        max_seq_len: usize,
+        inv_freq: &[f32],
+        sections: Option<[usize; 4]>,
+        interleaved: bool,
+    ) -> Vec<f32> {
+        let mut freqs = Vec::with_capacity(max_seq_len * inv_freq.len());
+        for pos in 0..max_seq_len {
+            freqs.extend(Self::angles_for_position_streams(
+                [pos as f32; 4],
+                inv_freq,
+                sections,
+                interleaved,
+            ));
+        }
+        freqs
+    }
+
+    fn angles_for_position_streams(
+        position_streams: [f32; 4],
+        inv_freq: &[f32],
+        sections: Option<[usize; 4]>,
+        interleaved: bool,
+    ) -> Vec<f32> {
+        inv_freq
+            .iter()
+            .enumerate()
+            .map(|(pair_idx, inv_freq)| {
+                let stream = Self::position_stream_for_pair(pair_idx, sections, interleaved);
+                position_streams[stream] * *inv_freq
+            })
+            .collect()
+    }
+
+    fn position_stream_for_pair(
+        pair_idx: usize,
+        sections: Option<[usize; 4]>,
+        interleaved: bool,
+    ) -> usize {
+        let Some(sections) = sections else {
+            return 0;
+        };
+
+        let sect_dims = sections.iter().sum::<usize>();
+        if sect_dims == 0 {
+            return 0;
+        }
+
+        let sector = pair_idx % sect_dims;
+        if interleaved {
+            if sector % 3 == 1 && sector < 3 * sections[1] {
+                1
+            } else if sector % 3 == 2 && sector < 3 * sections[2] {
+                2
+            } else if sector % 3 == 0 && sector < 3 * sections[0] {
+                0
+            } else {
+                3
+            }
+        } else {
+            let sec_w = sections[0] + sections[1];
+            let sec_e = sec_w + sections[2];
+            if sector >= sections[0] && sector < sec_w {
+                1
+            } else if sector >= sec_w && sector < sec_e {
+                2
+            } else if sector >= sec_e {
+                3
+            } else {
+                0
+            }
+        }
     }
 
     /// Apply YARN frequency scaling to inverse frequencies.
@@ -293,5 +366,36 @@ impl RotaryEmbedding {
         let k_embed = Tensor::cat(&[&k_rot_embed, &k_pass], D::Minus1)?;
 
         Ok((q_embed.try_into()?, k_embed.try_into()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RotaryEmbedding;
+
+    #[test]
+    fn mrope_stream_selection_matches_contiguous_sections() {
+        let inv_freq = [1.0, 10.0, 100.0, 1000.0, 10_000.0, 100_000.0];
+        let positions = [1.0, 2.0, 3.0, 4.0];
+        let angles = RotaryEmbedding::angles_for_position_streams(
+            positions,
+            &inv_freq,
+            Some([2, 1, 1, 2]),
+            false,
+        );
+        assert_eq!(angles, vec![1.0, 10.0, 200.0, 3000.0, 40_000.0, 400_000.0,]);
+    }
+
+    #[test]
+    fn mrope_stream_selection_matches_imrope_sections() {
+        let inv_freq = [1.0, 10.0, 100.0, 1000.0, 10_000.0, 100_000.0];
+        let positions = [1.0, 2.0, 3.0, 4.0];
+        let angles = RotaryEmbedding::angles_for_position_streams(
+            positions,
+            &inv_freq,
+            Some([2, 1, 1, 2]),
+            true,
+        );
+        assert_eq!(angles, vec![1.0, 20.0, 300.0, 1000.0, 40_000.0, 400_000.0,]);
     }
 }

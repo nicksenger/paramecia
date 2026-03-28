@@ -616,6 +616,14 @@ pub struct ParameciaConfig {
     #[serde(default)]
     pub enabled_tools: Vec<String>,
 
+    /// Builtin tool allowlist. Empty means all builtins are enabled.
+    #[serde(default)]
+    pub builtin_tools: Vec<String>,
+
+    /// Disable all builtin tools.
+    #[serde(default)]
+    pub no_builtin_tools: bool,
+
     /// Disabled tool patterns.
     #[serde(default)]
     pub disabled_tools: Vec<String>,
@@ -725,6 +733,8 @@ impl Default for ParameciaConfig {
             tool_paths: Vec::new(),
             mcp_servers: Vec::new(),
             enabled_tools: Vec::new(),
+            builtin_tools: Vec::new(),
+            no_builtin_tools: false,
             disabled_tools: Vec::new(),
             tuning: TuningConfig::default(),
             controller: ControllerConfig::default(),
@@ -991,6 +1001,12 @@ fn merge_configs(base: ParameciaConfig, overlay: ParameciaConfig) -> ParameciaCo
         } else {
             overlay.enabled_tools
         },
+        builtin_tools: if overlay.builtin_tools.is_empty() {
+            base.builtin_tools
+        } else {
+            overlay.builtin_tools
+        },
+        no_builtin_tools: overlay.no_builtin_tools || base.no_builtin_tools,
         disabled_tools: {
             let mut merged = base.disabled_tools;
             merged.extend(overlay.disabled_tools);

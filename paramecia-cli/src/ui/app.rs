@@ -76,6 +76,8 @@ pub struct ApprovalState {
 
 /// The main TUI application state.
 pub struct App {
+    /// When the welcome banner first became visible.
+    welcome_banner_shown_at: Option<Instant>,
     /// Configuration.
     pub config: ParameciaConfig,
     /// Current mode.
@@ -144,6 +146,8 @@ pub struct App {
 }
 
 impl App {
+    const WELCOME_BANNER_AUTO_HIDE_AFTER: Duration = Duration::from_secs(5);
+
     /// Create a new app.
     pub fn new(config: ParameciaConfig, mode: AgentMode) -> Self {
         let commands = crate::commands::create_default_registry();
@@ -163,6 +167,7 @@ impl App {
         };
 
         Self {
+            welcome_banner_shown_at: None,
             config,
             mode,
             messages: Vec::new(),
@@ -199,6 +204,18 @@ impl App {
             game_of_life: super::game_of_life::GameOfLife::new(80, 20),
             last_gol_step: Instant::now(),
         }
+    }
+
+    fn should_render_welcome_banner(&mut self, area: Rect) -> bool {
+        let banner_height = 10;
+        if !self.messages.is_empty() || area.height < banner_height {
+            return false;
+        }
+
+        let shown_at = self
+            .welcome_banner_shown_at
+            .get_or_insert_with(Instant::now);
+        shown_at.elapsed() < Self::WELCOME_BANNER_AUTO_HIDE_AFTER
     }
 
     /// Set the session ID for resume message.
@@ -1029,18 +1046,16 @@ impl App {
     /// Render the chat area.
     fn render_chat(&mut self, frame: &mut Frame, area: Rect) {
         // Welcome banner (if no messages yet)
-        if self.messages.is_empty() {
+        if self.should_render_welcome_banner(area) {
             let banner_height = 10;
-            if area.height >= banner_height {
-                let banner_area = Rect {
-                    x: area.x,
-                    y: area.y,
-                    width: area.width,
-                    height: banner_height,
-                };
-                self.welcome_banner.set_color_index(self.color_index);
-                self.welcome_banner.render(banner_area, frame.buffer_mut());
-            }
+            let banner_area = Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: banner_height,
+            };
+            self.welcome_banner.set_color_index(self.color_index);
+            self.welcome_banner.render(banner_area, frame.buffer_mut());
             return;
         }
 
@@ -1477,5 +1492,33 @@ impl TerminalWrapper {
 impl Drop for TerminalWrapper {
     fn drop(&mut self) {
         let _ = self.restore();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chat_area() -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 20,
+        }
+    }
+
+    #[test]
+    fn welcome_banner_is_visible_initially() {
+        let mut app = App::new(ParameciaConfig::default(), AgentMode::Default);
+        assert!(app.should_render_welcome_banner(chat_area()));
+    }
+
+    #[test]
+    fn welcome_banner_auto_hides_after_timeout() {
+        let mut app = App::new(ParameciaConfig::default(), AgentMode::Default);
+        app.welcome_banner_shown_at =
+            Some(Instant::now() - App::WELCOME_BANNER_AUTO_HIDE_AFTER - Duration::from_millis(1));
+        assert!(!app.should_render_welcome_banner(chat_area()));
     }
 }

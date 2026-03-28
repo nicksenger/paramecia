@@ -100,3 +100,23 @@ async fn test_mcp_tool_info() {
     });
     assert_eq!(info.parameters, expected_schema);
 }
+
+#[tokio::test]
+async fn test_mcp_tool_exposes_prompt() {
+    let mock_transport = Arc::new(MockTransport::new());
+    let mut mock_client = McpClient::new(mock_transport);
+
+    mock_client.initialize().await.unwrap();
+    let remote_tools = mock_client.list_tools().await.unwrap();
+
+    let mut tool_manager = ToolManager::new();
+    let client_arc = Arc::new(mock_client);
+    tool_manager.register_mcp_tools(client_arc, remote_tools);
+
+    let tool = tool_manager.get("test_mcp_tool").unwrap();
+    let tool_read = tool.read();
+    let prompt = tool_read.prompt().unwrap();
+
+    assert!(prompt.contains("A test MCP tool"));
+    assert!(prompt.contains("\"param1\""));
+}

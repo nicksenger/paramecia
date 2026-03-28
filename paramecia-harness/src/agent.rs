@@ -131,24 +131,23 @@ impl Agent {
         mode: AgentMode,
         backend: Arc<dyn Backend>,
     ) -> ParameciaResult<Self> {
-        let tool_manager = ToolManager::with_configs(config.tools.clone());
+        Self::from_backend_internal(config, mode, backend, true)
+    }
+
+    fn from_backend_internal(
+        config: ParameciaConfig,
+        mode: AgentMode,
+        backend: Arc<dyn Backend>,
+        initialize_system_prompt: bool,
+    ) -> ParameciaResult<Self> {
+        let tool_manager =
+            ToolManager::with_configs_and_builtin_filter(
+                config.tools.clone(),
+                &config.builtin_tools,
+                config.no_builtin_tools,
+            );
         let session_logger = SessionLogger::new(config.session_logging.clone());
         let session_id = session_logger.session_id().to_string();
-
-        // Build system prompt using the universal system prompt builder
-        let system_prompt = get_universal_system_prompt_with_tools(&tool_manager, &config);
-        tracing::info!(
-            "System prompt built: {} chars (~{} tokens)",
-            system_prompt.len(),
-            system_prompt.len() / 4 // Rough estimate: 4 chars per token
-        );
-
-        // Start with a system prompt when configured and non-empty.
-        let messages = if system_prompt.trim().is_empty() {
-            Vec::new()
-        } else {
-            vec![LlmMessage::system(system_prompt)]
-        };
 
         // Create atomic mode for sharing with middleware
         let mode_atomic = Arc::new(std::sync::atomic::AtomicU8::new(mode as u8));
@@ -160,7 +159,7 @@ impl Agent {
             backend,
             tool_manager,
             format_handler: ApiToolFormatHandler::new(),
-            messages,
+            messages: Vec::new(),
             stats: AgentStats::default(),
             middleware: MiddlewarePipeline::new(),
             session_logger,
@@ -183,17 +182,50 @@ impl Agent {
         // Setup middleware
         agent.setup_middleware(None, None);
 
+        if initialize_system_prompt {
+            agent.rebuild_system_prompt();
+        }
+
         Ok(agent)
     }
 
     /// Create a new agent and connect to MCP servers.
     pub async fn new_with_mcp(config: ParameciaConfig, mode: AgentMode) -> ParameciaResult<Self> {
-        let mut agent = Self::new(config, mode)?;
+        let active_model = config.get_active_model()?;
+        let provider = config.get_provider_for_model(active_model)?;
+
+        let context_length = Some(config.context_length as usize)
+            .filter(|&v| v > 0)
+            .or(provider.context_length);
+
+        let backend = BackendFactory::create(&paramecia_text::backend::ProviderConfig {
+            name: provider.name.clone(),
+            backend: provider.backend,
+            local_model_path: provider.local_model_path.clone(),
+            local_tokenizer_path: provider.local_tokenizer_path.clone(),
+            local_max_tokens: provider.local_max_tokens,
+            local_device: provider.local_device.clone(),
+            local_offload: provider.local_offload.clone(),
+            context_length,
+            local_kv_cache_quant: provider.local_kv_cache_quant.clone(),
+            local_layer_split: provider.local_layer_split.clone(),
+            local_disable_context: provider.local_disable_context,
+            tool_call_format: provider.tool_call_format.clone(),
+            full_generation_output: provider.full_generation_output,
+            tuning_output: provider.tuning_output,
+            tuning_top_k: provider.tuning_top_k,
+            tuning_tail_samples: provider.tuning_tail_samples,
+        })
+        .map_err(ParameciaError::Config)?;
+
+        let mut agent = Self::from_backend_internal(config, mode, backend, false)?;
 
         // Connect to MCP servers and register their tools
         if let Err(e) = agent.connect_mcp_servers().await {
             println!("Warning: Failed to connect to MCP servers: {}", e);
         }
+
+        agent.rebuild_system_prompt();
 
         Ok(agent)
     }
@@ -205,7 +237,34 @@ impl Agent {
         max_turns: Option<u32>,
         max_price: Option<f64>,
     ) -> ParameciaResult<Self> {
-        let mut agent = Self::new(config, mode)?;
+        let active_model = config.get_active_model()?;
+        let provider = config.get_provider_for_model(active_model)?;
+
+        let context_length = Some(config.context_length as usize)
+            .filter(|&v| v > 0)
+            .or(provider.context_length);
+
+        let backend = BackendFactory::create(&paramecia_text::backend::ProviderConfig {
+            name: provider.name.clone(),
+            backend: provider.backend,
+            local_model_path: provider.local_model_path.clone(),
+            local_tokenizer_path: provider.local_tokenizer_path.clone(),
+            local_max_tokens: provider.local_max_tokens,
+            local_device: provider.local_device.clone(),
+            local_offload: provider.local_offload.clone(),
+            context_length,
+            local_kv_cache_quant: provider.local_kv_cache_quant.clone(),
+            local_layer_split: provider.local_layer_split.clone(),
+            local_disable_context: provider.local_disable_context,
+            tool_call_format: provider.tool_call_format.clone(),
+            full_generation_output: provider.full_generation_output,
+            tuning_output: provider.tuning_output,
+            tuning_top_k: provider.tuning_top_k,
+            tuning_tail_samples: provider.tuning_tail_samples,
+        })
+        .map_err(ParameciaError::Config)?;
+
+        let mut agent = Self::from_backend_internal(config, mode, backend, false)?;
         agent.max_turns = max_turns;
         agent.max_price = max_price;
         agent.setup_middleware(max_turns, max_price);
@@ -214,6 +273,8 @@ impl Agent {
         if let Err(e) = agent.connect_mcp_servers().await {
             println!("Warning: Failed to connect to MCP servers: {}", e);
         }
+
+        agent.rebuild_system_prompt();
 
         Ok(agent)
     }
@@ -226,7 +287,7 @@ impl Agent {
         max_turns: Option<u32>,
         max_price: Option<f64>,
     ) -> ParameciaResult<Self> {
-        let mut agent = Self::from_backend(config, mode, backend)?;
+        let mut agent = Self::from_backend_internal(config, mode, backend, false)?;
         agent.max_turns = max_turns;
         agent.max_price = max_price;
         agent.setup_middleware(max_turns, max_price);
@@ -236,7 +297,40 @@ impl Agent {
             println!("Warning: Failed to connect to MCP servers: {}", e);
         }
 
+        agent.rebuild_system_prompt();
+
         Ok(agent)
+    }
+
+    fn rebuild_system_prompt(&mut self) {
+        let system_prompt = get_universal_system_prompt_with_tools(&self.tool_manager, &self.config);
+        tracing::info!(
+            "System prompt built: {} chars (~{} tokens)",
+            system_prompt.len(),
+            system_prompt.len() / 4
+        );
+        Self::set_system_prompt_message(&mut self.messages, system_prompt);
+    }
+
+    fn set_system_prompt_message(messages: &mut Vec<LlmMessage>, system_prompt: String) {
+        let has_system = messages
+            .first()
+            .map(|message| message.role == Role::System)
+            .unwrap_or(false);
+
+        if system_prompt.trim().is_empty() {
+            if has_system {
+                messages.remove(0);
+            }
+            return;
+        }
+
+        let system_message = LlmMessage::system(system_prompt);
+        if has_system {
+            messages[0] = system_message;
+        } else {
+            messages.insert(0, system_message);
+        }
     }
 
     fn setup_middleware(&mut self, max_turns: Option<u32>, max_price: Option<f64>) {
@@ -1361,13 +1455,9 @@ impl Agent {
             match client.list_tools().await {
                 Ok(remote_tools) => {
                     let client_arc = Arc::new(client);
-                    let registered = self
+                    let _registered = self
                         .tool_manager
                         .register_mcp_tools(client_arc, remote_tools);
-                    println!(
-                        "Info: Registered {} tools from MCP server {}",
-                        registered, server_config.name
-                    );
                 }
                 Err(e) => {
                     println!(
@@ -1379,5 +1469,35 @@ impl Agent {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Agent;
+    use paramecia_text::{LlmMessage, Role};
+
+    #[test]
+    fn set_system_prompt_replaces_existing_system_message() {
+        let mut messages = vec![LlmMessage::system("old"), LlmMessage::user("hello")];
+
+        Agent::set_system_prompt_message(&mut messages, "new".to_string());
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[0].content.as_deref(), Some("new"));
+        assert_eq!(messages[1].role, Role::User);
+    }
+
+    #[test]
+    fn set_system_prompt_inserts_when_missing() {
+        let mut messages = vec![LlmMessage::user("hello")];
+
+        Agent::set_system_prompt_message(&mut messages, "new".to_string());
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[0].content.as_deref(), Some("new"));
+        assert_eq!(messages[1].role, Role::User);
     }
 }

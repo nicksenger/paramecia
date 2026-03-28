@@ -50,7 +50,7 @@ qwen35moe_35b_a3b = ["paramecia-model/qwen35moe_35b_a3b"]
 qwen35moe_122b_a10b = ["paramecia-model/qwen35moe_122b_a10b"]
 qwen35moe_397b_a17b = ["paramecia-model/qwen35moe_397b_a17b"]
 qwen35_0p8b = ["paramecia-model/qwen35_0p8b"]
+qwen35_2b = ["paramecia-model/qwen35_2b"]
 qwen35_4b = ["paramecia-model/qwen35_4b"]
 qwen35_9b = ["paramecia-model/qwen35_9b"]
 qwen35_27b = ["paramecia-model/qwen35_27b"]
-
