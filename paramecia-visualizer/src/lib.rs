@@ -9,7 +9,7 @@ use iced::{Background, Border, Color, Font, Length, Shadow, Subscription, keyboa
 use iced_sugiyama::{
     Cluster, EdgeEndpoint, EdgeEndpointKind, Graph as SugiyamaGraph, OutgoingEdgeStyle, Sugiyama,
 };
-use paramecia_arrow::vis::{Graph as ArrowGraph, SubGraph as ArrowSubGraph, Vis};
+use paramecia_engine::vis::{Graph as ArrowGraph, SubGraph as ArrowSubGraph};
 
 const WINDOW_WIDTH: f32 = 1400.0;
 const WINDOW_HEIGHT: f32 = 900.0;
@@ -192,7 +192,7 @@ enum ChatOverlayRole {
 
 impl ModelVisualizer {
     fn with_channels(channels: VisualizerChannels) -> Self {
-        let source_graph = paramecia_model::models::qwen3_next::ModelWeights::visualize();
+        let source_graph = paramecia_engine::model_visualization_graph();
 
         let node_info_by_id = source_graph
             .nodes

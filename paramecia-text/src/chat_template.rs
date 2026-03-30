@@ -341,7 +341,7 @@ impl std::error::Error for ChatTemplateError {}
 ///
 /// The chat template is typically stored under the key `tokenizer.chat_template`.
 pub fn extract_chat_template_from_gguf(
-    _metadata: &HashMap<String, paramecia_core::quantized::gguf_file::Value>,
+    _metadata: &HashMap<String, paramecia_engine::gguf_file::Value>,
 ) -> Option<String> {
     Some(QWEN3_NEXT_CHAT_TEMPLATE.to_string())
 }

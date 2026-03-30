@@ -4,9 +4,9 @@ use crate::executor::{ModelEngine, ModelEngineInner};
 use crate::model_actor::{spawn_model_actor, TrainingConfig};
 use crate::types::Error;
 
-use paramecia_core::Device;
 use paramecia_model::generation::LogitsProcessor;
 use paramecia_model::models::qwen3_next::{self, DeviceOffloadMode, KvCacheQuantization};
+use paramecia_model::Device;
 use paramecia_model::YarnConfig;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -447,7 +447,7 @@ fn download_tokenizer(repo_id: &str) -> Result<Tokenizer, Error> {
 fn read_num_layers(model_path: &PathBuf) -> Result<usize, Error> {
     let mut file = std::fs::File::open(model_path)
         .map_err(|e| Error::ModelError(format!("Failed to open model: {e}")))?;
-    let ct = paramecia_core::quantized::gguf_file::Content::read(&mut file)
+    let ct = paramecia_model::gguf_file::Content::read(&mut file)
         .map_err(|e| Error::ModelError(format!("Failed to read GGUF: {e}")))?;
     let md = &ct.metadata;
     md.get("qwen35moe.block_count")

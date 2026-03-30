@@ -251,8 +251,12 @@ impl ToolManager {
             config_overrides: configs,
         };
 
-        let builtin_filter = (!disable_all_builtins && !builtin_tools.is_empty())
-            .then(|| builtin_tools.iter().map(String::as_str).collect::<HashSet<_>>());
+        let builtin_filter = (!disable_all_builtins && !builtin_tools.is_empty()).then(|| {
+            builtin_tools
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+        });
 
         // Register builtin tools
         if !disable_all_builtins {

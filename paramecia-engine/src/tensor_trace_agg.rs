@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use paramecia_arrow::vis::pretty_shape;
+use paramecia_model::vis::pretty_shape;
 use tracing::field::{Field, Visit};
 use tracing::{Id, Subscriber};
 use tracing_subscriber::layer::{Context, Layer};

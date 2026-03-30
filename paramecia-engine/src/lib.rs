@@ -13,14 +13,25 @@ pub mod training;
 pub mod types;
 
 pub use builder::ModelEngineBuilder;
-pub use executor::{describe_model, fuse_models, ModelEngine};
+pub use executor::{
+    describe_model, fuse_models, graft_composite_from_paths, prune_experts, prune_layers,
+    update_model_metadata, ModelEngine,
+};
 pub use model_actor::TrainingConfig;
 pub use types::*;
 
 // Re-export types needed by downstream crates (paramecia-text)
+pub use paramecia_model::gguf_file;
 pub use paramecia_model::models::qwen3_next::{
     DeviceOffloadMode, KvCacheQuantization, LayerDeviceMap,
 };
 pub use paramecia_model::token_output_stream::TokenOutputStream;
+pub use paramecia_model::vis;
 pub use paramecia_model::YarnConfig;
+pub use paramecia_model::{select_best_device, DType, Device, GgmlDType, Tensor};
 pub use paramecia_opt::fuse::parse_model_spec;
+
+/// Build the model computation graph used by the visualizer.
+pub fn model_visualization_graph() -> vis::Graph {
+    paramecia_model::visualization_graph()
+}

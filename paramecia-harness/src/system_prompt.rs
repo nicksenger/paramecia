@@ -196,12 +196,11 @@ fn format_tool_prompt(tool_name: &str, prompt: &str) -> String {
 /// - Project context
 /// - Project documentation
 pub fn get_universal_system_prompt(config: &ParameciaConfig) -> String {
-    let tool_manager =
-        ToolManager::with_configs_and_builtin_filter(
-            config.tools.clone(),
-            &config.builtin_tools,
-            config.no_builtin_tools,
-        );
+    let tool_manager = ToolManager::with_configs_and_builtin_filter(
+        config.tools.clone(),
+        &config.builtin_tools,
+        config.no_builtin_tools,
+    );
     get_universal_system_prompt_with_tools(&tool_manager, config)
 }
 
@@ -436,12 +435,11 @@ mod tests {
         config.include_project_context = false;
         config.instructions.clear();
 
-        let tool_manager =
-            ToolManager::with_configs_and_builtin_filter(
-                config.tools.clone(),
-                &config.builtin_tools,
-                config.no_builtin_tools,
-            );
+        let tool_manager = ToolManager::with_configs_and_builtin_filter(
+            config.tools.clone(),
+            &config.builtin_tools,
+            config.no_builtin_tools,
+        );
         let prompt = get_universal_system_prompt_with_tools(&tool_manager, &config);
 
         assert!(prompt.contains("The operating system is"));
@@ -462,12 +460,11 @@ mod tests {
         config.instructions.clear();
         config.builtin_tools = vec!["grep".to_string(), "read_file".to_string()];
 
-        let tool_manager =
-            ToolManager::with_configs_and_builtin_filter(
-                config.tools.clone(),
-                &config.builtin_tools,
-                config.no_builtin_tools,
-            );
+        let tool_manager = ToolManager::with_configs_and_builtin_filter(
+            config.tools.clone(),
+            &config.builtin_tools,
+            config.no_builtin_tools,
+        );
         let prompt = get_universal_system_prompt_with_tools(&tool_manager, &config);
 
         assert!(prompt.contains("Tool: `grep`"));

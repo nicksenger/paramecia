@@ -9,8 +9,7 @@
 use crate::paramecia::host::types as wit;
 use paramecia_bridge::ControllerHostEndpoint;
 use paramecia_engine::types::Uuid;
-use paramecia_engine::{ModelEngine, TrainingConfig};
-use paramecia_model::models::qwen3_next::{DeviceOffloadMode, KvCacheQuantization};
+use paramecia_engine::{DeviceOffloadMode, KvCacheQuantization, ModelEngine, TrainingConfig};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -76,7 +75,7 @@ pub struct HostState {
     /// Directory for checkpoint files
     pub checkpoint_dir: PathBuf,
     /// Device for model loading
-    pub device: paramecia_core::Device,
+    pub device: paramecia_engine::Device,
     /// Configuration for building new ModelEngines
     pub builder_config: ModelBuilderConfig,
     /// UUID generation counter

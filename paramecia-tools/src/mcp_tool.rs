@@ -39,9 +39,7 @@ impl McpTool {
         let parameters = serde_json::to_string_pretty(&remote_tool.input_schema)
             .unwrap_or_else(|_| remote_tool.input_schema.to_string());
 
-        format!(
-            "{description}\n\n**Parameters Schema:**\n```json\n{parameters}\n```"
-        )
+        format!("{description}\n\n**Parameters Schema:**\n```json\n{parameters}\n```")
     }
 }
 

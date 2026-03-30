@@ -15,6 +15,16 @@ pub use models::qwen3_next::{
     select_best_device, DeviceOffloadMode, KvCacheQuantization, LayerDeviceMap, LayerSnapshot,
     ModelWeights, MtpHead, PrefixCache, SpeculativeResult, VerificationResult, YarnConfig,
 };
+pub use paramecia_arrow::vis;
+pub use paramecia_core::quantized::gguf_file;
+pub use paramecia_core::quantized::GgmlDType;
+pub use paramecia_core::{DType, Device, Error, Result, Tensor};
+
+/// Build the model computation graph used by the visualizer.
+pub fn visualization_graph() -> vis::Graph {
+    use paramecia_arrow::vis::Vis;
+    models::qwen3_next::ModelWeights::visualize()
+}
 
 /// Token output stream for streaming text generation
 pub mod token_output_stream {

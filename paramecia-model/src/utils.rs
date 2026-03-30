@@ -157,12 +157,7 @@ mod tests {
         let repeated = repeat_kv(xs, 2)?;
         let values = repeated.flatten_all()?.to_vec1::<f32>()?;
 
-        assert_eq!(
-            values,
-            vec![
-                1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0,
-            ]
-        );
+        assert_eq!(values, vec![1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0,]);
         Ok(())
     }
 }

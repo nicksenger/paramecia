@@ -9,8 +9,8 @@ use crate::executor::ModelEngineInner;
 use crate::training::sample_to_tuning_data;
 use crate::types::*;
 
-use paramecia_core::quantized::gguf_file;
-use paramecia_core::quantized::GgmlDType;
+use paramecia_model::gguf_file;
+use paramecia_model::GgmlDType;
 use paramecia_opt::{
     run_training_step_with_grad_accum, save_trained_model, DecomposedZOState, DistillationLoss,
     EpsilonConfig, MtpLossConfig, OptimizeTensors, ParamsQuZO, QuZO,

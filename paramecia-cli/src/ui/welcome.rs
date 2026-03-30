@@ -60,7 +60,10 @@ fn format_build_feature_name(feature_name: &str) -> String {
 }
 
 fn format_build_feature_part(part: &str) -> String {
-    if let Some(number) = part.strip_prefix('a').and_then(|value| value.strip_suffix('b')) {
+    if let Some(number) = part
+        .strip_prefix('a')
+        .and_then(|value| value.strip_suffix('b'))
+    {
         return format!("A{}b", number.replace('p', "."));
     }
 
@@ -236,9 +239,7 @@ impl WelcomeBanner {
                     format!("{LOGO_TEXT_GAP}Model: {build_label}"),
                     Style::default().fg(colors::MUTED),
                 ),
-                Span::raw(
-                    " ".repeat(max_text_width - format!("Model: {build_label}").len()),
-                ),
+                Span::raw(" ".repeat(max_text_width - format!("Model: {build_label}").len())),
             ]),
             // Line 3: middle bar - "  ▇▇▇▇▇▇▇▇    " (2 + 8 + 4 = 14)
             Line::from(vec![
