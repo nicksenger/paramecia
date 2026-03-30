@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing::{debug, info};
 
-use paramecia_model::models::qwen3_next::ModelWeights;
+use paramecia_model::ModelWeights;
 
 use super::{
     DistillationLoss, DistillationLossConfig, MtpLossConfig, PaddedTuningData, TuningData,

@@ -4,10 +4,10 @@ use crate::executor::{ModelEngine, ModelEngineInner};
 use crate::model_actor::{spawn_model_actor, TrainingConfig};
 use crate::types::Error;
 
-use paramecia_model::generation::LogitsProcessor;
-use paramecia_model::models::qwen3_next::{self, DeviceOffloadMode, KvCacheQuantization};
-use paramecia_model::Device;
-use paramecia_model::YarnConfig;
+use paramecia_model::{
+    select_best_device, Device, DeviceOffloadMode, KvCacheQuantization, LayerDeviceMap,
+    LogitsProcessor, ModelWeights, YarnConfig,
+};
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
@@ -239,7 +239,7 @@ impl ModelEngineBuilder {
         } else if self.cpu {
             Device::Cpu
         } else {
-            paramecia_model::select_best_device()
+            select_best_device()
         };
 
         // Resolve model path (download from HF if needed)
@@ -285,10 +285,10 @@ impl ModelEngineBuilder {
 
         let (mut model, device) = if let Some(ref split) = layer_split_str {
             let num_layers = read_num_layers(&model_path)?;
-            let layer_device_map = qwen3_next::LayerDeviceMap::from_proportions(split, num_layers)
+            let layer_device_map = LayerDeviceMap::from_proportions(split, num_layers)
                 .map_err(|e| Error::ModelError(e.to_string()))?;
             let primary = layer_device_map.primary_device().clone();
-            let model = qwen3_next::ModelWeights::from_gguf_with_layer_split(
+            let model = ModelWeights::from_gguf_with_layer_split(
                 &model_path,
                 layer_device_map,
                 offload_mode,
@@ -298,7 +298,7 @@ impl ModelEngineBuilder {
             .map_err(|e| Error::ModelError(e.to_string()))?;
             (model, primary)
         } else {
-            let model = qwen3_next::ModelWeights::from_gguf_with_offload_and_yarn(
+            let model = ModelWeights::from_gguf_with_offload_and_yarn(
                 &model_path,
                 &device,
                 offload_mode,

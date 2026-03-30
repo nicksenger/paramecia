@@ -397,7 +397,7 @@ fn apply_hyper_parameters(
 
 /// Set up the QuZO optimizer from the model's shared tensors.
 fn setup_optimizer(
-    model: &mut paramecia_model::models::qwen3_next::ModelWeights,
+    model: &mut paramecia_model::ModelWeights,
     ts: &TrainingSubsystem,
 ) -> Result<Option<QuZO>, Error> {
     let quzo_tensors = model.quzo_qtensors();

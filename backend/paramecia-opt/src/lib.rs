@@ -14,22 +14,21 @@
 //! QuZO (Quantized Zeroth-Order) optimization enables training of quantized models
 //! without backpropagation by using finite differences to estimate gradients.
 
-pub mod distillation;
-pub mod fuse;
-pub mod prune;
-pub mod qzo;
-pub mod tune;
+#[allow(dead_code)]
+mod distillation;
+mod fuse;
+#[allow(dead_code)]
+mod prune;
+#[allow(dead_code)]
+mod qzo;
+#[allow(dead_code)]
+mod tune;
 
-// Re-export QuZO (Quantized Zeroth-Order optimization for discrete weights)
-pub use crate::qzo::{
-    parse_error_feedback_mode, DecomposedZOState, ErrorFeedbackMode, ParamsQuZO, QuZO,
-    QuZOPerturbation,
-};
-
-// Re-export distillation types
 pub use distillation::{
-    load_tokenizer_for_training, parse_optimize_tensors, run_training_step_with_grad_accum,
-    save_trained_model, update_gguf_metadata, DistillationLoss, DistillationLossConfig,
-    DistillationTrainer, DistillationTrainerConfig, EpsilonConfig, MtpLossConfig, OptimizeTensors,
-    StepStats, TrainingCheckpoint, TrainingState, TuningData, TuningDataset, TuningReader,
+    parse_optimize_tensors, run_training_step_with_grad_accum, save_trained_model,
+    update_gguf_metadata, DistillationLoss, DistillationLossConfig, EpsilonConfig, MtpLossConfig,
+    OptimizeTensors, TuningData,
 };
+pub use fuse::{fuse_models, parse_model_spec, FuseOptions, QuantConflictStrategy};
+pub use prune::{prune_experts, prune_layers, PruneExpertsOptions, PruneLayersOptions};
+pub use qzo::{DecomposedZOState, ErrorFeedbackMode, ParamsQuZO, QuZO};

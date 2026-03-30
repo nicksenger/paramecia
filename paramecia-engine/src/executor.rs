@@ -8,11 +8,10 @@ use crate::distribution::logits_to_distribution;
 use crate::model_actor::{ModelActorHandle, ModelCommand};
 use crate::types::*;
 
-use paramecia_model::generation::LogitsProcessor;
-use paramecia_model::models::qwen3_next::PrefixCache;
-use paramecia_model::utils::apply_penalties;
-use paramecia_model::ModelWeights;
-use paramecia_model::{DType, Tensor};
+use paramecia_model::{
+    apply_penalties, DType, GraftComposite, GraftCompositeOptions, GraftLayerSource,
+    LogitsProcessor, ModelWeights, PrefixCache, Tensor,
+};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
@@ -1853,17 +1852,17 @@ pub fn fuse_models(
     strategy: QuantConflictStrategy,
 ) -> Result<(), Error> {
     let opt_strategy = match strategy {
-        QuantConflictStrategy::Reject => paramecia_opt::fuse::QuantConflictStrategy::Reject,
-        QuantConflictStrategy::Highest => paramecia_opt::fuse::QuantConflictStrategy::Highest,
-        QuantConflictStrategy::Lowest => paramecia_opt::fuse::QuantConflictStrategy::Lowest,
+        QuantConflictStrategy::Reject => paramecia_opt::QuantConflictStrategy::Reject,
+        QuantConflictStrategy::Highest => paramecia_opt::QuantConflictStrategy::Highest,
+        QuantConflictStrategy::Lowest => paramecia_opt::QuantConflictStrategy::Lowest,
     };
-    let options = paramecia_opt::fuse::FuseOptions {
+    let options = paramecia_opt::FuseOptions {
         base: base.to_path_buf(),
         models: members.to_vec(),
         output: output.to_path_buf(),
         quant_conflict_strategy: opt_strategy,
     };
-    paramecia_opt::fuse::fuse_models(&options)
+    paramecia_opt::fuse_models(&options)
         .map_err(|e| Error::CheckpointError(format!("Fusion failed: {e}")))?;
     Ok(())
 }
@@ -1905,7 +1904,7 @@ pub fn prune_experts(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    paramecia_opt::prune::prune_experts(&paramecia_opt::prune::PruneExpertsOptions {
+    paramecia_opt::prune_experts(&paramecia_opt::PruneExpertsOptions {
         input_model: source.to_path_buf(),
         output_model: output.to_path_buf(),
         retained_indices: retained_indices_u16,
@@ -1918,7 +1917,7 @@ pub fn prune_experts(
 
 /// Prune transformer layers from a GGUF model and write the result to `output`.
 pub fn prune_layers(source: &Path, output: &Path, retained_layers: &[u32]) -> Result<(), Error> {
-    paramecia_opt::prune::prune_layers(&paramecia_opt::prune::PruneLayersOptions {
+    paramecia_opt::prune_layers(&paramecia_opt::PruneLayersOptions {
         input_model: source.to_path_buf(),
         output_model: output.to_path_buf(),
         retained_layers: retained_layers.to_vec(),
@@ -1939,16 +1938,14 @@ pub fn graft_composite_from_paths(
 ) -> Result<(), Error> {
     let layers = layers
         .iter()
-        .map(
-            |(path, layer_idx)| paramecia_model::graft::GraftLayerSource {
-                path: path.clone(),
-                layer_idx: *layer_idx,
-            },
-        )
+        .map(|(path, layer_idx)| GraftLayerSource {
+            path: path.clone(),
+            layer_idx: *layer_idx,
+        })
         .collect();
 
-    paramecia_model::graft::graft_composite(&paramecia_model::graft::GraftCompositeOptions {
-        composite: paramecia_model::graft::GraftComposite {
+    paramecia_model::graft_composite(&GraftCompositeOptions {
+        composite: GraftComposite {
             embedding: embedding.to_path_buf(),
             layers,
             lm_head: lm_head.to_path_buf(),

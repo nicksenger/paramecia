@@ -1,24 +1,36 @@
-pub mod expert_pipeline;
-pub mod generation;
-pub mod graft;
-pub mod inspect;
-pub mod layer_pipeline;
+#[allow(dead_code)]
+mod expert_pipeline;
+mod generation;
+#[allow(dead_code)]
+mod graft;
+#[allow(dead_code)]
+mod inspect;
+#[allow(dead_code)]
+mod layer_pipeline;
 pub mod models;
-pub mod ops;
-pub mod quantized_nn;
-pub mod quantized_var_builder;
-pub mod snapshot;
-pub mod utils;
+#[allow(dead_code)]
+mod ops;
+#[allow(dead_code)]
+mod quantized_nn;
+#[allow(dead_code)]
+mod quantized_var_builder;
+#[allow(dead_code)]
+mod snapshot;
+#[allow(dead_code)]
+mod utils;
 
-pub use generation::{LogitsProcessor, Sampling};
+pub use generation::LogitsProcessor;
+pub use graft::{graft_composite, GraftComposite, GraftCompositeOptions, GraftLayerSource};
 pub use models::qwen3_next::{
-    select_best_device, DeviceOffloadMode, KvCacheQuantization, LayerDeviceMap, LayerSnapshot,
-    ModelWeights, MtpHead, PrefixCache, SpeculativeResult, VerificationResult, YarnConfig,
+    select_best_device, DeviceOffloadMode, KvCacheQuantization, LayerDeviceMap, ModelWeights,
+    PrefixCache, YarnConfig,
 };
 pub use paramecia_arrow::vis;
 pub use paramecia_core::quantized::gguf_file;
 pub use paramecia_core::quantized::GgmlDType;
-pub use paramecia_core::{DType, Device, Error, Result, Tensor};
+pub use paramecia_core::{DType, Device, Result, Tensor};
+pub use token_output_stream::TokenOutputStream;
+pub use utils::apply_penalties;
 
 /// Build the model computation graph used by the visualizer.
 pub fn visualization_graph() -> vis::Graph {
@@ -27,7 +39,7 @@ pub fn visualization_graph() -> vis::Graph {
 }
 
 /// Token output stream for streaming text generation
-pub mod token_output_stream {
+mod token_output_stream {
     use tokenizers::Tokenizer;
 
     /// Wrapper around tokenizer for streaming output

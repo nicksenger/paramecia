@@ -1,2 +1,3 @@
 pub mod qwen3_next;
-pub mod with_tracing;
+#[allow(dead_code)]
+pub(crate) mod with_tracing;

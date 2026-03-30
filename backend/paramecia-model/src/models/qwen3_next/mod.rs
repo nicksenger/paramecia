@@ -14,7 +14,7 @@
 
 mod config;
 mod expert_cache;
-pub mod full_attention;
+mod full_attention;
 mod gguf_loader;
 mod kv_cache;
 mod linear_attention;
