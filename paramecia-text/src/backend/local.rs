@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
-use paramecia_core::Device;
+use paramecia_engine::Device;
 use paramecia_engine::{
     DeviceOffloadMode, KvCacheQuantization, ModelEngine, ModelEngineBuilder, Snapshot,
     TokenOutputStream, YarnConfig,
@@ -730,7 +730,7 @@ impl LocalBackend {
     }
 
     fn extract_chat_template_from_gguf(model_path: &std::path::Path) -> LlmResult<ChatTemplate> {
-        use paramecia_core::quantized::gguf_file;
+        use paramecia_engine::gguf_file;
 
         let mut file = std::fs::File::open(model_path)
             .map_err(|e| LlmError::InvalidConfig(format!("Failed to open model file: {e}")))?;

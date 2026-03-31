@@ -10,5 +10,4 @@ publish = false
 fastrand = "2"
 iced = { version = "0.13", features = ["tokio"] }
 iced-sugiyama = { git = "https://github.com/nicksenger/iced-sugiyama.git", branch = "paramecia", features = ["animated"] }
-paramecia-arrow = { workspace = true }
-paramecia-model = { workspace = true }
+paramecia-engine = { workspace = true }

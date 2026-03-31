@@ -31,7 +31,6 @@ regex = { workspace = true }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 paramecia-engine = { workspace = true }
 paramecia-bridge = { workspace = true }
-paramecia-core = { workspace = true }
 minijinja = { version = "2", features = ["json"] }
 
 [dev-dependencies]
@@ -42,10 +41,10 @@ paramecia-tools = { workspace = true }
 
 [features]
 default = []
-accelerate = ["paramecia-core/accelerate", "paramecia-engine/accelerate"]
-cuda = ["paramecia-core/cuda", "paramecia-engine/cuda"]
-metal = ["paramecia-core/metal", "paramecia-engine/metal"]
-vulkan = ["paramecia-core/vulkan", "paramecia-engine/vulkan"]
+accelerate = ["paramecia-engine/accelerate"]
+cuda = ["paramecia-engine/cuda"]
+metal = ["paramecia-engine/metal"]
+vulkan = ["paramecia-engine/vulkan"]
 qwen3next_80b_a3b = ["paramecia-engine/qwen3next_80b_a3b"]
 qwen35moe_35b_a3b = ["paramecia-engine/qwen35moe_35b_a3b"]
 qwen35moe_122b_a10b = ["paramecia-engine/qwen35moe_122b_a10b"]

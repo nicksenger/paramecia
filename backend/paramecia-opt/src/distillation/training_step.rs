@@ -6,7 +6,7 @@
 use super::{DistillationLoss, DistillationLossConfig, EpsilonConfig, MtpLossConfig};
 use crate::{OptimizeTensors, QuZO, TuningData};
 
-use paramecia_model::models::qwen3_next::ModelWeights;
+use paramecia_model::ModelWeights;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 

@@ -13,9 +13,9 @@ pub use runtime::run_host;
 
 use anyhow::Result;
 use host::ModelBuilderConfig;
-use paramecia_engine::TrainingConfig;
-use paramecia_model::DeviceOffloadMode;
-use paramecia_model::models::qwen3_next::KvCacheQuantization;
+use paramecia_engine::{
+    DeviceOffloadMode, KvCacheQuantization, TrainingConfig, select_best_device,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -204,9 +204,9 @@ pub fn run_host_cli(options: HostOptions) -> Result<()> {
 
     // Select device upfront
     let device = if options.cpu {
-        paramecia_core::Device::Cpu
+        paramecia_engine::Device::Cpu
     } else {
-        paramecia_model::select_best_device()
+        select_best_device()
     };
     log!("Device: {:?}", device);
 

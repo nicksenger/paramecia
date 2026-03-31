@@ -313,17 +313,12 @@ fn add_structure_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
                     }
                 };
 
-                let gguf_metadata: std::collections::HashMap<
-                    String,
-                    paramecia_core::quantized::gguf_file::Value,
-                > = metadata
-                    .into_iter()
-                    .map(|(k, v)| (k, wit_metadata_to_gguf(v)))
-                    .collect();
+                let metadata_updates: std::collections::HashMap<String, exec::MetadataValue> =
+                    metadata.into_iter().map(|(k, v)| (k, v.into())).collect();
 
                 let path = checkpoint_path.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    paramecia_opt::update_gguf_metadata(&path, &gguf_metadata)
+                    paramecia_engine::update_model_metadata(&path, &metadata_updates)
                 })
                 .await
                 .map_err(|e| wit::Error::CheckpointError(format!("Task join error: {e}")))?;
@@ -339,25 +334,6 @@ fn add_structure_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
     )?;
 
     Ok(())
-}
-
-fn wit_metadata_to_gguf(v: wit::MetadataValue) -> paramecia_core::quantized::gguf_file::Value {
-    use paramecia_core::quantized::gguf_file::Value;
-    match v {
-        wit::MetadataValue::U8(x) => Value::U8(x),
-        wit::MetadataValue::S8(x) => Value::I8(x),
-        wit::MetadataValue::U16(x) => Value::U16(x),
-        wit::MetadataValue::S16(x) => Value::I16(x),
-        wit::MetadataValue::U32(x) => Value::U32(x),
-        wit::MetadataValue::S32(x) => Value::I32(x),
-        wit::MetadataValue::U64(x) => Value::U64(x),
-        wit::MetadataValue::S64(x) => Value::I64(x),
-        wit::MetadataValue::F32(x) => Value::F32(x),
-        wit::MetadataValue::F64(x) => Value::F64(x),
-        wit::MetadataValue::Bool(x) => Value::Bool(x),
-        wit::MetadataValue::String(x) => Value::String(x),
-        wit::MetadataValue::Array(s) => Value::String(s),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -680,25 +656,17 @@ fn add_structure_ext_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
                     }
                 };
 
-                // Convert Vec<Vec<u32>> → Vec<Vec<u16>>
-                let retained_indices: Vec<Vec<u16>> = retained
-                    .indices
-                    .iter()
-                    .map(|layer| layer.iter().map(|&x| x as u16).collect())
-                    .collect();
+                let retained_indices = retained.indices;
 
                 let output_path =
                     checkpoint_dir.join(format!("pruned-experts-{}.gguf", uuid::Uuid::new_v4()));
                 let output_path_clone = output_path.clone();
 
                 let prune_result = tokio::task::spawn_blocking(move || {
-                    paramecia_opt::prune::prune_experts(
-                        &paramecia_opt::prune::PruneExpertsOptions {
-                            input_model: source_path,
-                            output_model: output_path_clone,
-                            retained_indices,
-                            verbose: false,
-                        },
+                    paramecia_engine::prune_experts(
+                        &source_path,
+                        &output_path_clone,
+                        &retained_indices,
                     )
                 })
                 .await;
@@ -770,12 +738,11 @@ fn add_structure_ext_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
                 let output_path_clone = output_path.clone();
 
                 let prune_result = tokio::task::spawn_blocking(move || {
-                    paramecia_opt::prune::prune_layers(&paramecia_opt::prune::PruneLayersOptions {
-                        input_model: source_path,
-                        output_model: output_path_clone,
-                        retained_layers,
-                        verbose: false,
-                    })
+                    paramecia_engine::prune_layers(
+                        &source_path,
+                        &output_path_clone,
+                        &retained_layers,
+                    )
                 })
                 .await;
 
@@ -837,16 +804,11 @@ fn add_structure_ext_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
                     }
                 };
 
-                // Helper to resolve wit::LayerRef → GraftLayerSource
-                let resolve_layer_ref = |lr: &wit::LayerRef| -> Result<
-                    paramecia_model::graft::GraftLayerSource,
-                    wit::Error,
-                > {
-                    Ok(paramecia_model::graft::GraftLayerSource {
-                        path: resolve(&lr.source)?,
-                        layer_idx: lr.layer_idx,
-                    })
-                };
+                // Helper to resolve wit::LayerRef -> (path, layer_idx)
+                let resolve_layer_ref =
+                    |lr: &wit::LayerRef| -> Result<(std::path::PathBuf, u32), wit::Error> {
+                        Ok((resolve(&lr.source)?, lr.layer_idx))
+                    };
 
                 // Build resolved composite
                 let embedding = match resolve(&composite.embedding) {
@@ -877,17 +839,12 @@ fn add_structure_ext_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
                 let output_path_clone = output_path.clone();
 
                 let graft_result = tokio::task::spawn_blocking(move || {
-                    paramecia_model::graft::graft_composite(
-                        &paramecia_model::graft::GraftCompositeOptions {
-                            composite: paramecia_model::graft::GraftComposite {
-                                embedding,
-                                layers,
-                                lm_head,
-                                mtp_head,
-                            },
-                            output: output_path_clone,
-                            verbose: false,
-                        },
+                    paramecia_engine::graft_composite_from_paths(
+                        &embedding,
+                        &layers,
+                        &lm_head,
+                        &mtp_head,
+                        &output_path_clone,
                     )
                 })
                 .await;

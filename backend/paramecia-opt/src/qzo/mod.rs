@@ -79,7 +79,7 @@ use rayon::prelude::*;
 use tracing::{debug, warn};
 // but NOT for GPU operations (forward passes) because CUDA contexts are thread-local.
 
-pub use moe::{ExpertMetrics, LoadBalanceLoss, RouterStats, ZLoss};
+use moe::{LoadBalanceLoss, RouterStats, ZLoss};
 
 /// Parameters for the QZO optimizer
 #[derive(Clone, Debug)]

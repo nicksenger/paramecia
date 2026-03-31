@@ -1151,9 +1151,7 @@ mod tests {
             Some("1".to_string())
         ));
         assert!(!FullAttention::resolve_q8_flash_mma_enabled(
-            None,
-            true,
-            None,
+            None, true, None,
         ));
         assert!(!FullAttention::resolve_q8_flash_mma_enabled(
             None,

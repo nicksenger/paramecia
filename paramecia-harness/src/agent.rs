@@ -140,12 +140,11 @@ impl Agent {
         backend: Arc<dyn Backend>,
         initialize_system_prompt: bool,
     ) -> ParameciaResult<Self> {
-        let tool_manager =
-            ToolManager::with_configs_and_builtin_filter(
-                config.tools.clone(),
-                &config.builtin_tools,
-                config.no_builtin_tools,
-            );
+        let tool_manager = ToolManager::with_configs_and_builtin_filter(
+            config.tools.clone(),
+            &config.builtin_tools,
+            config.no_builtin_tools,
+        );
         let session_logger = SessionLogger::new(config.session_logging.clone());
         let session_id = session_logger.session_id().to_string();
 
@@ -303,7 +302,8 @@ impl Agent {
     }
 
     fn rebuild_system_prompt(&mut self) {
-        let system_prompt = get_universal_system_prompt_with_tools(&self.tool_manager, &self.config);
+        let system_prompt =
+            get_universal_system_prompt_with_tools(&self.tool_manager, &self.config);
         tracing::info!(
             "System prompt built: {} chars (~{} tokens)",
             system_prompt.len(),

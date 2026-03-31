@@ -69,8 +69,8 @@ pub enum LlmError {
 /// Result type for LLM operations.
 pub type LlmResult<T> = Result<T, LlmError>;
 
-impl From<paramecia_core::Error> for LlmError {
-    fn from(value: paramecia_core::Error) -> Self {
+impl From<paramecia_engine::Error> for LlmError {
+    fn from(value: paramecia_engine::Error) -> Self {
         Self::ModelError(value.to_string())
     }
 }

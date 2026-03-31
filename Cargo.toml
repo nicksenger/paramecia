@@ -1,27 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "paramecia-arrow",
     "paramecia-cli",
     "paramecia-harness",
     "paramecia-text",
     "paramecia-tools",
-    "paramecia-model",
-    "paramecia-opt",
     "paramecia-host",
     "paramecia-engine",
     "paramecia-wit",
     "paramecia-bridge",
-    "paramecia-core",
-    "paramecia-nn",
-    "paramecia-tensor",
     "paramecia-visualizer",
 ]
-exclude = [
-    "paramecia-cuda",
-    "paramecia-metal",
-    "paramecia-vulkan",
-]
+exclude = ["backend"]
 
 [workspace.package]
 version = "0.1.0"
@@ -34,18 +24,18 @@ categories = ["command-line-utilities"]
 
 [workspace.dependencies]
 # Internal crates
-paramecia-arrow = { path = "paramecia-arrow" }
+paramecia-arrow = { path = "backend/paramecia-arrow" }
 paramecia-harness = { path = "paramecia-harness" }
 paramecia-text = { path = "paramecia-text" }
 paramecia-tools = { path = "paramecia-tools" }
-paramecia-model = { path = "paramecia-model" }
-paramecia-opt = { path = "paramecia-opt" }
+paramecia-model = { path = "backend/paramecia-model" }
+paramecia-opt = { path = "backend/paramecia-opt" }
 paramecia-host = { path = "paramecia-host" }
 paramecia-engine = { path = "paramecia-engine" }
 paramecia-bridge = { path = "paramecia-bridge" }
-paramecia-tensor = { path = "paramecia-tensor" }
-paramecia-core = { path = "paramecia-core" }
-paramecia-nn = { path = "paramecia-nn" }
+paramecia-tensor = { path = "backend/paramecia-tensor" }
+paramecia-core = { path = "backend/paramecia-core" }
+paramecia-nn = { path = "backend/paramecia-nn" }
 paramecia-visualizer = { path = "paramecia-visualizer" }
 
 # Type level

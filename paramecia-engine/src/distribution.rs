@@ -4,7 +4,7 @@
 //! with top-k entries and stratified tail sampling.
 
 use crate::types::LogitEntry;
-use paramecia_core::Tensor;
+use paramecia_model::Tensor;
 use rand::prelude::IndexedRandom;
 
 /// Intermediate distribution representation.

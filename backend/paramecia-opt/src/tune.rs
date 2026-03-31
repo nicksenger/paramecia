@@ -4,16 +4,16 @@
 //! for offline distillation training from tuning data files.
 
 use paramecia_core::Result;
-use paramecia_model::models::qwen3_next::{
+use paramecia_model::{
     select_best_device, DeviceOffloadMode, KvCacheQuantization, LayerDeviceMap, ModelWeights,
 };
 use std::path::PathBuf;
 use std::time::Instant;
 use tracing::{info, warn};
 
+use crate::distillation::{DistillationTrainer, DistillationTrainerConfig, TuningDataset};
 use crate::{
-    save_trained_model, DistillationLossConfig, DistillationTrainer, DistillationTrainerConfig,
-    EpsilonConfig, MtpLossConfig, OptimizeTensors, TuningDataset,
+    save_trained_model, DistillationLossConfig, EpsilonConfig, MtpLossConfig, OptimizeTensors,
 };
 
 /// Options for knowledge distillation training.

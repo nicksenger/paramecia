@@ -8,11 +8,10 @@ use crate::distribution::logits_to_distribution;
 use crate::model_actor::{ModelActorHandle, ModelCommand};
 use crate::types::*;
 
-use paramecia_core::{DType, Tensor};
-use paramecia_model::generation::LogitsProcessor;
-use paramecia_model::models::qwen3_next::PrefixCache;
-use paramecia_model::utils::apply_penalties;
-use paramecia_model::ModelWeights;
+use paramecia_model::{
+    apply_penalties, DType, GraftComposite, GraftCompositeOptions, GraftLayerSource,
+    LogitsProcessor, ModelWeights, PrefixCache, Tensor,
+};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
@@ -43,7 +42,7 @@ pub(crate) struct PendingPrediction {
 /// Core engine that owns inference state. Runs on a dedicated actor thread.
 pub(crate) struct ModelEngineInner {
     pub(crate) model: ModelWeights,
-    pub(crate) device: paramecia_core::Device,
+    pub(crate) device: paramecia_model::Device,
     pub(crate) tokenizer: Tokenizer,
     pub(crate) tokens: Vec<u32>,
     pub(crate) state_position: usize,
@@ -108,7 +107,7 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
     }
 
     /// Get the device used by this engine.
-    pub fn device(&self) -> &paramecia_core::Device {
+    pub fn device(&self) -> &paramecia_model::Device {
         &self.device
     }
 
@@ -1300,7 +1299,7 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
                         t.flatten_all()?.to_vec1::<u32>().map(|v| v[0])
                     }
                 })
-                .collect::<paramecia_core::Result<Vec<_>>>()
+                .collect::<paramecia_model::Result<Vec<_>>>()
                 .map_err(|e| Error::ModelError(e.to_string()))?;
 
             // Draft tensor: [main_token, spec_0, spec_1, ...]
@@ -1393,7 +1392,7 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
 #[derive(Clone)]
 pub struct ModelEngine {
     actor: std::sync::Arc<ModelActorHandle>,
-    device: paramecia_core::Device,
+    device: paramecia_model::Device,
     model_path: PathBuf,
     tokenizer: Tokenizer,
     has_mtp: bool,
@@ -1408,7 +1407,7 @@ impl ModelEngine {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         actor: std::sync::Arc<ModelActorHandle>,
-        device: paramecia_core::Device,
+        device: paramecia_model::Device,
         model_path: PathBuf,
         tokenizer: Tokenizer,
         has_mtp: bool,
@@ -1433,7 +1432,7 @@ impl ModelEngine {
     }
 
     /// Get the device used by this engine.
-    pub fn device(&self) -> &paramecia_core::Device {
+    pub fn device(&self) -> &paramecia_model::Device {
         &self.device
     }
 
@@ -1853,18 +1852,110 @@ pub fn fuse_models(
     strategy: QuantConflictStrategy,
 ) -> Result<(), Error> {
     let opt_strategy = match strategy {
-        QuantConflictStrategy::Reject => paramecia_opt::fuse::QuantConflictStrategy::Reject,
-        QuantConflictStrategy::Highest => paramecia_opt::fuse::QuantConflictStrategy::Highest,
-        QuantConflictStrategy::Lowest => paramecia_opt::fuse::QuantConflictStrategy::Lowest,
+        QuantConflictStrategy::Reject => paramecia_opt::QuantConflictStrategy::Reject,
+        QuantConflictStrategy::Highest => paramecia_opt::QuantConflictStrategy::Highest,
+        QuantConflictStrategy::Lowest => paramecia_opt::QuantConflictStrategy::Lowest,
     };
-    let options = paramecia_opt::fuse::FuseOptions {
+    let options = paramecia_opt::FuseOptions {
         base: base.to_path_buf(),
         models: members.to_vec(),
         output: output.to_path_buf(),
         quant_conflict_strategy: opt_strategy,
     };
-    paramecia_opt::fuse::fuse_models(&options)
+    paramecia_opt::fuse_models(&options)
         .map_err(|e| Error::CheckpointError(format!("Fusion failed: {e}")))?;
+    Ok(())
+}
+
+/// Update GGUF metadata entries in-place for an existing checkpoint/model file.
+pub fn update_model_metadata(
+    checkpoint_path: &Path,
+    metadata_updates: &HashMap<String, MetadataValue>,
+) -> Result<(), Error> {
+    let gguf_updates: HashMap<String, paramecia_model::gguf_file::Value> = metadata_updates
+        .iter()
+        .map(|(k, v)| (k.clone(), metadata_value_to_gguf(v)))
+        .collect();
+
+    paramecia_opt::update_gguf_metadata(checkpoint_path, &gguf_updates)
+        .map_err(|e| Error::CheckpointError(format!("Failed to update metadata: {e}")))?;
+    Ok(())
+}
+
+/// Prune experts from a GGUF model and write the result to `output`.
+pub fn prune_experts(
+    source: &Path,
+    output: &Path,
+    retained_indices: &[Vec<u32>],
+) -> Result<(), Error> {
+    let retained_indices_u16: Vec<Vec<u16>> = retained_indices
+        .iter()
+        .map(|layer| {
+            layer
+                .iter()
+                .map(|&idx| {
+                    u16::try_from(idx).map_err(|_| {
+                        Error::CheckpointError(format!(
+                            "Expert index {idx} exceeds u16::MAX and cannot be encoded"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    paramecia_opt::prune_experts(&paramecia_opt::PruneExpertsOptions {
+        input_model: source.to_path_buf(),
+        output_model: output.to_path_buf(),
+        retained_indices: retained_indices_u16,
+        verbose: false,
+    })
+    .map_err(|e| Error::CheckpointError(format!("Expert pruning failed: {e}")))?;
+
+    Ok(())
+}
+
+/// Prune transformer layers from a GGUF model and write the result to `output`.
+pub fn prune_layers(source: &Path, output: &Path, retained_layers: &[u32]) -> Result<(), Error> {
+    paramecia_opt::prune_layers(&paramecia_opt::PruneLayersOptions {
+        input_model: source.to_path_buf(),
+        output_model: output.to_path_buf(),
+        retained_layers: retained_layers.to_vec(),
+        verbose: false,
+    })
+    .map_err(|e| Error::CheckpointError(format!("Layer pruning failed: {e}")))?;
+
+    Ok(())
+}
+
+/// Graft a composite model from resolved GGUF paths and write it to `output`.
+pub fn graft_composite_from_paths(
+    embedding: &Path,
+    layers: &[(PathBuf, u32)],
+    lm_head: &Path,
+    mtp_head: &Path,
+    output: &Path,
+) -> Result<(), Error> {
+    let layers = layers
+        .iter()
+        .map(|(path, layer_idx)| GraftLayerSource {
+            path: path.clone(),
+            layer_idx: *layer_idx,
+        })
+        .collect();
+
+    paramecia_model::graft_composite(&GraftCompositeOptions {
+        composite: GraftComposite {
+            embedding: embedding.to_path_buf(),
+            layers,
+            lm_head: lm_head.to_path_buf(),
+            mtp_head: mtp_head.to_path_buf(),
+        },
+        output: output.to_path_buf(),
+        verbose: false,
+    })
+    .map_err(|e| Error::CheckpointError(format!("Graft failed: {e}")))?;
+
     Ok(())
 }
 
@@ -1872,7 +1963,7 @@ pub fn fuse_models(
 ///
 /// Returns layer/expert counts, total/active parameter counts, metadata, and tensor info.
 pub fn describe_model(path: &Path) -> Result<ModelDescription, Error> {
-    use paramecia_core::quantized::gguf_file;
+    use paramecia_model::gguf_file;
 
     let mut file = std::fs::File::open(path)
         .map_err(|e| Error::ModelError(format!("Failed to open model: {e}")))?;
@@ -1915,7 +2006,7 @@ pub fn describe_model(path: &Path) -> Result<ModelDescription, Error> {
     // Determine true active expert count by reading expert_mask tensors (if present).
     // Pruned models store blk.{layer}.expert_mask with 0.0 for kept and -inf for pruned.
     let n_experts = if n_experts_metadata > 0 {
-        let device = paramecia_core::Device::Cpu;
+        let device = paramecia_model::Device::Cpu;
         let mut min_active: Option<u32> = None;
         for layer in 0..n_layers {
             let mask_name = format!("blk.{layer}.expert_mask");
@@ -1985,8 +2076,8 @@ pub fn describe_model(path: &Path) -> Result<ModelDescription, Error> {
     })
 }
 
-fn convert_ggml_dtype(dt: paramecia_core::quantized::GgmlDType) -> GgmlDtype {
-    use paramecia_core::quantized::GgmlDType;
+fn convert_ggml_dtype(dt: paramecia_model::GgmlDType) -> GgmlDtype {
+    use paramecia_model::GgmlDType;
     match dt {
         GgmlDType::F32 => GgmlDtype::F32,
         GgmlDType::F16 => GgmlDtype::F16,
@@ -2006,8 +2097,8 @@ fn convert_ggml_dtype(dt: paramecia_core::quantized::GgmlDType) -> GgmlDtype {
     }
 }
 
-fn convert_gguf_value(v: &paramecia_core::quantized::gguf_file::Value) -> MetadataValue {
-    use paramecia_core::quantized::gguf_file::Value;
+fn convert_gguf_value(v: &paramecia_model::gguf_file::Value) -> MetadataValue {
+    use paramecia_model::gguf_file::Value;
     match v {
         Value::U8(x) => MetadataValue::U8(*x),
         Value::I8(x) => MetadataValue::I8(*x),
@@ -2022,6 +2113,25 @@ fn convert_gguf_value(v: &paramecia_core::quantized::gguf_file::Value) -> Metada
         Value::Bool(x) => MetadataValue::Bool(*x),
         Value::String(x) => MetadataValue::String(x.clone()),
         Value::Array(arr) => MetadataValue::Array(arr.iter().map(convert_gguf_value).collect()),
+    }
+}
+
+fn metadata_value_to_gguf(v: &MetadataValue) -> paramecia_model::gguf_file::Value {
+    use paramecia_model::gguf_file::Value;
+    match v {
+        MetadataValue::U8(x) => Value::U8(*x),
+        MetadataValue::I8(x) => Value::I8(*x),
+        MetadataValue::U16(x) => Value::U16(*x),
+        MetadataValue::I16(x) => Value::I16(*x),
+        MetadataValue::U32(x) => Value::U32(*x),
+        MetadataValue::I32(x) => Value::I32(*x),
+        MetadataValue::U64(x) => Value::U64(*x),
+        MetadataValue::I64(x) => Value::I64(*x),
+        MetadataValue::F32(x) => Value::F32(*x),
+        MetadataValue::F64(x) => Value::F64(*x),
+        MetadataValue::Bool(x) => Value::Bool(*x),
+        MetadataValue::String(x) => Value::String(x.clone()),
+        MetadataValue::Array(arr) => Value::Array(arr.iter().map(metadata_value_to_gguf).collect()),
     }
 }
 

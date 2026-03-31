@@ -28,16 +28,13 @@
 
 mod loss;
 mod trainer;
-pub mod training_step;
+mod training_step;
 mod tuning_reader;
 
 pub use loss::{DistillationLoss, DistillationLossConfig, MtpLossConfig};
 pub use trainer::{
     save_trained_model, update_gguf_metadata, DistillationTrainer, DistillationTrainerConfig,
-    EpsilonConfig, OptimizeTensors, StepStats, TrainingCheckpoint,
+    EpsilonConfig, OptimizeTensors,
 };
-pub use training_step::{
-    load_tokenizer_for_training, parse_optimize_tensors, run_training_step_with_grad_accum,
-    TrainingState,
-};
-pub use tuning_reader::{PaddedTuningData, TuningData, TuningDataset, TuningReader};
+pub use training_step::{parse_optimize_tensors, run_training_step_with_grad_accum};
+pub use tuning_reader::{PaddedTuningData, TuningData, TuningDataset};

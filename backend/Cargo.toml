@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "paramecia-arrow",
+    "paramecia-core",
+    "paramecia-cuda",
+    "paramecia-metal",
+    "paramecia-model",
+    "paramecia-nn",
+    "paramecia-opt",
+    "paramecia-tensor",
+    "paramecia-vulkan",
+]
+default-members = [
+    "paramecia-arrow",
+    "paramecia-core",
+    "paramecia-model",
+    "paramecia-nn",
+    "paramecia-opt",
+    "paramecia-tensor",
+]
+
+[workspace.dependencies]
+# Internal backend crates
+paramecia-arrow = { path = "paramecia-arrow" }
+paramecia-core = { path = "paramecia-core" }
+paramecia-model = { path = "paramecia-model" }
+paramecia-nn = { path = "paramecia-nn" }
+paramecia-opt = { path = "paramecia-opt" }
+paramecia-tensor = { path = "paramecia-tensor" }
+
+# Shared deps used by backend crates
+anyhow = "1.0"
+bytemuck = { version = "1.14", features = ["derive"] }
+byteorder = "1.5"
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+glowstick = { git = "https://github.com/nicksenger/glowstick.git", branch = "paramecia" }
+half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
+hf-hub = "0.4"
+inception = { git = "https://github.com/nicksenger/Inception.git", branch = "paramecia" }
+num-traits = "0.2.15"
+rand = "0.9"
+rand_distr = "0.5.1"
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokenizers = { version = "0.21", default-features = false }
+tracing = "0.1"
