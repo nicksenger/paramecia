@@ -154,6 +154,8 @@ pub enum ModelInput {
     Tokens(Vec<u32>),
     /// Soft prompt component (transformed into an input-embedding by the host).
     Soft(Vec<LogitEntry>),
+    /// Raw per-token probabilities over the full vocabulary for one position.
+    Raw(Vec<f32>),
 }
 
 /// A segment of training data: either masked context or teacher-labeled generation.
@@ -163,6 +165,8 @@ pub enum TrainingData {
     Context(ModelInput),
     /// Teacher model output — logits for generated tokens.
     Target(Vec<Predicted>),
+    /// Raw per-token probabilities over the full vocabulary for one position
+    Raw(Vec<f32>),
 }
 
 /// A complete training sample with interleaved context and generation segments.
@@ -170,6 +174,16 @@ pub enum TrainingData {
 pub struct TrainingSample {
     pub id: SampleId,
     pub data: Vec<TrainingData>,
+}
+
+impl From<&[TrainingData]> for TrainingSample {
+    fn from(value: &[TrainingData]) -> Self {
+        let id = uuid::Uuid::new_v4().as_u64_pair();
+        Self {
+            id,
+            data: value.to_vec(),
+        }
+    }
 }
 
 /// A batch of training data for fine-grained training operations.

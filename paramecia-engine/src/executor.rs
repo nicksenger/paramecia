@@ -295,6 +295,7 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
     /// - Text(s) → tokenize then fill_context_tokens
     /// - Tokens(ids) → fill_context_tokens directly
     /// - Soft(logits) → compute weighted embedding and forward_with_embeddings
+    /// - Raw(probabilities) → full-vocab weighted embedding and forward_with_embeddings
     pub async fn fill_context_inputs(
         &mut self,
         inputs: &[ModelInput],
@@ -362,6 +363,79 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
                     self.state_position += 1;
                     self.pending_logits = Some(logits);
                     // Soft tokens don't add to the token history (they're synthetic)
+                    total += 1;
+
+                    if let Some(tx) = &progress_tx {
+                        let _ = tx.send(Ok(total)).await;
+                    }
+                }
+                ModelInput::Raw(raw_probs) => {
+                    let vocab_size = self.model.vocab_size();
+                    if raw_probs.len() != vocab_size {
+                        return Err(Error::ModelError(format!(
+                            "Raw probability vector length {} does not match model vocab size {}. \
+This usually indicates tokenizer/model mismatch (for example, Qwen3.5 uses 248320 and Qwen3-Next uses 151936).",
+                            raw_probs.len(),
+                            vocab_size
+                        )));
+                    }
+
+                    if raw_probs.is_empty() {
+                        return Err(Error::ModelError(
+                            "Raw probability vector is empty".to_string(),
+                        ));
+                    }
+
+                    if raw_probs
+                        .iter()
+                        .any(|p| !p.is_finite() || p.is_sign_negative())
+                    {
+                        return Err(Error::ModelError(
+                            "Raw probability vector contains non-finite or negative values"
+                                .to_string(),
+                        ));
+                    }
+
+                    let mut probs = raw_probs.clone();
+                    let prob_sum: f32 = probs.iter().sum();
+                    if !prob_sum.is_finite() || prob_sum <= 0.0 {
+                        return Err(Error::ModelError(
+                            "Raw probability vector must have positive finite mass".to_string(),
+                        ));
+                    }
+                    for p in &mut probs {
+                        *p /= prob_sum;
+                    }
+
+                    // Compute weighted embedding directly over the full vocabulary.
+                    let embed_weights = self.model.embedding_weights();
+                    let device = embed_weights.device().clone();
+                    let probs_tensor = Tensor::new(probs.as_slice(), &device)
+                        .and_then(|t| t.unsqueeze(1))
+                        .map_err(|e| Error::ModelError(e.to_string()))?;
+                    let weighted = embed_weights
+                        .broadcast_mul(&probs_tensor)
+                        .and_then(|t| t.sum(0))
+                        .map_err(|e| Error::ModelError(e.to_string()))?;
+
+                    let embedding = weighted
+                        .unsqueeze(0)
+                        .and_then(|t| t.unsqueeze(0))
+                        .and_then(|t| t.to_dtype(self.model.dtype()))
+                        .map_err(|e| Error::ModelError(e.to_string()))?;
+
+                    self.clear_pending_speculative_predictions();
+                    self.awaiting_commit = false;
+
+                    let offset = self.state_position;
+                    let logits = self
+                        .model
+                        .forward_with_embeddings(&embedding, offset)
+                        .map_err(|e| Error::ModelError(e.to_string()))?;
+
+                    self.state_position += 1;
+                    self.pending_logits = Some(logits);
+                    // Raw tokens are synthetic positions and do not append a concrete token ID.
                     total += 1;
 
                     if let Some(tx) = &progress_tx {
@@ -485,6 +559,96 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
             tail_mass: distribution.tail_mass,
             expert_indices,
         })
+    }
+
+    /// Predict full-vocabulary probabilities for the next token without sampling/decoding.
+    ///
+    /// This uses the same state/cache flow as `predict_token`, but returns a
+    /// normalized probability for every vocabulary entry so the caller can
+    /// choose and commit a token explicitly via `commit_token`.
+    pub async fn predict_logits(&mut self) -> Result<Vec<f32>, Error> {
+        if self.awaiting_commit {
+            return Err(Error::InvalidState(
+                "Must call commit_token before calling predict_logits again".into(),
+            ));
+        }
+
+        if self.tokens.is_empty() {
+            return Err(Error::InvalidState(
+                "No tokens in context. Call fill_context first.".into(),
+            ));
+        }
+
+        // Use cached logits from fill_context if available.
+        let logits = if let Some(cached) = self.pending_logits.take() {
+            cached
+        } else {
+            let start_pos = self.state_position;
+            let ctxt: Vec<u32> = self.tokens[start_pos..].to_vec();
+
+            if ctxt.is_empty() {
+                return Err(Error::InvalidState(
+                    "No uncommitted tokens to process. Call commit_token first.".into(),
+                ));
+            }
+
+            let device = self.device.clone();
+            let input = Tensor::new(ctxt.as_slice(), &device)
+                .and_then(|t| t.unsqueeze(0))
+                .map_err(|e| Error::ModelError(e.to_string()))?;
+
+            let logits = self
+                .model
+                .forward(&input, start_pos)
+                .map_err(|e| Error::ModelError(e.to_string()))?;
+
+            self.state_position = self.tokens.len();
+            logits
+        };
+
+        // Extract logits for last position.
+        let logits = logits
+            .squeeze(0)
+            .map_err(|e| Error::ModelError(e.to_string()))?;
+        let logits = if logits.rank() == 2 {
+            match logits.dims()[0].checked_sub(1) {
+                Some(last_idx) => logits
+                    .get(last_idx)
+                    .map_err(|e| Error::ModelError(e.to_string()))?,
+                None => return Err(Error::ModelError("Empty logits".into())),
+            }
+        } else {
+            logits
+        };
+
+        let logits = logits
+            .to_dtype(DType::F32)
+            .map_err(|e| Error::ModelError(e.to_string()))?;
+        let logits_vec = logits
+            .to_vec1::<f32>()
+            .map_err(|e| Error::ModelError(e.to_string()))?;
+        if logits_vec.is_empty() {
+            return Err(Error::ModelError("Empty logits".into()));
+        }
+
+        // Convert logits -> probabilities (stable softmax) so output can be
+        // fed directly into ModelInput::Raw.
+        let max_logit = logits_vec.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut probs: Vec<f32> = logits_vec.iter().map(|&x| (x - max_logit).exp()).collect();
+        let sum: f32 = probs.iter().sum();
+        if !sum.is_finite() || sum <= 0.0 {
+            return Err(Error::ModelError(
+                "Invalid logits: cannot normalize probabilities".into(),
+            ));
+        }
+        for p in &mut probs {
+            *p /= sum;
+        }
+
+        self.pending_commit_expected_token = None;
+        self.pending_commit_preappended = false;
+        self.awaiting_commit = true;
+        Ok(probs)
     }
 
     pub async fn predict_completion(
@@ -613,6 +777,14 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
                         let _ = tx
                             .send(Err(Error::InvalidState(
                                 "Soft inputs are not supported in batched mode".into(),
+                            )))
+                            .await;
+                        return;
+                    }
+                    ModelInput::Raw(_) => {
+                        let _ = tx
+                            .send(Err(Error::InvalidState(
+                                "Raw inputs are not supported in batched mode".into(),
                             )))
                             .await;
                         return;
@@ -917,7 +1089,8 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
         self.validate_single_token_id(token, "commit_token")?;
         if !self.awaiting_commit {
             return Err(Error::InvalidState(
-                "No pending predict_token to commit. Call predict_token first.".into(),
+                "No pending prediction to commit. Call predict_token or predict_logits first."
+                    .into(),
             ));
         }
 
@@ -951,6 +1124,43 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
             self.pending_speculative_commits.clear();
         }
         Ok(())
+    }
+
+    /// Commit the argmax token from a full-vocabulary probability vector.
+    pub async fn commit_logits(&mut self, probs: &[f32]) -> Result<(), Error> {
+        if !self.awaiting_commit {
+            return Err(Error::InvalidState(
+                "No pending prediction to commit. Call predict_token or predict_logits first."
+                    .into(),
+            ));
+        }
+
+        let vocab_size = self.model.vocab_size();
+        if probs.len() != vocab_size {
+            return Err(Error::ModelError(format!(
+                "Logit probability vector length {} does not match model vocab size {}.",
+                probs.len(),
+                vocab_size
+            )));
+        }
+        if probs.is_empty() {
+            return Err(Error::ModelError(
+                "Logit probability vector is empty".into(),
+            ));
+        }
+        if probs.iter().any(|p| !p.is_finite() || p.is_sign_negative()) {
+            return Err(Error::ModelError(
+                "Logit probability vector contains non-finite or negative values".into(),
+            ));
+        }
+
+        let (argmax_idx, _) = probs
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .ok_or_else(|| Error::ModelError("Logit probability vector is empty".into()))?;
+        self.commit_token(argmax_idx as u32).await
     }
 
     /// Take an in-memory snapshot of current state. Returns UUID-keyed Snapshot.
@@ -1517,7 +1727,7 @@ impl ModelEngine {
         Ok(progress_rx)
     }
 
-    /// Fill context with ModelInput items (text, tokens, or soft prompts).
+    /// Fill context with ModelInput items (text, tokens, soft prompts, or raw probabilities).
     pub async fn fill_context_inputs(
         &self,
         inputs: &[ModelInput],
@@ -1587,6 +1797,18 @@ impl ModelEngine {
             .map_err(|_| Error::ModelError("Model actor dropped response".into()))?
     }
 
+    /// Predict full-vocabulary probabilities for the next token.
+    pub async fn predict_logits(&self) -> Result<Vec<f32>, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.actor
+            .sender()
+            .send(ModelCommand::PredictLogits { respond: tx })
+            .await
+            .map_err(|_| Error::ModelError("Model actor stopped".into()))?;
+        rx.await
+            .map_err(|_| Error::ModelError("Model actor dropped response".into()))?
+    }
+
     /// Start a streaming completion.
     pub async fn predict_completion(
         &self,
@@ -1641,6 +1863,21 @@ impl ModelEngine {
         self.actor
             .sender()
             .send(ModelCommand::CommitToken { token, respond: tx })
+            .await
+            .map_err(|_| Error::ModelError("Model actor stopped".into()))?;
+        rx.await
+            .map_err(|_| Error::ModelError("Model actor dropped response".into()))?
+    }
+
+    /// Commit the argmax token from a full-vocabulary probability vector.
+    pub async fn commit_logits(&self, probs: &[f32]) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.actor
+            .sender()
+            .send(ModelCommand::CommitLogits {
+                probs: probs.to_vec(),
+                respond: tx,
+            })
             .await
             .map_err(|_| Error::ModelError("Model actor stopped".into()))?;
         rx.await
@@ -1775,6 +2012,23 @@ impl ModelEngine {
             .await
             .map_err(|_| Error::ModelError("Model actor stopped".into()))?;
         Ok(())
+    }
+
+    /// Reinforce a single in-memory sequence of training samples.
+    ///
+    /// This is the non-streaming singular form of `train_model`.
+    pub async fn reinforce_sequence(&self, sequence: Vec<TrainingSample>) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.actor
+            .sender()
+            .send(ModelCommand::ReinforceSequence {
+                sequence,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| Error::ModelError("Model actor stopped".into()))?;
+        rx.await
+            .map_err(|_| Error::ModelError("Model actor dropped response".into()))?
     }
 
     /// Set hyperparameters on the unified actor.

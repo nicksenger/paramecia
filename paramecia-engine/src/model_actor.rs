@@ -38,6 +38,9 @@ pub(crate) enum ModelCommand {
     PredictToken {
         respond: oneshot::Sender<Result<Predicted, Error>>,
     },
+    PredictLogits {
+        respond: oneshot::Sender<Result<Vec<f32>, Error>>,
+    },
     PredictCompletion {
         respond: mpsc::Sender<Result<Predicted, Error>>,
         cancel_rx: oneshot::Receiver<()>,
@@ -49,6 +52,10 @@ pub(crate) enum ModelCommand {
     },
     CommitToken {
         token: u32,
+        respond: oneshot::Sender<Result<(), Error>>,
+    },
+    CommitLogits {
+        probs: Vec<f32>,
         respond: oneshot::Sender<Result<(), Error>>,
     },
     TakeSnapshot {
@@ -93,6 +100,10 @@ pub(crate) enum ModelCommand {
         is_validation: bool,
         loss_tx: mpsc::Sender<Result<StepResult, Error>>,
         cancel_rx: oneshot::Receiver<()>,
+    },
+    ReinforceSequence {
+        sequence: Vec<TrainingSample>,
+        respond: oneshot::Sender<Result<(), Error>>,
     },
     SetHyperParameters {
         update: Box<HyperParameterUpdate>,
@@ -552,6 +563,93 @@ async fn flush_training_buffer(
     }
 }
 
+/// Run one-shot reinforcement over an in-memory sequence of samples.
+///
+/// This mirrors `train_model` semantics (same loss pipeline and optimizer path)
+/// but without a streamed channel interface.
+fn reinforce_sequence(
+    executor: &mut ModelEngineInner,
+    training_state: &mut Option<TrainingSubsystem>,
+    training_config: &TrainingConfig,
+    sequence: Vec<TrainingSample>,
+) -> Result<(), Error> {
+    if sequence.is_empty() {
+        return Ok(());
+    }
+
+    let (loss_config, mtp_config, minibatch_size, n_grad_steps) = {
+        let ts = ensure_training_subsystem(training_state, executor, training_config);
+        (
+            ts.loss_config.clone(),
+            ts.mtp_config.clone(),
+            ts.minibatch_size,
+            ts.n_grad_steps,
+        )
+    };
+
+    let mut optimizer = {
+        let ts = ensure_training_subsystem(training_state, executor, training_config);
+        setup_optimizer(executor.model_mut(), ts)?
+    };
+
+    let tokenizer = executor.tokenizer().clone();
+    let loss_fn = DistillationLoss::new(loss_config);
+    let device = executor.device().clone();
+    let mut sample_buffer = Vec::new();
+    let effective_batch = minibatch_size * n_grad_steps;
+
+    for sample in sequence {
+        let tuning_data = sample_to_tuning_data(&sample.data, &tokenizer)
+            .map_err(|e| Error::TrainError(format!("Failed to convert sample: {e}")))?;
+        sample_buffer.push(tuning_data);
+
+        if sample_buffer.len() >= effective_batch {
+            let step_loss = run_training_step_with_grad_accum(
+                executor.model_mut(),
+                &mut optimizer,
+                &loss_fn,
+                &mut sample_buffer,
+                &device,
+                false,
+                minibatch_size,
+                n_grad_steps,
+                mtp_config.as_ref(),
+            )
+            .map_err(|e| Error::TrainError(format!("Training step failed: {e}")))?;
+
+            let ts = ensure_training_subsystem(training_state, executor, training_config);
+            ts.step += 1;
+            if step_loss < ts.best_loss {
+                ts.best_loss = step_loss;
+            }
+        }
+    }
+
+    if !sample_buffer.is_empty() {
+        let actual_n_grad = sample_buffer.len().div_ceil(minibatch_size);
+        let step_loss = run_training_step_with_grad_accum(
+            executor.model_mut(),
+            &mut optimizer,
+            &loss_fn,
+            &mut sample_buffer,
+            &device,
+            false,
+            minibatch_size,
+            actual_n_grad,
+            mtp_config.as_ref(),
+        )
+        .map_err(|e| Error::TrainError(format!("Training step failed: {e}")))?;
+
+        let ts = ensure_training_subsystem(training_state, executor, training_config);
+        ts.step += 1;
+        if step_loss < ts.best_loss {
+            ts.best_loss = step_loss;
+        }
+    }
+
+    Ok(())
+}
+
 /// Run one training step on the buffered samples.
 async fn run_training_step(
     executor: &mut ModelEngineInner,
@@ -645,6 +743,10 @@ async fn process_command(
             let result = executor.predict_token().await;
             let _ = respond.send(result);
         }
+        ModelCommand::PredictLogits { respond } => {
+            let result = executor.predict_logits().await;
+            let _ = respond.send(result);
+        }
         ModelCommand::PredictCompletion { respond, cancel_rx } => {
             executor.predict_completion(cancel_rx, respond).await;
         }
@@ -659,6 +761,10 @@ async fn process_command(
         }
         ModelCommand::CommitToken { token, respond } => {
             let result = executor.commit_token(token).await;
+            let _ = respond.send(result);
+        }
+        ModelCommand::CommitLogits { probs, respond } => {
+            let result = executor.commit_logits(&probs).await;
             let _ = respond.send(result);
         }
         ModelCommand::TakeSnapshot { respond } => {
@@ -744,6 +850,17 @@ async fn process_command(
                 minibatch_size: ts.minibatch_size,
                 n_grad_steps: ts.n_grad_steps,
             });
+        }
+        ModelCommand::ReinforceSequence { sequence, respond } => {
+            if active_training.is_some() {
+                let _ = respond.send(Err(Error::InvalidState(
+                    "Cannot run reinforce_sequence while stream training is active.".into(),
+                )));
+                return;
+            }
+
+            let result = reinforce_sequence(executor, training_state, training_config, sequence);
+            let _ = respond.send(result);
         }
         ModelCommand::SetHyperParameters { update, respond } => {
             let ts = ensure_training_subsystem(training_state, executor, training_config);

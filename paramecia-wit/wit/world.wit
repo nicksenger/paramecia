@@ -161,6 +161,9 @@ interface types {
         /// by computing a weighted sum over the token embedding table, producing a
         /// sequence of length equal to the list length.
         soft(list<logit-entry>),
+        /// Raw probability vector for a single synthetic position.
+        /// Length must exactly match the loaded model vocabulary size.
+        raw(list<f32>),
     }
 
     /// A segment of training data: either masked context or teacher-labeled generation

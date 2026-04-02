@@ -168,50 +168,89 @@ impl DistillationLoss {
             if chunk_pos >= seq_dim {
                 continue;
             }
+            if data_idx >= tuning_data.raw_probs.len() {
+                return Err(paramecia_core::Error::Msg(format!(
+                    "Assistant data index {} is out of range for raw_probs (len={})",
+                    data_idx,
+                    tuning_data.raw_probs.len()
+                )));
+            }
 
             // Get student log probs for this position (already on CPU)
             let pos_log_probs_vec = &student_log_probs_cpu[chunk_pos];
 
-            // Get teacher data for this position
-            let teacher_top_k_ids = &tuning_data.top_k_token_ids[data_idx];
-            let teacher_top_k_log_probs = &tuning_data.top_k_log_probs[data_idx];
-            let teacher_tail_ids = &tuning_data.tail_token_ids[data_idx];
-            let teacher_tail_log_probs = &tuning_data.tail_log_probs[data_idx];
-
-            // Compute KL divergence for top-k tokens
-            // KL = Σ p_teacher * (log p_teacher - log p_student)
             let mut position_loss = 0.0f32;
 
-            for (i, &token_id) in teacher_top_k_ids.iter().enumerate() {
-                let token_id = token_id as usize;
-                if token_id >= vocab_size {
-                    continue;
+            // Dense raw-probability path: full-vocab KL.
+            if let Some(raw_probs) = tuning_data.raw_probs[data_idx].as_ref() {
+                if raw_probs.len() != vocab_size {
+                    return Err(paramecia_core::Error::Msg(format!(
+                        "Raw teacher distribution length {} does not match student vocab size {}",
+                        raw_probs.len(),
+                        vocab_size
+                    )));
                 }
 
-                let teacher_log_prob = teacher_top_k_log_probs[i];
-                let teacher_prob = teacher_log_prob.exp().max(self.config.min_prob as f32);
-                let student_log_prob = pos_log_probs_vec[token_id];
+                let raw_sum: f32 = raw_probs
+                    .iter()
+                    .copied()
+                    .filter(|p| p.is_finite() && *p > 0.0)
+                    .sum();
+                if !raw_sum.is_finite() || raw_sum <= 0.0 {
+                    return Err(paramecia_core::Error::Msg(
+                        "Raw teacher distribution must have positive finite mass".to_string(),
+                    ));
+                }
 
-                // KL contribution: p_teacher * (log p_teacher - log p_student)
-                position_loss += teacher_prob * (teacher_log_prob - student_log_prob);
-            }
+                for (token_id, &raw_prob) in raw_probs.iter().enumerate() {
+                    if !raw_prob.is_finite() || raw_prob <= 0.0 {
+                        continue;
+                    }
 
-            // Compute KL divergence for tail samples
-            // These are randomly sampled tokens from outside top-k
-            // KL contribution: p_teacher * (log p_teacher - log p_student)
-            if !teacher_tail_ids.is_empty() {
-                for (i, &token_id) in teacher_tail_ids.iter().enumerate() {
+                    let teacher_prob = (raw_prob / raw_sum).max(self.config.min_prob as f32);
+                    let teacher_log_prob = teacher_prob.ln();
+                    let student_log_prob = pos_log_probs_vec[token_id];
+
+                    // KL = Σ p_teacher * (log p_teacher - log p_student)
+                    position_loss += teacher_prob * (teacher_log_prob - student_log_prob);
+                }
+            } else {
+                // Sparse top-k + tail path.
+                let teacher_top_k_ids = &tuning_data.top_k_token_ids[data_idx];
+                let teacher_top_k_log_probs = &tuning_data.top_k_log_probs[data_idx];
+                let teacher_tail_ids = &tuning_data.tail_token_ids[data_idx];
+                let teacher_tail_log_probs = &tuning_data.tail_log_probs[data_idx];
+
+                // KL divergence for top-k tokens:
+                // KL = Σ p_teacher * (log p_teacher - log p_student)
+                for (i, &token_id) in teacher_top_k_ids.iter().enumerate() {
                     let token_id = token_id as usize;
                     if token_id >= vocab_size {
                         continue;
                     }
 
-                    let teacher_log_prob = teacher_tail_log_probs[i];
+                    let teacher_log_prob = teacher_top_k_log_probs[i];
                     let teacher_prob = teacher_log_prob.exp().max(self.config.min_prob as f32);
                     let student_log_prob = pos_log_probs_vec[token_id];
 
-                    // Same KL formula as top-k: p_teacher * (log p_teacher - log p_student)
+                    // KL contribution: p_teacher * (log p_teacher - log p_student)
                     position_loss += teacher_prob * (teacher_log_prob - student_log_prob);
+                }
+
+                // KL divergence for sampled tail tokens.
+                if !teacher_tail_ids.is_empty() {
+                    for (i, &token_id) in teacher_tail_ids.iter().enumerate() {
+                        let token_id = token_id as usize;
+                        if token_id >= vocab_size {
+                            continue;
+                        }
+
+                        let teacher_log_prob = teacher_tail_log_probs[i];
+                        let teacher_prob = teacher_log_prob.exp().max(self.config.min_prob as f32);
+                        let student_log_prob = pos_log_probs_vec[token_id];
+
+                        position_loss += teacher_prob * (teacher_log_prob - student_log_prob);
+                    }
                 }
             }
 

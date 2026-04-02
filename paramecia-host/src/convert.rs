@@ -109,6 +109,7 @@ impl From<exec::ModelInput> for wit::ModelInput {
             exec::ModelInput::Soft(entries) => {
                 wit::ModelInput::Soft(entries.into_iter().map(Into::into).collect())
             }
+            exec::ModelInput::Raw(probs) => wit::ModelInput::Raw(probs),
         }
     }
 }
@@ -294,6 +295,7 @@ impl From<wit::ModelInput> for exec::ModelInput {
             wit::ModelInput::Soft(entries) => {
                 exec::ModelInput::Soft(entries.into_iter().map(Into::into).collect())
             }
+            wit::ModelInput::Raw(probs) => exec::ModelInput::Raw(probs),
         }
     }
 }

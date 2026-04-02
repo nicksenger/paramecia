@@ -92,6 +92,10 @@ pub struct TuningData {
     pub tail_log_probs: Vec<Vec<f32>>,
     /// Total probability mass of tail (for importance weighting)
     pub tail_mass: Vec<f32>,
+    /// Optional full-vocab teacher probabilities for each assistant token.
+    /// When present, KL is computed against this dense distribution instead of
+    /// sparse top-k/tail entries.
+    pub raw_probs: Vec<Option<Vec<f32>>>,
     /// Expert indices per assistant token [n_assistant, n_layers * n_experts_per_tok]
     pub expert_indices: Vec<Vec<u32>>,
     /// Metadata
@@ -183,6 +187,40 @@ impl TuningData {
         // CRITICAL: Use same device as embed_weights to avoid CPU<->GPU sync bottleneck
         let device = embed_weights.device();
 
+        if let Some(Some(raw_probs)) = self.raw_probs.get(data_idx) {
+            let vocab_size = embed_weights.dim(0)?;
+            if raw_probs.len() != vocab_size {
+                return Err(paramecia_core::Error::Msg(format!(
+                    "Raw probability length {} does not match embedding vocab size {}",
+                    raw_probs.len(),
+                    vocab_size
+                )));
+            }
+            if raw_probs
+                .iter()
+                .any(|p| !p.is_finite() || p.is_sign_negative())
+            {
+                return Err(paramecia_core::Error::Msg(
+                    "Raw probabilities contain non-finite or negative values".to_string(),
+                ));
+            }
+
+            let prob_sum: f32 = raw_probs.iter().sum();
+            if !prob_sum.is_finite() || prob_sum <= 0.0 {
+                return Err(paramecia_core::Error::Msg(
+                    "Raw probabilities must have positive finite mass".to_string(),
+                ));
+            }
+
+            let mut probs = raw_probs.clone();
+            for p in &mut probs {
+                *p /= prob_sum;
+            }
+
+            let probs_tensor = Tensor::new(probs.as_slice(), device)?.unsqueeze(1)?; // [vocab, 1]
+            return embed_weights.broadcast_mul(&probs_tensor)?.sum(0); // [hidden]
+        }
+
         // Gather top-k + tail token IDs and probs
         let top_k_ids = &self.top_k_token_ids[data_idx];
         let top_k_probs: Vec<f32> = self.top_k_log_probs[data_idx]
@@ -271,6 +309,7 @@ impl TuningData {
         truncated.tail_token_ids.truncate(n_assistant_kept);
         truncated.tail_log_probs.truncate(n_assistant_kept);
         truncated.tail_mass.truncate(n_assistant_kept);
+        truncated.raw_probs.truncate(n_assistant_kept);
         if !truncated.expert_indices.is_empty() {
             truncated.expert_indices.truncate(n_assistant_kept);
         }
@@ -469,6 +508,7 @@ impl TuningReader {
             tail_token_ids,
             tail_log_probs,
             tail_mass,
+            raw_probs: vec![None; n_assistant_tokens],
             expert_indices,
             vocab_size,
             n_layers,
