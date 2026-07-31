@@ -1412,11 +1412,11 @@ fn add_training_ext_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
         },
     )?;
 
-    // perturb-down: async func(perturbed: positive-model, loss-up: f32) -> result<negative-model, error>
+    // perturb-down: async func(perturbed: positive-model) -> result<negative-model, error>
     instance.func_wrap_concurrent(
         "perturb-down",
         |accessor: &Accessor<HostState, HasSelf<HostState>>,
-         (perturbed, loss_up): (wit::PositiveModel, f32)| {
+         (perturbed,): (wit::PositiveModel,)| {
             Box::pin(async move {
                 let model_id = perturbed.model.id;
                 let executor = accessor.with(|mut data| {
@@ -1430,7 +1430,7 @@ fn add_training_ext_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
                     Err(e) => return Ok((Err(e),)),
                 };
 
-                let result = executor.perturb_down(loss_up).await;
+                let result = executor.perturb_down().await;
                 match result {
                     Ok(()) => Ok((Ok(wit::NegativeModel {
                         model: perturbed.model,
@@ -1441,11 +1441,11 @@ fn add_training_ext_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
         },
     )?;
 
-    // update: async func(perturbed: negative-model, loss-down: f32) -> result<training-model, error>
+    // update: async func(perturbed: negative-model, loss-up: f32, loss-down: f32) -> result<training-model, error>
     instance.func_wrap_concurrent(
         "update",
         |accessor: &Accessor<HostState, HasSelf<HostState>>,
-         (perturbed, loss_down): (wit::NegativeModel, f32)| {
+         (perturbed, loss_up, loss_down): (wit::NegativeModel, f32, f32)| {
             Box::pin(async move {
                 let model_id = perturbed.model.id;
                 let executor = accessor.with(|mut data| {
@@ -1459,7 +1459,7 @@ fn add_training_ext_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
                     Err(e) => return Ok((Err(e),)),
                 };
 
-                let result = executor.update(loss_down).await;
+                let result = executor.update(loss_up, loss_down).await;
                 match result {
                     Ok(()) => Ok((Ok(perturbed.model),)),
                     Err(e) => Ok((Err(e.into()),)),

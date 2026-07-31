@@ -104,10 +104,10 @@ pub(crate) enum ModelCommand {
         respond: oneshot::Sender<Result<(), Error>>,
     },
     PerturbDown {
-        loss_up: f32,
         respond: oneshot::Sender<Result<(), Error>>,
     },
     Update {
+        loss_up: f32,
         loss_down: f32,
         respond: oneshot::Sender<Result<(), Error>>,
     },
@@ -614,8 +614,6 @@ struct DecomposedZO {
     optimizer: QuZO,
     /// State from perturb_up, cleared after update.
     pending_state: Option<DecomposedZOState>,
-    /// loss_up stored after perturb_down.
-    loss_up: f32,
 }
 
 /// Process a single command from the actor's command channel.
@@ -759,7 +757,6 @@ async fn process_command(
                         *decomposed_zo = Some(DecomposedZO {
                             optimizer: opt,
                             pending_state: None,
-                            loss_up: 0.0,
                         });
                     }
                     Ok(None) => {
@@ -784,11 +781,10 @@ async fn process_command(
                 }
             }
         }
-        ModelCommand::PerturbDown { loss_up, respond } => match decomposed_zo.as_mut() {
+        ModelCommand::PerturbDown { respond } => match decomposed_zo.as_mut() {
             Some(dzo) => match dzo.pending_state.as_ref() {
                 Some(state) => match dzo.optimizer.perturb_down(state) {
                     Ok(()) => {
-                        dzo.loss_up = loss_up;
                         let _ = respond.send(Ok(()));
                     }
                     Err(e) => {
@@ -808,10 +804,9 @@ async fn process_command(
                 )));
             }
         },
-        ModelCommand::Update { loss_down, respond } => match decomposed_zo.as_mut() {
+        ModelCommand::Update { loss_up, loss_down, respond } => match decomposed_zo.as_mut() {
             Some(dzo) => match dzo.pending_state.take() {
                 Some(state) => {
-                    let loss_up = dzo.loss_up;
                     match dzo.optimizer.update(state, loss_up, loss_down) {
                         Ok(_avg_loss) => {
                             let _ = respond.send(Ok(()));

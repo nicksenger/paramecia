@@ -495,7 +495,6 @@ impl crate::paramecia::host::training_ext::HostWithStore for HostState {
     fn perturb_down<T: 'static>(
         _accessor: &Accessor<T, Self>,
         _perturbed: wit::PositiveModel,
-        _loss_up: f32,
     ) -> impl std::future::Future<Output = wasmtime::Result<Result<wit::NegativeModel, wit::Error>>> + Send
     {
         async move {
@@ -508,6 +507,7 @@ impl crate::paramecia::host::training_ext::HostWithStore for HostState {
     fn update<T: 'static>(
         _accessor: &Accessor<T, Self>,
         _perturbed: wit::NegativeModel,
+        _loss_up: f32,
         _loss_down: f32,
     ) -> impl std::future::Future<Output = wasmtime::Result<Result<wit::Model, wit::Error>>> + Send
     {

@@ -523,9 +523,9 @@ interface training {
 /// QuZO estimates gradients by evaluating loss at two perturbation points:
 ///   1. perturb-up: apply +epsilon perturbation → returns positive-model
 ///   2. Guest evaluates loss on positive-model (forward pass)
-///   3. perturb-down: record loss+, apply -epsilon perturbation → returns negative-model
+///   3. perturb-down: apply -epsilon perturbation → returns negative-model
 ///   4. Guest evaluates loss on negative-model (forward pass)
-///   5. update: record loss-, compute gradient estimate, update weights → returns model
+///   5. update: compute gradient estimate from both losses, update weights → returns model
 interface training-ext {
     use types.{model, positive-model, negative-model, error};
 
@@ -533,10 +533,10 @@ interface training-ext {
     perturb-up: async func(model: model) -> result<positive-model, error>;
 
     /// Restores a positively perturbed model, then perturbs it in the negative direction
-    perturb-down: async func(perturbed: positive-model, loss-up: f32) -> result<negative-model, error>;
+    perturb-down: async func(perturbed: positive-model) -> result<negative-model, error>;
 
     /// Calculates the difference in loss and updates the weights
-    update: async func(perturbed: negative-model, loss-down: f32) -> result<model, error>;
+    update: async func(perturbed: negative-model, loss-up: f32, loss-down: f32) -> result<model, error>;
 }
 
 interface interactive {

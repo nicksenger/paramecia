@@ -1805,12 +1805,11 @@ impl ModelEngine {
     }
 
     /// Perturb model weights in the negative direction.
-    pub async fn perturb_down(&self, loss_up: f32) -> Result<(), Error> {
+    pub async fn perturb_down(&self) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
         self.actor
             .sender()
             .send(ModelCommand::PerturbDown {
-                loss_up,
                 respond: tx,
             })
             .await
@@ -1820,11 +1819,12 @@ impl ModelEngine {
     }
 
     /// Calculate loss difference and update weights.
-    pub async fn update(&self, loss_down: f32) -> Result<(), Error> {
+    pub async fn update(&self, loss_up: f32, loss_down: f32) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
         self.actor
             .sender()
             .send(ModelCommand::Update {
+                loss_up,
                 loss_down,
                 respond: tx,
             })
