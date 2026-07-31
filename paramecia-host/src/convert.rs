@@ -106,8 +106,11 @@ impl From<exec::ModelInput> for wit::ModelInput {
         match i {
             exec::ModelInput::Text(s) => wit::ModelInput::Text(s),
             exec::ModelInput::Tokens(ids) => wit::ModelInput::Tokens(ids),
-            exec::ModelInput::Soft(entries) => {
-                wit::ModelInput::Soft(entries.into_iter().map(Into::into).collect())
+            exec::ModelInput::Soft(tokens) => {
+                wit::ModelInput::Soft(tokens.into_iter().map(|t| wit::SoftToken {
+                    predicted: t.predicted,
+                    dark_knowledge: t.dark_knowledge.into_iter().map(Into::into).collect(),
+                }).collect())
             }
         }
     }
@@ -291,8 +294,11 @@ impl From<wit::ModelInput> for exec::ModelInput {
         match i {
             wit::ModelInput::Text(s) => exec::ModelInput::Text(s),
             wit::ModelInput::Tokens(ids) => exec::ModelInput::Tokens(ids),
-            wit::ModelInput::Soft(entries) => {
-                exec::ModelInput::Soft(entries.into_iter().map(Into::into).collect())
+            wit::ModelInput::Soft(tokens) => {
+                exec::ModelInput::Soft(tokens.into_iter().map(|t| exec::SoftToken {
+                    predicted: t.predicted,
+                    dark_knowledge: t.dark_knowledge.into_iter().map(Into::into).collect(),
+                }).collect())
             }
         }
     }

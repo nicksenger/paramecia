@@ -134,6 +134,15 @@ interface types {
         log-prob: f32,
     }
 
+    /// A soft token position: predicted token plus dark-knowledge distribution.
+    /// Used for transferring knowledge between model inference forward passes.
+    record soft-token {
+        /// The predicted (committed) token ID for this position
+        predicted: u32,
+        /// Top-K logit entries representing the teacher model's distribution at this position
+        dark-knowledge: list<logit-entry>,
+    }
+
     /// Result from a forward pass: sampled token + distribution info
     record predicted {
         /// The sampled token ID
@@ -156,11 +165,12 @@ interface types {
         text(string),
         /// Specific token IDs
         tokens(list<u32>),
-        /// Soft prompt: each entry is a weighted token in a single-position distribution.
-        /// The host converts each logit-entry list element into one embedding position
-        /// by computing a weighted sum over the token embedding table, producing a
-        /// sequence of length equal to the list length.
-        soft(list<logit-entry>),
+        /// Soft prompt: a sequence of soft tokens, each carrying a predicted token ID
+        /// and a dark-knowledge distribution (top-K logit entries from a teacher model).
+        /// The host computes a weighted embedding per position from the dark-knowledge
+        /// distribution, producing a [1, seq_len, hidden_dim] embedding tensor for
+        /// dark-knowledge transfer between model inference forward passes.
+        soft(list<soft-token>),
     }
 
     /// A segment of training data: either masked context or teacher-labeled generation

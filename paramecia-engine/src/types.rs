@@ -132,6 +132,16 @@ pub struct LogitEntry {
     pub log_prob: f32,
 }
 
+/// A soft token position for dark-knowledge transfer between model forward passes.
+/// Carries the predicted (committed) token ID and a top-K distribution from a teacher model.
+#[derive(Debug, Clone)]
+pub struct SoftToken {
+    /// The predicted (committed) token ID for this position.
+    pub predicted: u32,
+    /// Top-K logit entries representing the teacher model's distribution at this position.
+    pub dark_knowledge: Vec<LogitEntry>,
+}
+
 /// A predicted token with distribution information.
 #[derive(Debug, Clone)]
 pub struct Predicted {
@@ -152,8 +162,10 @@ pub enum ModelInput {
     Text(String),
     /// Specific token IDs.
     Tokens(Vec<u32>),
-    /// Soft prompt component (transformed into an input-embedding by the host).
-    Soft(Vec<LogitEntry>),
+    /// Soft prompt: a sequence of soft tokens carrying predicted token IDs and
+    /// dark-knowledge distributions. The host computes a weighted embedding per position
+    /// from each soft token's dark_knowledge, producing a [1, seq_len, hidden_dim] tensor.
+    Soft(Vec<SoftToken>),
 }
 
 /// A segment of training data: either masked context or teacher-labeled generation.

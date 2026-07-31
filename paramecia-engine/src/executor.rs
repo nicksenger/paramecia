@@ -294,7 +294,7 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
     /// Dispatches each input type:
     /// - Text(s) → tokenize then fill_context_tokens
     /// - Tokens(ids) → fill_context_tokens directly
-    /// - Soft(logits) → compute weighted embedding and forward_with_embeddings
+    /// - Soft(soft_tokens) → compute per-position weighted embeddings from dark-knowledge, stack into [1, seq_len, hidden], then forward_with_embeddings
     pub async fn fill_context_inputs(
         &mut self,
         inputs: &[ModelInput],
@@ -312,41 +312,77 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
                     let n = self.fill_context_tokens(ids, progress_tx.clone()).await?;
                     total += n;
                 }
-                ModelInput::Soft(logit_entries) => {
-                    // Compute weighted embedding from logit entries
+                ModelInput::Soft(soft_tokens) => {
+                    // Compute a weighted embedding per soft-token position from the
+                    // dark-knowledge distribution, then stack into [1, seq_len, hidden_dim].
                     let embed_weights = self.model.embedding_weights();
                     let device = embed_weights.device().clone();
 
-                    let ids: Vec<u32> = logit_entries.iter().map(|e| e.token_id).collect();
-                    self.validate_token_ids(&ids, "fill_context_inputs:soft")?;
-                    let mut probs: Vec<f32> =
-                        logit_entries.iter().map(|e| e.log_prob.exp()).collect();
+                    if soft_tokens.is_empty() {
+                        continue;
+                    }
 
-                    // Normalize
-                    let prob_sum: f32 = probs.iter().sum();
-                    if prob_sum > 0.0 {
-                        for p in &mut probs {
-                            *p /= prob_sum;
+                    // Validate all predicted token IDs and dark-knowledge token IDs
+                    let mut all_ids: Vec<u32> = Vec::new();
+                    for st in soft_tokens {
+                        all_ids.push(st.predicted);
+                        for entry in &st.dark_knowledge {
+                            all_ids.push(entry.token_id);
+                        }
+                    }
+                    self.validate_token_ids(&all_ids, "fill_context_inputs:soft")?;
+
+                    let seq_len = soft_tokens.len();
+
+                    // Compute one weighted embedding per position
+                    let mut position_embeddings: Vec<Tensor> = Vec::with_capacity(seq_len);
+                    for st in soft_tokens {
+                        if st.dark_knowledge.is_empty() {
+                            // No dark knowledge — use the predicted token's embedding directly
+                            let id_tensor = Tensor::new(&[st.predicted], &device)
+                                .map_err(|e| Error::ModelError(e.to_string()))?;
+                            let embed = embed_weights
+                                .index_select(&id_tensor, 0)
+                                .map_err(|e| Error::ModelError(e.to_string()))?;
+                            // Shape: [1, hidden_dim] → squeeze to [hidden_dim]
+                            let squeezed = embed.reshape((embed.dims().last().copied().unwrap_or(0),))
+                                .map_err(|e| Error::ModelError(e.to_string()))?;
+                            position_embeddings.push(squeezed);
+                        } else {
+                            // Compute weighted embedding from dark-knowledge distribution
+                            let ids: Vec<u32> = st.dark_knowledge.iter().map(|e| e.token_id).collect();
+                            let mut probs: Vec<f32> =
+                                st.dark_knowledge.iter().map(|e| e.log_prob.exp()).collect();
+
+                            // Normalize probabilities
+                            let prob_sum: f32 = probs.iter().sum();
+                            if prob_sum > 0.0 {
+                                for p in &mut probs {
+                                    *p /= prob_sum;
+                                }
+                            }
+
+                            let ids_tensor = Tensor::new(ids.as_slice(), &device)
+                                .map_err(|e| Error::ModelError(e.to_string()))?;
+                            let sparse_embeds = embed_weights
+                                .index_select(&ids_tensor, 0)
+                                .map_err(|e| Error::ModelError(e.to_string()))?;
+                            let probs_tensor = Tensor::new(probs.as_slice(), &device)
+                                .and_then(|t| t.unsqueeze(1))
+                                .map_err(|e| Error::ModelError(e.to_string()))?;
+                            let weighted = sparse_embeds
+                                .broadcast_mul(&probs_tensor)
+                                .and_then(|t| t.sum(0))
+                                .map_err(|e| Error::ModelError(e.to_string()))?;
+                            position_embeddings.push(weighted);
                         }
                     }
 
-                    let ids_tensor = Tensor::new(ids.as_slice(), &device)
+                    // Stack positions into [seq_len, hidden_dim], then add batch dim → [1, seq_len, hidden_dim]
+                    let stacked = Tensor::stack(&position_embeddings, 0)
                         .map_err(|e| Error::ModelError(e.to_string()))?;
-                    let sparse_embeds = embed_weights
-                        .index_select(&ids_tensor, 0)
-                        .map_err(|e| Error::ModelError(e.to_string()))?;
-                    let probs_tensor = Tensor::new(probs.as_slice(), &device)
-                        .and_then(|t| t.unsqueeze(1))
-                        .map_err(|e| Error::ModelError(e.to_string()))?;
-                    let weighted = sparse_embeds
-                        .broadcast_mul(&probs_tensor)
-                        .and_then(|t| t.sum(0))
-                        .map_err(|e| Error::ModelError(e.to_string()))?;
-
-                    // Shape for forward: [1, 1, hidden_dim]
-                    let embedding = weighted
+                    let embedding = stacked
                         .unsqueeze(0)
-                        .and_then(|t| t.unsqueeze(0))
                         .and_then(|t| t.to_dtype(self.model.dtype()))
                         .map_err(|e| Error::ModelError(e.to_string()))?;
 
@@ -359,10 +395,10 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
                         .forward_with_embeddings(&embedding, offset)
                         .map_err(|e| Error::ModelError(e.to_string()))?;
 
-                    self.state_position += 1;
+                    self.state_position += seq_len;
                     self.pending_logits = Some(logits);
                     // Soft tokens don't add to the token history (they're synthetic)
-                    total += 1;
+                    total += seq_len as u32;
 
                     if let Some(tx) = &progress_tx {
                         let _ = tx.send(Ok(total)).await;
