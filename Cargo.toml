@@ -39,8 +39,8 @@ paramecia-nn = { path = "backend/paramecia-nn" }
 paramecia-visualizer = { path = "paramecia-visualizer" }
 
 # Type level
-glowstick = { git = "https://github.com/nicksenger/glowstick.git", branch = "paramecia" }
-inception = { git = "https://github.com/nicksenger/Inception.git", branch = "paramecia" }
+glowstick = { git = "https://github.com/nicksenger/glowstick.git", branch = "blackholesun" }
+inception = { git = "https://github.com/nicksenger/Inception.git", branch = "jungle" }
 
 # Async runtime
 tokio = { version = "1.44", features = ["full"] }

@@ -34,10 +34,10 @@ anyhow = "1.0"
 bytemuck = { version = "1.14", features = ["derive"] }
 byteorder = "1.5"
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
-glowstick = { git = "https://github.com/nicksenger/glowstick.git", branch = "paramecia" }
+glowstick = { git = "https://github.com/nicksenger/glowstick.git", branch = "blackholesun" }
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
 hf-hub = "0.4"
-inception = { git = "https://github.com/nicksenger/Inception.git", branch = "paramecia" }
+inception = { git = "https://github.com/nicksenger/Inception.git", branch = "jungle" }
 num-traits = "0.2.15"
 rand = "0.9"
 rand_distr = "0.5.1"

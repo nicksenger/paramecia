@@ -9,5 +9,5 @@ publish = false
 [dependencies]
 fastrand = "2"
 iced = { version = "0.13", features = ["tokio"] }
-iced-sugiyama = { git = "https://github.com/nicksenger/iced-sugiyama.git", branch = "paramecia", features = ["animated"] }
+iced-sugiyama = { git = "https://github.com/nicksenger/iced-sugiyama.git", branch = "jungle" }
 paramecia-engine = { workspace = true }
