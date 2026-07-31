@@ -101,6 +101,7 @@ pub(crate) enum ModelCommand {
 
     // -- Training-ext (decomposed ZO) commands --
     PerturbUp {
+        seed: Option<u64>,
         respond: oneshot::Sender<Result<(), Error>>,
     },
     PerturbDown {
@@ -748,7 +749,7 @@ async fn process_command(
             let result = apply_hyper_parameters(ts, &update);
             let _ = respond.send(result);
         }
-        ModelCommand::PerturbUp { respond } => {
+        ModelCommand::PerturbUp { seed, respond } => {
             // Ensure training subsystem + optimizer exist
             let ts = ensure_training_subsystem(training_state, executor, training_config);
             if decomposed_zo.is_none() {
@@ -771,7 +772,7 @@ async fn process_command(
             }
 
             let dzo = decomposed_zo.as_mut().unwrap();
-            match dzo.optimizer.perturb_up() {
+            match dzo.optimizer.perturb_up(seed) {
                 Ok(state) => {
                     dzo.pending_state = Some(state);
                     let _ = respond.send(Ok(()));

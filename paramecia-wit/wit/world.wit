@@ -530,7 +530,7 @@ interface training-ext {
     use types.{model, positive-model, negative-model, error};
 
     /// Begins a training step, perturbing the model in the positive direction
-    perturb-up: async func(model: model) -> result<positive-model, error>;
+    perturb-up: async func(model: model, seed: option<u64>) -> result<positive-model, error>;
 
     /// Restores a positively perturbed model, then perturbs it in the negative direction
     perturb-down: async func(perturbed: positive-model) -> result<negative-model, error>;

@@ -1793,11 +1793,14 @@ impl ModelEngine {
     }
 
     /// Perturb model weights in the positive direction.
-    pub async fn perturb_up(&self) -> Result<(), Error> {
+    pub async fn perturb_up(&self, seed: Option<u64>) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
         self.actor
             .sender()
-            .send(ModelCommand::PerturbUp { respond: tx })
+            .send(ModelCommand::PerturbUp {
+                seed,
+                respond: tx,
+            })
             .await
             .map_err(|_| Error::ModelError("Model actor stopped".into()))?;
         rx.await

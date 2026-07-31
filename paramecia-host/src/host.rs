@@ -483,6 +483,7 @@ impl crate::paramecia::host::training_ext::HostWithStore for HostState {
     fn perturb_up<T: 'static>(
         _accessor: &Accessor<T, Self>,
         _model: wit::Model,
+        _seed: Option<u64>,
     ) -> impl std::future::Future<Output = wasmtime::Result<Result<wit::PositiveModel, wit::Error>>> + Send
     {
         async move {

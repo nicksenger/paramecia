@@ -1325,7 +1325,12 @@ impl QuZO {
     /// `loss_up` using the perturbed model externally.
     ///
     /// Returns a `DecomposedZOState` that must be passed to `perturb_down`.
-    pub fn perturb_up(&mut self) -> Result<DecomposedZOState> {
+    pub fn perturb_up(&mut self, seed: Option<u64>) -> Result<DecomposedZOState> {
+        // Re-seed RNG when an external seed is provided
+        if let Some(seed) = seed {
+            self.rng = StdRng::seed_from_u64(seed);
+        }
+
         let epsilon = self.params.epsilon as f32;
         let lazy = self.params.lazy_perturbations;
 

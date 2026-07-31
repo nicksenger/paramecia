@@ -1387,10 +1387,10 @@ fn add_training_ext_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
 
     use wasmtime::component::Accessor;
 
-    // perturb-up: async func(model: training-model) -> result<positive-model, error>
+    // perturb-up: async func(model: model, seed: option<u64>) -> result<positive-model, error>
     instance.func_wrap_concurrent(
         "perturb-up",
-        |accessor: &Accessor<HostState, HasSelf<HostState>>, (model,): (wit::Model,)| {
+        |accessor: &Accessor<HostState, HasSelf<HostState>>, (model, seed): (wit::Model, Option<u64>)| {
             Box::pin(async move {
                 let executor = accessor.with(|mut data| {
                     let host = data.get();
@@ -1403,7 +1403,7 @@ fn add_training_ext_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
                     Err(e) => return Ok((Err(e),)),
                 };
 
-                let result = executor.perturb_up().await;
+                let result = executor.perturb_up(seed).await;
                 match result {
                     Ok(()) => Ok((Ok(wit::PositiveModel { model }),)),
                     Err(e) => Ok((Err(e.into()),)),
