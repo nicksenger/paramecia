@@ -40,6 +40,7 @@ pub(crate) enum ModelCommand {
     },
     PredictCompletion {
         respond: mpsc::Sender<Result<Predicted, Error>>,
+        limit: u32,
         cancel_rx: oneshot::Receiver<()>,
     },
     PredictCompletionsBatched {
@@ -644,8 +645,8 @@ async fn process_command(
             let result = executor.predict_token().await;
             let _ = respond.send(result);
         }
-        ModelCommand::PredictCompletion { respond, cancel_rx } => {
-            executor.predict_completion(cancel_rx, respond).await;
+        ModelCommand::PredictCompletion { respond, limit, cancel_rx } => {
+            executor.predict_completion(cancel_rx, limit, respond).await;
         }
         ModelCommand::PredictCompletionsBatched {
             inputs,

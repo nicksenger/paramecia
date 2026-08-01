@@ -526,6 +526,7 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
     pub async fn predict_completion(
         &mut self,
         mut cancel_rx: oneshot::Receiver<()>,
+        limit: u32,
         tx: mpsc::Sender<Result<Predicted, Error>>,
     ) {
         // Get stop token IDs
@@ -582,9 +583,9 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
                         return;
                     }
 
-                    if count >= 4096 {
+                    if count >= limit {
                         let _ = tx.send(Err(Error::ModelError(
-                            "Maximum completion length (4096 tokens) exceeded".into(),
+                            format!("Maximum completion length ({limit} tokens) exceeded"),
                         ))).await;
                         return;
                     }
@@ -1626,6 +1627,7 @@ impl ModelEngine {
     /// Start a streaming completion.
     pub async fn predict_completion(
         &self,
+        limit: u32,
     ) -> Result<
         (
             mpsc::Receiver<Result<Predicted, Error>>,
@@ -1639,6 +1641,7 @@ impl ModelEngine {
             .sender()
             .send(ModelCommand::PredictCompletion {
                 respond: result_tx,
+                limit,
                 cancel_rx,
             })
             .await

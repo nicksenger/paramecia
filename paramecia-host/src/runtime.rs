@@ -1054,7 +1054,7 @@ fn add_inference_to_linker(linker: &mut Linker<HostState>) -> Result<()> {
                 };
 
                 let (mut exec_rx, cancel_tx) = executor
-                    .predict_completion()
+                    .predict_completion(4096)
                     .await
                     .map_err(|e| wasmtime::Error::msg(format!("{e}")))?;
 
