@@ -5063,7 +5063,7 @@ impl ModelWeights {
         self.forward_with_embeddings_batched(&h, offset, embed_ms, padding_lengths)
     }
 
-    fn forward_with_embeddings_batched(
+    pub fn forward_with_embeddings_batched(
         &mut self,
         h: &Tensor,
         offset: usize,
