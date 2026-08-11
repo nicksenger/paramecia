@@ -47,7 +47,7 @@ pub struct HostOptions {
 
     /// Device offload mode for MoE expert weights.
     ///
-    /// Valid values: "none", "experts", "down", "updown".
+    /// Valid values: "auto", "none", "experts", "down", "updown".
     pub offload: String,
 
     /// Disable KV-cache quantization.
@@ -146,7 +146,7 @@ impl Default for HostOptions {
         Self {
             controller: String::new(),
             cpu: false,
-            offload: "experts".to_string(),
+            offload: "auto".to_string(),
             no_kv_quant: false,
             model_id: DEFAULT_MODEL_ID.to_string(),
             model_file: DEFAULT_MODEL_FILE.to_string(),

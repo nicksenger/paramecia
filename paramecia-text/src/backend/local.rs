@@ -675,16 +675,20 @@ impl LocalBackend {
         Ok(Device::Cpu)
     }
 
-    /// Parse offload mode from string. Defaults to "experts".
+    /// Parse offload mode from string. The 0.8B build defaults to full GPU;
+    /// larger model builds default to CPU-offloaded experts.
     fn parse_offload_mode(hint: Option<&str>) -> DeviceOffloadMode {
         match hint {
+            Some("auto") => DeviceOffloadMode::default(),
             Some("none") => DeviceOffloadMode::FullGpu,
             Some("down") => DeviceOffloadMode::DownProjectionsOnCpu,
             Some("updown") => DeviceOffloadMode::UpDownProjectionsOnCpu,
-            Some("experts") | None => DeviceOffloadMode::ExpertsOnCpu,
+            Some("experts") => DeviceOffloadMode::ExpertsOnCpu,
+            None => DeviceOffloadMode::default(),
             Some(other) => {
-                tracing::warn!("Unknown offload mode '{}', using 'experts'", other);
-                DeviceOffloadMode::ExpertsOnCpu
+                let fallback = DeviceOffloadMode::default();
+                tracing::warn!("Unknown offload mode '{}', using {:?}", other, fallback);
+                fallback
             }
         }
     }

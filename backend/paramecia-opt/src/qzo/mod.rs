@@ -592,12 +592,26 @@ impl QZO {
 // - QuZO optimizes discrete quantized weights directly using stochastic rounding
 
 use half::f16;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 use paramecia_core::quantized::GgmlDType;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 use paramecia_core::quantized::QTensor;
 use paramecia_core::quantized::SharedQTensor;
 use std::collections::VecDeque;
+
+/// Returns true for dtypes that use stochastic quantization/residual feedback.
+fn tracks_error_feedback_residuals(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Q4_0
+            | GgmlDType::Q4K
+            | GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+            | GgmlDType::Q8K
+    )
+}
 
 /// Cached GPU disable flags for each dtype.
 /// Initialized once on first access.
@@ -834,7 +848,8 @@ pub fn philox_gaussian(seed: u64, index: u64) -> f32 {
 /// the fractional residuals so small gradients eventually cross the rounding threshold.
 #[derive(Clone, Debug)]
 pub enum ErrorFeedbackMode {
-    /// FP16 residuals stored per element. Memory: elem_count * 2 bytes per tensor.
+    /// FP16 residuals stored per element for quantized tensors that use stochastic rounding.
+    /// F32/BF16 tensors skip residual storage.
     Persistent,
     /// Reconstruct residuals by replaying history. Memory: O(K * n_tensors * 16 bytes).
     Replay { max_history: usize },
@@ -1019,8 +1034,12 @@ impl QuZO {
                 let res: Vec<Vec<f16>> = qtensors
                     .iter()
                     .map(|qt| {
-                        let elem_count = qt.read().unwrap().shape().elem_count();
-                        vec![f16::ZERO; elem_count]
+                        let qt_read = qt.read().unwrap();
+                        if tracks_error_feedback_residuals(qt_read.dtype()) {
+                            vec![f16::ZERO; qt_read.shape().elem_count()]
+                        } else {
+                            Vec::new()
+                        }
                     })
                     .collect();
                 (Some(res), None)
@@ -1251,46 +1270,58 @@ impl QuZO {
                 let qt_read = qt.read().unwrap();
                 let continuous = get_perturb!(i, qt_read.shape());
 
-                let updated = if let Some(ref mut residuals) = active_residuals.as_mut() {
-                    // Error feedback path: always CPU
-                    qt_read.restore_and_update_with_residual(
-                        &continuous,
-                        eps_i,
-                        update_scale_i,
-                        seed_forward,
-                        seed_update,
-                        &mut residuals[i],
-                        gain,
-                    )?
-                } else {
+                let apply_without_residual = || -> Result<_> {
                     // Original path (try GPU first, fall back to CPU)
                     #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
-                    let result = if supports_gpu_restore_update(&qt_read) {
-                        qt_read.restore_and_update_gpu(
-                            &continuous,
-                            eps_i,
-                            update_scale_i,
-                            seed_forward,
-                            seed_update,
-                        )?
-                    } else {
+                    {
+                        if supports_gpu_restore_update(&qt_read) {
+                            qt_read.restore_and_update_gpu(
+                                &continuous,
+                                eps_i,
+                                update_scale_i,
+                                seed_forward,
+                                seed_update,
+                            )
+                        } else {
+                            qt_read.restore_and_update(
+                                &continuous,
+                                eps_i,
+                                update_scale_i,
+                                seed_forward,
+                                seed_update,
+                            )
+                        }
+                    }
+                    #[cfg(not(any(feature = "cuda", feature = "metal", feature = "vulkan")))]
+                    {
                         qt_read.restore_and_update(
                             &continuous,
                             eps_i,
                             update_scale_i,
                             seed_forward,
                             seed_update,
+                        )
+                    }
+                };
+
+                let updated = if tracks_error_feedback_residuals(qt_read.dtype()) {
+                    if let Some(ref mut residuals) = active_residuals.as_mut() {
+                        // Error feedback path: always CPU for quantized tensors.
+                        qt_read.restore_and_update_with_residual(
+                            &continuous,
+                            eps_i,
+                            update_scale_i,
+                            seed_forward,
+                            seed_update,
+                            &mut residuals[i],
+                            gain,
                         )?
-                    };
-                    #[cfg(not(any(feature = "cuda", feature = "metal", feature = "vulkan")))]
-                    let result = qt_read.restore_and_update(
-                        &continuous,
-                        eps_i,
-                        update_scale_i,
-                        seed_forward,
-                        seed_update,
-                    )?;
-                    result
+                    } else {
+                        apply_without_residual()?
+                    }
+                } else {
+                    // F32/BF16 tensors are updated directly without residual tracking.
+                    apply_without_residual()?
                 };
                 drop(qt_read);
                 qt.replace(updated);
@@ -1476,44 +1507,55 @@ impl QuZO {
                 generate_perturbation(state.seeds[i].0, qt_read.shape())?
             };
 
-            let updated = if let Some(ref mut residuals) = active_residuals.as_mut() {
-                qt_read.restore_and_update_with_residual(
-                    &continuous,
-                    eps_i,
-                    update_scale_i,
-                    seed_forward,
-                    seed_update,
-                    &mut residuals[i],
-                    gain,
-                )?
-            } else {
+            let apply_without_residual = || -> Result<_> {
                 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
-                let result = if supports_gpu_restore_update(&qt_read) {
-                    qt_read.restore_and_update_gpu(
-                        &continuous,
-                        eps_i,
-                        update_scale_i,
-                        seed_forward,
-                        seed_update,
-                    )?
-                } else {
+                {
+                    if supports_gpu_restore_update(&qt_read) {
+                        qt_read.restore_and_update_gpu(
+                            &continuous,
+                            eps_i,
+                            update_scale_i,
+                            seed_forward,
+                            seed_update,
+                        )
+                    } else {
+                        qt_read.restore_and_update(
+                            &continuous,
+                            eps_i,
+                            update_scale_i,
+                            seed_forward,
+                            seed_update,
+                        )
+                    }
+                }
+                #[cfg(not(any(feature = "cuda", feature = "metal", feature = "vulkan")))]
+                {
                     qt_read.restore_and_update(
                         &continuous,
                         eps_i,
                         update_scale_i,
                         seed_forward,
                         seed_update,
+                    )
+                }
+            };
+
+            let updated = if tracks_error_feedback_residuals(qt_read.dtype()) {
+                if let Some(ref mut residuals) = active_residuals.as_mut() {
+                    qt_read.restore_and_update_with_residual(
+                        &continuous,
+                        eps_i,
+                        update_scale_i,
+                        seed_forward,
+                        seed_update,
+                        &mut residuals[i],
+                        gain,
                     )?
-                };
-                #[cfg(not(any(feature = "cuda", feature = "metal", feature = "vulkan")))]
-                let result = qt_read.restore_and_update(
-                    &continuous,
-                    eps_i,
-                    update_scale_i,
-                    seed_forward,
-                    seed_update,
-                )?;
-                result
+                } else {
+                    apply_without_residual()?
+                }
+            } else {
+                apply_without_residual()?
             };
             drop(qt_read);
             qt.replace(updated);
@@ -1684,8 +1726,12 @@ impl QuZO {
             .qtensors
             .iter()
             .map(|qt| {
-                let elem_count = qt.read().unwrap().shape().elem_count();
-                vec![f16::ZERO; elem_count]
+                let qt_read = qt.read().unwrap();
+                if tracks_error_feedback_residuals(qt_read.dtype()) {
+                    vec![f16::ZERO; qt_read.shape().elem_count()]
+                } else {
+                    Vec::new()
+                }
             })
             .collect();
 
@@ -1702,6 +1748,9 @@ impl QuZO {
             // Replay each tensor's update
             for (i, qt) in self.qtensors.iter().enumerate() {
                 let qt_read = qt.read().unwrap();
+                if !tracks_error_feedback_residuals(qt_read.dtype()) {
+                    continue;
+                }
                 let (_, seed_update) = entry.seeds[i];
                 let update_scale_i = (entry.update_scale * self.epsilon_multipliers[i]) as f32;
                 let perturbation = generate_perturbation(entry.seeds[i].0, qt_read.shape())?;

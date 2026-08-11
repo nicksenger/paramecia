@@ -30,7 +30,7 @@ pub use paramecia_core::quantized::gguf_file;
 pub use paramecia_core::quantized::GgmlDType;
 pub use paramecia_core::{DType, Device, Result, Tensor};
 pub use token_output_stream::TokenOutputStream;
-pub use utils::apply_penalties;
+pub use utils::{apply_penalties, apply_penalties_slice};
 
 /// Build the model computation graph used by the visualizer.
 pub fn visualization_graph() -> vis::Graph {

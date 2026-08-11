@@ -74,26 +74,17 @@ pub fn apply_presence_penalty(logits: &Tensor, penalty: f32, context: &[u32]) ->
 
 /// Apply both repeat and presence penalties in a single download.
 /// Returns a CPU F32 tensor to avoid re-downloading in the sampler.
-pub fn apply_penalties(
-    logits: &Tensor,
+pub fn apply_penalties_slice(
+    logits: &mut [f32],
     repeat_penalty: f32,
     presence_penalty: f32,
     context: &[u32],
-) -> Result<Tensor> {
+) {
     let no_repeat = repeat_penalty == 1.0;
     let no_presence = presence_penalty == 0.0;
-
     if no_repeat && no_presence {
-        // Still need CPU F32 for sampling
-        return logits
-            .to_dtype(paramecia_core::DType::F32)?
-            .to_device(&paramecia_core::Device::Cpu);
+        return;
     }
-
-    // Single download
-    let mut logits_vec = logits
-        .to_dtype(paramecia_core::DType::F32)?
-        .to_vec1::<f32>()?;
 
     // Count token frequencies (needed for both penalties)
     let mut token_counts = std::collections::HashMap::new();
@@ -102,7 +93,7 @@ pub fn apply_penalties(
     }
 
     for (token_id, count) in token_counts {
-        if let Some(logit) = logits_vec.get_mut(token_id as usize) {
+        if let Some(logit) = logits.get_mut(token_id as usize) {
             // Repeat penalty (multiplicative, frequency-based)
             if !no_repeat {
                 let cumulative_penalty = repeat_penalty.powi(count as i32);
@@ -118,6 +109,19 @@ pub fn apply_penalties(
             }
         }
     }
+}
+
+pub fn apply_penalties(
+    logits: &Tensor,
+    repeat_penalty: f32,
+    presence_penalty: f32,
+    context: &[u32],
+) -> Result<Tensor> {
+    // Single download
+    let mut logits_vec = logits
+        .to_dtype(paramecia_core::DType::F32)?
+        .to_vec1::<f32>()?;
+    apply_penalties_slice(&mut logits_vec, repeat_penalty, presence_penalty, context);
 
     let logits_len = logits_vec.len();
     // Return on CPU - sampler can work directly without re-downloading

@@ -10,6 +10,11 @@ use paramecia_arrow::{
     Arrow, Combinator,
 };
 
+fn shared_weight_cache_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PARAMECIA_DISABLE_RMS_NORM_CACHE").is_none())
+}
+
 /// Typed RMS normalization op that holds its own weight tensor.
 ///
 /// Shape-preserving: input and output have the same shape `S`.
@@ -83,10 +88,26 @@ where
         let _span = crate::op::trace::forward_1!("rms_norm", S);
         let input = input.into_inner();
         let weight = if let Some(shared) = self.shared_weight.as_ref() {
-            let qt = shared.read().map_err(|e| {
-                Error::Msg(format!("RmsNormOp shared_weight read lock failed: {e}"))
-            })?;
-            let weight = qt.dequantize(input.device())?;
+            let weight = if shared_weight_cache_enabled() {
+                if shared.generation() == 0 {
+                    self.weight.to_device(input.device())?
+                } else {
+                    match shared.cached_dequantize()? {
+                        Some(weight) => weight.to_device(input.device())?,
+                        None => {
+                            let qt = shared.read().map_err(|e| {
+                                Error::Msg(format!("RmsNormOp shared_weight read lock failed: {e}"))
+                            })?;
+                            qt.dequantize(input.device())?
+                        }
+                    }
+                }
+            } else {
+                let qt = shared.read().map_err(|e| {
+                    Error::Msg(format!("RmsNormOp shared_weight read lock failed: {e}"))
+                })?;
+                qt.dequantize(input.device())?
+            };
             if weight.dtype() != input.dtype() {
                 weight.to_dtype(input.dtype())?
             } else {
@@ -145,5 +166,35 @@ mod test {
 
         let res = op.forward(&mut (), a).unwrap();
         assert_shape_eq!(res, Shape2<U2, U3>);
+    }
+
+    #[test]
+    fn shared_rms_norm_uses_replaced_weight() {
+        use paramecia_core::quantized::{GgmlDType, QTensor, SharedQTensor};
+
+        let device = paramecia_core::Device::Cpu;
+        type A = Tensor<Shape2<U2, U3>>;
+        let input = A::ones(paramecia_core::DType::F32, &device).unwrap();
+        let weight = paramecia_core::Tensor::new(&[1.0f32, 1.0, 1.0], &device).unwrap();
+        let shared = SharedQTensor::new(QTensor::quantize(&weight, GgmlDType::F32).unwrap());
+        let mut op =
+            RmsNormOp::<Shape2<U2, U3>>::new_with_shared(weight, 1e-6, Some(shared.clone()), false);
+
+        let before = op
+            .forward(&mut (), input.clone())
+            .unwrap()
+            .into_inner()
+            .to_vec2::<f32>()
+            .unwrap();
+        let updated = paramecia_core::Tensor::new(&[2.0f32, 2.0, 2.0], &device).unwrap();
+        shared.replace(QTensor::quantize(&updated, GgmlDType::F32).unwrap());
+        let after = op
+            .forward(&mut (), input)
+            .unwrap()
+            .into_inner()
+            .to_vec2::<f32>()
+            .unwrap();
+
+        assert!((after[0][0] - 2.0 * before[0][0]).abs() < 1e-5);
     }
 }

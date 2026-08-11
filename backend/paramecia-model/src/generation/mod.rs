@@ -3,7 +3,7 @@
 //! Functionality for modeling sampling strategies and logits processing in text generation
 //! with support for temperature-based sampling, top-k filtering, nucleus sampling (top-p),
 //! and combinations thereof.
-use paramecia_core::{DType, Error, Result, Tensor};
+use paramecia_core::{DType, Device, Error, Result, Tensor};
 use rand::{distr::Distribution, SeedableRng};
 
 #[derive(Clone, PartialEq, Debug)]
@@ -157,6 +157,71 @@ impl LogitsProcessor {
         self.sample_f(logits, |_| {})
     }
 
+    /// Sample directly from host-resident F32 logits.
+    ///
+    /// Batched inference downloads the complete logits matrix once and then
+    /// samples each row through this method, avoiding one GPU synchronization
+    /// and device-to-host copy per sequence.
+    pub fn sample_slice(&mut self, logits: &[f32]) -> Result<u32> {
+        let Some((&first, rest)) = logits.split_first() else {
+            return Err(Error::Msg("cannot sample empty logits".to_string()));
+        };
+        let mut fallback = 0usize;
+        let mut max_logit = first;
+        for (index, &logit) in rest.iter().enumerate() {
+            if logit.total_cmp(&max_logit).is_gt() {
+                fallback = index + 1;
+                max_logit = logit;
+            }
+        }
+        let fallback = fallback as u32;
+
+        let probabilities = |temperature: f64| {
+            let temperature = temperature as f32;
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut probabilities = logits
+                .iter()
+                .map(|&logit| ((logit - max) / temperature).exp())
+                .collect::<Vec<_>>();
+            let sum = probabilities.iter().sum::<f32>();
+            if sum.is_finite() && sum > 0.0 {
+                for probability in &mut probabilities {
+                    *probability /= sum;
+                }
+            }
+            probabilities
+        };
+
+        let next_token = match &self.sampling {
+            Sampling::ArgMax => fallback,
+            Sampling::GumbelSoftmax { temperature } => {
+                let logits = Tensor::from_slice(logits, logits.len(), &Device::Cpu)?;
+                self.sample_gumbel_softmax(&logits, *temperature)?
+            }
+            Sampling::All { temperature } => {
+                let prs = probabilities(*temperature);
+                self.sample_multinomial(&prs, fallback)?
+            }
+            Sampling::TopP { p, temperature } => {
+                let mut prs = probabilities(*temperature);
+                if *p <= 0.0 || *p >= 1.0 {
+                    self.sample_multinomial(&prs, fallback)?
+                } else {
+                    self.sample_topp(&mut prs, *p as f32, fallback)?
+                }
+            }
+            Sampling::TopK { k, temperature } => {
+                let mut prs = probabilities(*temperature);
+                self.sample_topk(&mut prs, *k, fallback)?
+            }
+            Sampling::TopKThenTopP { k, p, temperature } => {
+                let mut prs = probabilities(*temperature);
+                self.sample_topk_topp(&mut prs, *k, *p as f32, fallback)?
+            }
+        };
+        Ok(next_token)
+    }
+
     pub fn sample_f(&mut self, logits: &Tensor, f: impl FnOnce(&mut [f32])) -> Result<u32> {
         let logits = logits.to_dtype(DType::F32)?;
         let prs = |temperature: f64| -> Result<Vec<f32>> {
@@ -199,5 +264,36 @@ impl LogitsProcessor {
             }
         };
         Ok(next_token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogitsProcessor, Sampling};
+
+    #[test]
+    fn sample_slice_argmax_uses_first_maximum() {
+        let mut processor = LogitsProcessor::from_sampling(7, Sampling::ArgMax);
+        assert_eq!(processor.sample_slice(&[-1.0, 3.0, 3.0]).unwrap(), 1);
+    }
+
+    #[test]
+    fn sample_slice_top_p_uses_normalized_probabilities() {
+        let mut processor = LogitsProcessor::from_sampling(
+            7,
+            Sampling::TopP {
+                p: 0.9,
+                temperature: 1.0,
+            },
+        );
+        for _ in 0..32 {
+            assert_eq!(processor.sample_slice(&[20.0, 0.0, -1.0]).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn sample_slice_rejects_empty_logits() {
+        let mut processor = LogitsProcessor::from_sampling(7, Sampling::ArgMax);
+        assert!(processor.sample_slice(&[]).is_err());
     }
 }

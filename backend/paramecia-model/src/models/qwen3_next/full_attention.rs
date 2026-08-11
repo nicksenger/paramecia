@@ -636,7 +636,7 @@ impl FullAttention {
         // KV-cache handling with optional quantization
         // For Q8_0/Q4K: use PreallocatedQuantizedKvCache for memory efficiency
         // For F16/BF16: use PreallocatedKvCache with appropriate dtype
-        let (k, v, q8_storage) =
+        let (k, v, q8_storage, seq_k) =
             if let Some(ggml_dtype) = self.kv_cache_quantization.to_ggml_dtype() {
                 // Quantized KV cache mode (Q8_0 or Q4K)
                 if self.quantized_cache.is_none() {
@@ -667,6 +667,7 @@ impl FullAttention {
                 }
 
                 cache.append_quantized(&k, &v)?;
+                let seq_k = cache.seq_len;
 
                 #[cfg(any(feature = "cuda", feature = "vulkan"))]
                 let q8_storage = if ggml_dtype == GgmlDType::Q8_0 && Self::q8_flash_enabled() {
@@ -688,19 +689,19 @@ impl FullAttention {
                 };
                 #[cfg(not(any(feature = "cuda", feature = "vulkan")))]
                 let q8_storage: Option<(
-                    paramecia_core::quantized::QStorage,
-                    paramecia_core::quantized::QStorage,
+                    &paramecia_core::quantized::QStorage,
+                    &paramecia_core::quantized::QStorage,
                     paramecia_core::Layout,
                     paramecia_core::Layout,
                 )> = None;
 
                 if q8_storage.is_some() {
-                    (k, v, q8_storage)
+                    (k, v, q8_storage, seq_k)
                 } else {
                     let (cached_k, cached_v) = cache.get_kv()?;
                     let cached_k = cached_k.to_dtype(q.dtype())?.contiguous()?;
                     let cached_v = cached_v.to_dtype(q.dtype())?.contiguous()?;
-                    (cached_k, cached_v, q8_storage)
+                    (cached_k, cached_v, q8_storage, seq_k)
                 }
             } else {
                 // Non-quantized mode (F16 or BF16)
@@ -749,6 +750,7 @@ impl FullAttention {
                 }
 
                 let (cached_k, cached_v) = cache.append(&k_for_cache, &v_for_cache)?;
+                let seq_k = cache.seq_len;
 
                 // Convert back to query dtype for attention if cache dtype differs
                 let (cached_k, cached_v) = if cached_k.dtype() != q.dtype() {
@@ -760,7 +762,7 @@ impl FullAttention {
                     (cached_k, cached_v)
                 };
 
-                (cached_k, cached_v, None)
+                (cached_k, cached_v, None, seq_k)
             };
         let k_typed: TTensor<Shape4<B, K, Lk, H>> = k.try_into()?;
         let v_typed: TTensor<Shape4<B, K, Lk, H>> = v.try_into()?;
@@ -777,7 +779,6 @@ impl FullAttention {
 
             // Use causal masking with an explicit offset into the KV cache.
             // This keeps correctness for chunked prefill and single-token decode.
-            let seq_k = self.cache_seq_len();
             let q_offset = seq_k.saturating_sub(l);
             let causal = true;
 
@@ -788,8 +789,8 @@ impl FullAttention {
 
             crate::ops::flash_attn_q8(
                 &q_perm,
-                &k_storage,
-                &v_storage,
+                k_storage,
+                v_storage,
                 &q_l,
                 &k_layout,
                 &v_layout,
@@ -834,6 +835,7 @@ impl FullAttention {
         let attn_output = {
             // Suppress unused variable warning when cuda/metal/vulkan is disabled
             let _ = &q8_storage;
+            let _ = seq_k;
 
             // Attention scale: 1/sqrt(head_dim) * YARN_scale
             let base_scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
@@ -1072,7 +1074,7 @@ impl FullAttention {
                     // Clear and restore by appending the saved K/V
                     if let Some(ref mut cache) = self.quantized_cache {
                         cache.clear();
-                        cache.append(k_cache.inner(), v_cache.inner())?;
+                        cache.append_quantized(k_cache.inner(), v_cache.inner())?;
                     }
                 } else {
                     // Non-quantized mode: restore to preallocated cache

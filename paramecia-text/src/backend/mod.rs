@@ -113,7 +113,8 @@ pub struct ProviderConfig {
     pub local_max_tokens: Option<usize>,
     /// Preferred device hint: "cpu", "cuda", or "metal".
     pub local_device: Option<String>,
-    /// Device offload mode: "none", "down", "updown", or "experts" (default: "experts").
+    /// Device offload mode: "auto", "none", "down", "updown", or "experts".
+    /// Defaults to "none" for the 0.8B build and "experts" for larger models.
     pub local_offload: Option<String>,
     /// Maximum context length for local inference (default: 262144 / 256K).
     /// Set to 1048576 to enable YARN for 1M token context extension.

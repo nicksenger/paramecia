@@ -80,7 +80,7 @@ impl std::str::FromStr for KvCacheQuantization {
 /// Device offloading mode for MoE expert weights.
 ///
 /// This enum controls how expert weights are distributed across devices for memory/speed tradeoffs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceOffloadMode {
     /// All expert weights on GPU (maximum speed, requires most VRAM).
     ///
@@ -92,7 +92,6 @@ pub enum DeviceOffloadMode {
     /// Significantly reduces VRAM usage but slower inference due to PCIe bandwidth.
     /// Best for GPUs with limited VRAM (8-16GB). Enables parallel CPU expert
     /// processing and is optimal for the async pipeline.
-    #[default]
     ExpertsOnCpu,
 
     /// Only down projections offloaded to CPU, gate and up stay on GPU.
@@ -111,6 +110,30 @@ pub enum DeviceOffloadMode {
     UpDownProjectionsOnCpu,
 }
 
+impl Default for DeviceOffloadMode {
+    fn default() -> Self {
+        // The dense 0.8B model is only about 0.5 GiB at Q4_K_M. Treating its
+        // FFN as an offloaded "expert" defeats GPU inference and makes PCIe
+        // transfers dominate every layer.
+        let default_architecture_is_0p8b = cfg!(not(any(
+            feature = "qwen3next_80b_a3b",
+            feature = "qwen35moe_35b_a3b",
+            feature = "qwen35moe_122b_a10b",
+            feature = "qwen35moe_397b_a17b",
+            feature = "qwen35_0p8b",
+            feature = "qwen35_2b",
+            feature = "qwen35_4b",
+            feature = "qwen35_9b",
+            feature = "qwen35_27b",
+        )));
+        if cfg!(feature = "qwen35_0p8b") || default_architecture_is_0p8b {
+            Self::FullGpu
+        } else {
+            Self::ExpertsOnCpu
+        }
+    }
+}
+
 impl DeviceOffloadMode {
     /// Returns the device placement for (gate, up, down) expert projections.
     pub fn get_expert_devices(&self, gpu_device: &Device) -> (Device, Device, Device) {
@@ -125,19 +148,21 @@ impl DeviceOffloadMode {
     /// Parse an offload mode from a CLI string.
     ///
     /// If `cpu` is true, returns `FullGpu` (everything on one device when running on CPU).
-    /// Accepts: "none", "experts", "down", "updown" (case sensitive).
+    /// Accepts: "auto", "none", "experts", "down", "updown" (case sensitive).
     pub fn parse(offload: &str, cpu: bool) -> Self {
         if cpu {
             Self::FullGpu
         } else {
             match offload {
+                "auto" => Self::default(),
                 "none" => Self::FullGpu,
                 "experts" => Self::ExpertsOnCpu,
                 "down" => Self::DownProjectionsOnCpu,
                 "updown" => Self::UpDownProjectionsOnCpu,
                 other => {
-                    warn!(mode = %other, "Unknown offload mode, using 'experts'");
-                    Self::ExpertsOnCpu
+                    let fallback = Self::default();
+                    warn!(mode = %other, ?fallback, "Unknown offload mode, using model default");
+                    fallback
                 }
             }
         }

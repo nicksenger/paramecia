@@ -125,6 +125,7 @@ fn quantize_q8_1(
 fn quantize_q8_0_rowwise(
     src: &CudaView<f32>,
     dst: &mut CudaSlice<u8>,
+    dst_byte_offset: usize,
     k: usize,
     rows: usize,
     dev: &CudaDevice,
@@ -151,7 +152,7 @@ fn quantize_q8_0_rowwise(
         let src_chunk = src.slice(src_start_elem..(src_start_elem + src_num_elems));
 
         let dst_row_size_bytes = blocks_per_row * GgmlDType::Q8_0.type_size();
-        let dst_start_byte = rows_processed * dst_row_size_bytes;
+        let dst_start_byte = dst_byte_offset + rows_processed * dst_row_size_bytes;
         let dst_num_bytes = rows_in_chunk * dst_row_size_bytes;
         let dst_chunk = dst.slice(dst_start_byte..(dst_start_byte + dst_num_bytes));
 
@@ -955,6 +956,62 @@ impl QCudaStorage {
             };
 
             let input_storage = input_f32.as_cuda_slice::<f32>()?;
+            let (num_experts, n, k) = self_shape.dims3()?;
+            let (batch, input_dim1, input_k) = input_l.shape().dims3()?;
+            let (ids_batch, topk) = ids_l.shape().dims2()?;
+            if input_k != k || ids_batch != batch {
+                crate::bail!(
+                    "indexed_moe_forward shape mismatch weights={self_shape:?} input={:?} ids={:?}",
+                    input_l.shape(),
+                    ids_l.shape(),
+                )
+            }
+
+            // Dense Qwen models are represented as a one-expert MoE. The
+            // generic indexed kernel launches an independent matvec for every
+            // batch item, causing each item to reread the same expert weights.
+            // Route this case through MMVQ so one block computes up to eight
+            // batch columns while loading each weight block only once.
+            if num_experts == 1
+                && input_dim1 == 1
+                && topk == 1
+                && (1..=8).contains(&batch)
+                && (batch == 1 || n % 2 == 0)
+            {
+                let input_view = if input_dtype == crate::DType::F32 {
+                    match input_l.contiguous_offsets() {
+                        Some((start, end)) => input_storage.slice(start..end),
+                        None => {
+                            return Err(crate::Error::RequiresContiguous {
+                                op: "indexed-moe-dense-mmvq",
+                            }
+                            .bt())
+                        }
+                    }
+                } else {
+                    // `to_dtype` creates compact storage at offset zero; the
+                    // original view's offset no longer applies.
+                    input_storage.slice(..input_l.shape().elem_count())
+                };
+                let out = mul_mat_vec_via_q8_1(
+                    &self.data,
+                    &input_view,
+                    self.dtype(),
+                    k,
+                    n,
+                    batch,
+                    &self.device,
+                )?;
+                let out_shape: crate::Shape = (batch, topk, n).into();
+                let out = if input_dtype != crate::DType::F32 {
+                    let out_layout = crate::Layout::contiguous(&out_shape);
+                    out.to_dtype(&out_layout, input_dtype)?
+                } else {
+                    out
+                };
+                return Ok((out, out_shape));
+            }
+
             let ids_storage = ids.as_cuda_slice::<u32>()?;
             let (out, out_shape) = indexed_moe_forward_fused_q8_1_input(
                 &self.data.inner.slice(0..),
@@ -2085,6 +2142,74 @@ pub fn kv_buffer_append(
     }
 }
 
+/// Copy a prefix between CUDA KV buffers without staging through host memory.
+pub fn kv_buffer_copy_prefix(
+    src: &QStorage,
+    dst: &mut QStorage,
+    bytes_to_copy: usize,
+) -> Result<()> {
+    match (src, dst) {
+        (QStorage::Cuda(src), QStorage::Cuda(dst)) => {
+            if bytes_to_copy > src.data.inner.len() || bytes_to_copy > dst.data.inner.len() {
+                crate::bail!(
+                    "kv_buffer_copy_prefix overflow: bytes={} src={} dst={}",
+                    bytes_to_copy,
+                    src.data.inner.len(),
+                    dst.data.inner.len()
+                );
+            }
+            dst.device.memcpy_dtod(
+                &src.data.inner.slice(..bytes_to_copy),
+                &mut dst.data.inner.slice_mut(..bytes_to_copy),
+            )?;
+            Ok(())
+        }
+        _ => crate::bail!("kv_buffer_copy_prefix requires CUDA storage"),
+    }
+}
+
+/// Download a byte range from a CUDA KV buffer.
+///
+/// This is intended for explicit snapshot/debug paths, not decode hot paths.
+pub fn kv_buffer_download_range(
+    storage: &QStorage,
+    byte_offset: usize,
+    bytes_to_copy: usize,
+) -> Result<Vec<u8>> {
+    match storage {
+        QStorage::Cuda(storage) => {
+            let end = byte_offset + bytes_to_copy;
+            if end > storage.data.inner.len() {
+                crate::bail!(
+                    "kv_buffer_download_range overflow: end={} capacity={}",
+                    end,
+                    storage.data.inner.len()
+                );
+            }
+            let mut host = vec![0u8; bytes_to_copy];
+            storage
+                .device
+                .memcpy_dtoh(&storage.data.inner.slice(byte_offset..end), &mut host)?;
+            Ok(host)
+        }
+        _ => crate::bail!("kv_buffer_download_range requires CUDA storage"),
+    }
+}
+
+/// Dequantize a CUDA KV buffer without cloning its device allocation.
+pub fn kv_buffer_dequantize(storage: &QStorage, shape: &crate::Shape) -> Result<crate::Tensor> {
+    match storage {
+        QStorage::Cuda(storage) => {
+            let dequantized = storage.dequantize(shape.elem_count())?;
+            Ok(crate::Tensor::from_storage(
+                crate::Storage::Cuda(dequantized),
+                shape.clone(),
+            ))
+        }
+        _ => crate::bail!("kv_buffer_dequantize requires CUDA storage"),
+    }
+}
+
 /// Returns the total allocated byte capacity of a CUDA KV buffer.
 pub fn kv_buffer_capacity(storage: &QStorage) -> usize {
     match storage {
@@ -2093,33 +2218,15 @@ pub fn kv_buffer_capacity(storage: &QStorage) -> usize {
     }
 }
 
-/// Create a view of a GPU KV cache buffer exposing only `valid_bytes` of data.
-/// The underlying GPU allocation is shared (reference-counted).
-pub fn kv_buffer_view(storage: &QStorage, valid_bytes: usize) -> Result<QStorage> {
-    match storage {
-        QStorage::Cuda(s) => Ok(QStorage::Cuda(QCudaStorage {
-            data: PaddedCudaSlice {
-                inner: s.data.inner.clone(),
-                len: valid_bytes,
-            },
-            dtype: s.dtype,
-            device: s.device.clone(),
-        })),
-        _ => crate::bail!("kv_buffer_view requires CUDA storage"),
-    }
-}
-
 /// Quantize a contiguous CUDA f32 matrix `[rows, k]` to Q8_0 on-device and append into
 /// a CUDA KV buffer at `byte_offset`.
-///
-/// Returns the appended quantized bytes as a host vector so callers can keep a CPU mirror.
 pub fn kv_buffer_append_quantized_q8_0_f32(
     storage: &mut QStorage,
     src: &CudaStorage,
     k: usize,
     rows: usize,
     byte_offset: usize,
-) -> Result<Vec<u8>> {
+) -> Result<()> {
     let (dst, src_f32) = match (storage, &src.slice) {
         (QStorage::Cuda(dst), crate::cuda_backend::CudaStorageSlice::F32(src_f32)) => {
             (dst, src_f32)
@@ -2144,7 +2251,7 @@ pub fn kv_buffer_append_quantized_q8_0_f32(
         );
     }
     if rows == 0 {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     let src_len = src_f32.len();
@@ -2168,19 +2275,14 @@ pub fn kv_buffer_append_quantized_q8_0_f32(
         );
     }
 
-    let mut quant_tmp = unsafe { dst.device.alloc::<u8>(bytes_to_copy)? };
-    quantize_q8_0_rowwise(&src_f32.as_view(), &mut quant_tmp, k, rows, &dst.device)?;
-
-    dst.device.memcpy_dtod(
-        &quant_tmp.slice(..bytes_to_copy),
-        &mut dst.data.inner.slice_mut(byte_offset..end),
-    )?;
-
-    let mut host_bytes = vec![0u8; bytes_to_copy];
-    dst.device
-        .memcpy_dtoh(&quant_tmp.slice(..bytes_to_copy), &mut host_bytes)?;
-
-    Ok(host_bytes)
+    quantize_q8_0_rowwise(
+        &src_f32.as_view(),
+        &mut dst.data.inner,
+        byte_offset,
+        k,
+        rows,
+        &dst.device,
+    )
 }
 
 #[cfg(test)]

@@ -111,6 +111,18 @@ pub trait BackendStorage: Sized {
         _: &Layout,
         _: usize,
     ) -> Result<Self>;
+    fn index_add_set(
+        &mut self,
+        layout: &Layout,
+        indexes: &Self,
+        indexes_layout: &Layout,
+        source: &Self,
+        source_layout: &Layout,
+        dim: usize,
+    ) -> Result<()> {
+        *self = self.index_add(layout, indexes, indexes_layout, source, source_layout, dim)?;
+        Ok(())
+    }
 
     fn matmul(
         &self,

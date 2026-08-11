@@ -934,6 +934,35 @@ impl Storage {
         }
     }
 
+    pub(crate) fn index_add_set(
+        &mut self,
+        l: &Layout,
+        indexes: &Self,
+        indexes_l: &Layout,
+        source: &Self,
+        source_l: &Layout,
+        d: usize,
+    ) -> Result<()> {
+        self.same_device(indexes, "index-add-set")?;
+        self.same_device(source, "index-add-set")?;
+        match (self, indexes, source) {
+            (Self::Cpu(s), Self::Cpu(indexes), Self::Cpu(source)) => {
+                s.index_add_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            (Self::Cuda(s), Self::Cuda(indexes), Self::Cuda(source)) => {
+                s.index_add_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            (Self::Metal(s), Self::Metal(indexes), Self::Metal(source)) => {
+                s.index_add_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            (Self::Vulkan(s), Self::Vulkan(indexes), Self::Vulkan(source)) => {
+                s.index_add_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
     pub(crate) fn index_select(
         &self,
         rhs: &Self,

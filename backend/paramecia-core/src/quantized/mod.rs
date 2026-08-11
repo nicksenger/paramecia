@@ -1826,6 +1826,11 @@ impl QTensor {
         residuals: &mut [f16],
         gain: f32,
     ) -> Result<Self> {
+        // Unquantized tensors have no rounding error, so residual feedback is not needed.
+        if matches!(self.dtype(), GgmlDType::F32 | GgmlDType::BF16) {
+            return self.apply_quantized_update(perturbation, scale, seed);
+        }
+
         let elem_count = self.shape().elem_count();
         if perturbation.elem_count() != elem_count {
             crate::bail!(
@@ -2130,6 +2135,17 @@ impl QTensor {
         residuals: &mut [f16],
         gain: f32,
     ) -> Result<Self> {
+        // Unquantized tensors have no rounding error, so residual feedback is not needed.
+        if matches!(self.dtype(), GgmlDType::F32 | GgmlDType::BF16) {
+            return self.restore_and_update(
+                perturbation,
+                restore_epsilon,
+                update_scale,
+                restore_seed,
+                update_seed,
+            );
+        }
+
         let elem_count = self.shape().elem_count();
         if perturbation.elem_count() != elem_count {
             crate::bail!(
@@ -2176,10 +2192,10 @@ impl QTensor {
             GgmlDType::Q6K => dispatch_restore_update_residual!(BlockQ6K, Q6K),
             GgmlDType::Q8K => dispatch_restore_update_residual!(BlockQ8K, Q8K),
             dtype => {
-                crate::bail!(
-                    "restore_and_update_with_residual not supported for {:?}",
-                    dtype
-                );
+                //crate::bail!(
+                //    "restore_and_update_with_residual not supported for {:?}",
+                //    dtype
+                //);
             }
         }
 
@@ -2199,6 +2215,11 @@ impl QTensor {
         residuals: &mut [f16],
         gain: f32,
     ) -> Result<()> {
+        // Unquantized tensors have no quantization residual to track.
+        if matches!(self.dtype(), GgmlDType::F32 | GgmlDType::BF16) {
+            return Ok(());
+        }
+
         let data = self.data()?;
 
         macro_rules! dispatch_simulate_residual {

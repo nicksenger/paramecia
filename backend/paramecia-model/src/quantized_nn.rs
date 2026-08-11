@@ -9,6 +9,11 @@ use crate::quantized_var_builder::VarBuilder;
 use paramecia_core::quantized::{QTensor, SharedQTensor};
 use paramecia_core::{Module, Result, Tensor};
 
+fn rms_norm_weight_cache_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PARAMECIA_DISABLE_RMS_NORM_CACHE").is_none())
+}
+
 #[derive(Debug, Clone)]
 pub struct Embedding {
     inner: paramecia_nn::Embedding,
@@ -200,6 +205,35 @@ impl RmsNorm {
     pub fn zero_centered(&self) -> bool {
         self.zero_centered
     }
+
+    pub(crate) fn resolved_weight(&self, x: &Tensor) -> Result<Tensor> {
+        let weight = if let Some(ref shared) = self.shared_weight {
+            let weight = if rms_norm_weight_cache_enabled() {
+                if shared.generation() == 0 {
+                    self.weight.to_device(x.device())?
+                } else {
+                    match shared.cached_dequantize()? {
+                        Some(weight) => weight.to_device(x.device())?,
+                        None => {
+                            let qt = shared.read().unwrap();
+                            qt.dequantize(x.device())?
+                        }
+                    }
+                }
+            } else {
+                let qt = shared.read().unwrap();
+                qt.dequantize(x.device())?
+            };
+            weight
+        } else {
+            self.weight.to_device(x.device())?
+        };
+        if weight.dtype() != x.dtype() {
+            weight.to_dtype(x.dtype())
+        } else {
+            Ok(weight)
+        }
+    }
 }
 
 impl RmsNorm {
@@ -212,17 +246,9 @@ impl RmsNorm {
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        // When shared_weight is present, re-dequantize to pick up QuZO perturbations.
-        // Norm tensors are small (e.g. [2048]) so this is negligible cost.
-        let weight = if let Some(ref shared) = self.shared_weight {
-            let qt = shared.read().unwrap();
-            let w = qt.dequantize(x.device())?;
-            w.to_dtype(x.dtype())?
-        } else if self.weight.dtype() != x.dtype() {
-            self.weight.to_dtype(x.dtype())?
-        } else {
-            self.weight.clone()
-        };
+        // Generation zero is the resident weight loaded with this module.
+        // After a QuZO replacement, use the generation-counted cache.
+        let weight = self.resolved_weight(x)?;
 
         // Zero-centered (Gemma-style): use (1 + weight) instead of weight
         if self.zero_centered {
@@ -232,5 +258,30 @@ impl Module for RmsNorm {
         } else {
             paramecia_nn::ops::rms_norm(x, &weight, self.eps as f32)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RmsNorm;
+    use paramecia_core::quantized::{GgmlDType, QTensor, SharedQTensor};
+    use paramecia_core::{Device, Module, Result, Tensor};
+
+    #[test]
+    fn shared_rms_norm_cache_is_invalidated_on_replace() -> Result<()> {
+        let device = Device::Cpu;
+        let initial_weight = Tensor::new(&[1.0f32, 1.0], &device)?;
+        let shared = SharedQTensor::new(QTensor::quantize(&initial_weight, GgmlDType::F32)?);
+        let norm = RmsNorm::from_shared(initial_weight, 1e-6, shared.clone())?;
+        let input = Tensor::new(&[[1.0f32, 1.0]], &device)?;
+
+        let before = norm.forward(&input)?.to_vec2::<f32>()?;
+        let updated_weight = Tensor::new(&[2.0f32, 2.0], &device)?;
+        shared.replace(QTensor::quantize(&updated_weight, GgmlDType::F32)?);
+        let after = norm.forward(&input)?.to_vec2::<f32>()?;
+
+        assert!((after[0][0] - 2.0 * before[0][0]).abs() < 1e-5);
+        assert!((after[0][1] - 2.0 * before[0][1]).abs() < 1e-5);
+        Ok(())
     }
 }

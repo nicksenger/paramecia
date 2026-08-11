@@ -5092,6 +5092,14 @@ impl ModelWeights {
         };
         let mut h_typed: TypedTensor<Hidden3> = h.contiguous()?.try_into()?;
 
+        if l == 1
+            && padding_lengths.iter().all(|&padding| padding == 0)
+            && self.prefetch_pipeline.is_none()
+            && !self.capture_expert_indices
+        {
+            return self.forward_decode_with_workspace(h_typed, offset, embed_ms, profile);
+        }
+
         let causal_mask = if l == 1 && padding_lengths.iter().all(|&p| p == 0) {
             None
         } else {
@@ -5740,50 +5748,62 @@ impl ModelWeights {
                                 },
                                 crate::snapshot::CachedTensor::Quantized {
                                     data: v_data,
-                                    dtype: _v_dtype,
-                                    ..
+                                    dtype: v_dtype,
+                                    shape: v_shape,
+                                    bytes_per_row: v_bytes_per_row,
+                                    padded_head_dim: v_padded_head_dim,
+                                    max_seq_len: v_max_seq_len,
                                 },
                             ) => {
                                 full_attn.preallocated_cache = None;
                                 full_attn.quantized_cache = None;
 
+                                if k_shape.len() != 4 || v_shape != k_shape {
+                                    paramecia_core::bail!(
+                                        "invalid quantized KV snapshot shapes: k={:?} v={:?}",
+                                        k_shape,
+                                        v_shape
+                                    );
+                                }
+                                if k_dtype != v_dtype
+                                    || saved_bytes_per_row != v_bytes_per_row
+                                    || saved_padded_head_dim != v_padded_head_dim
+                                    || saved_max_seq_len != v_max_seq_len
+                                {
+                                    paramecia_core::bail!(
+                                        "quantized K/V snapshot metadata mismatch"
+                                    );
+                                }
                                 let batch_size = k_shape[0];
                                 let num_kv_heads = k_shape[1];
+                                if k_shape[2] != *seq_len {
+                                    paramecia_core::bail!(
+                                        "quantized KV snapshot length mismatch: shape={} metadata={}",
+                                        k_shape[2],
+                                        seq_len
+                                    );
+                                }
                                 let head_dim = k_shape[3];
-
-                                let block_size = k_dtype.block_size();
-                                let total_rows = batch_size * num_kv_heads * saved_max_seq_len;
-                                let total_bytes = total_rows * saved_bytes_per_row;
-
-                                let mut k_cache = vec![0u8; total_bytes];
-                                let mut v_cache = vec![0u8; total_bytes];
-
-                                k_cache[..k_data.len()].copy_from_slice(k_data);
-                                v_cache[..v_data.len()].copy_from_slice(v_data);
-
-                                let mut qcache = PreallocatedQuantizedKvCache {
-                                    k_cache,
-                                    v_cache,
-                                    ggml_dtype: *k_dtype,
-                                    seq_len: *seq_len,
-                                    max_seq_len: *saved_max_seq_len,
+                                let mut qcache = PreallocatedQuantizedKvCache::new(
                                     batch_size,
                                     num_kv_heads,
+                                    *saved_max_seq_len,
                                     head_dim,
-                                    padded_head_dim: *saved_padded_head_dim,
-                                    block_size,
-                                    bytes_per_row: *saved_bytes_per_row,
-                                    device: self.device.clone(),
-                                    #[cfg(feature = "vulkan")]
-                                    k_gpu_storage: None,
-                                    #[cfg(feature = "vulkan")]
-                                    v_gpu_storage: None,
-                                    #[cfg(feature = "cuda")]
-                                    k_gpu_storage: None,
-                                    #[cfg(feature = "cuda")]
-                                    v_gpu_storage: None,
-                                };
-                                qcache.rebuild_gpu_storage_from_host()?;
+                                    *k_dtype,
+                                    &self.device,
+                                )?;
+                                if qcache.bytes_per_row != *saved_bytes_per_row
+                                    || qcache.padded_head_dim != *saved_padded_head_dim
+                                {
+                                    paramecia_core::bail!(
+                                        "quantized KV snapshot layout does not match model: bytes_per_row={} vs {}, padded_head_dim={} vs {}",
+                                        saved_bytes_per_row,
+                                        qcache.bytes_per_row,
+                                        saved_padded_head_dim,
+                                        qcache.padded_head_dim,
+                                    );
+                                }
+                                qcache.restore_quantized_bytes(*seq_len, k_data, v_data)?;
 
                                 full_attn.quantized_cache = Some(qcache);
                             }

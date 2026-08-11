@@ -120,3 +120,22 @@ fn slice_assign() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn index_add_set_accumulates_in_place() -> Result<()> {
+    let dev = Device::Cpu;
+    let target = Tensor::zeros((4, 3), paramecia_core::DType::F32, &dev)?;
+    let first_ids = Tensor::new(&[1u32, 1, 3], &dev)?;
+    let first = Tensor::new(&[[1f32, 2., 3.], [4., 5., 6.], [7., 8., 9.]], &dev)?;
+    target.index_add_set(&first_ids, &first, 0)?;
+
+    let second_ids = Tensor::new(&[0u32, 3], &dev)?;
+    let second = Tensor::new(&[[10f32, 11., 12.], [1., 1., 1.]], &dev)?;
+    target.index_add_set(&second_ids, &second, 0)?;
+
+    assert_eq!(
+        target.to_vec2::<f32>()?,
+        &[[10., 11., 12.], [5., 7., 9.], [0., 0., 0.], [8., 9., 10.],]
+    );
+    Ok(())
+}

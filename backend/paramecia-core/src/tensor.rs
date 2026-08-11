@@ -1728,6 +1728,50 @@ impl Tensor {
         Ok(from_storage(storage, self.shape()))
     }
 
+    /// Accumulate elements from `source` at `indexes` directly into this tensor.
+    pub fn index_add_set<D: Dim>(&self, indexes: &Self, source: &Self, dim: D) -> Result<()> {
+        if self.same_storage(source) {
+            crate::bail!("cannot use index_add_set when self and source share their storage")
+        }
+        if self.same_storage(indexes) {
+            crate::bail!("cannot use index_add_set when self and indexes share their storage")
+        }
+        let dim = dim.to_index(self.shape(), "index-add-set")?;
+        let source_dims = source.dims();
+        let self_dims = self.dims();
+        let mismatch = source_dims.len() != self_dims.len()
+            || self_dims
+                .iter()
+                .zip(source_dims.iter())
+                .enumerate()
+                .any(|(index, (&lhs, &rhs))| index != dim && lhs != rhs);
+        if mismatch {
+            return Err(Error::ShapeMismatchBinaryOp {
+                op: "index-add-set (self, source)",
+                lhs: self.shape().clone(),
+                rhs: source.shape().clone(),
+            }
+            .bt());
+        }
+        let indexes_len = indexes.dims1()?;
+        if source_dims[dim] != indexes_len {
+            return Err(Error::ShapeMismatchBinaryOp {
+                op: "index-add-set (ids, source)",
+                lhs: indexes.shape().clone(),
+                rhs: source.shape().clone(),
+            }
+            .bt());
+        }
+        self.storage_mut().index_add_set(
+            self.layout(),
+            &indexes.storage(),
+            indexes.layout(),
+            &source.storage(),
+            source.layout(),
+            dim,
+        )
+    }
+
     /// Gather values across the target dimension.
     ///
     /// # Arguments

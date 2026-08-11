@@ -4,14 +4,15 @@
 //! `ModelEngine` is a cheap, cloneable handle that forwards async calls
 //! to `ModelEngineInner` running on a dedicated OS thread via channels.
 
-use crate::distribution::logits_to_distribution;
+use crate::distribution::{Distribution, logits_slice_to_distribution, logits_to_distribution};
 use crate::model_actor::{ModelActorHandle, ModelCommand};
 use crate::types::*;
 
 use paramecia_model::{
-    apply_penalties, DType, GraftComposite, GraftCompositeOptions, GraftLayerSource,
-    LogitsProcessor, ModelWeights, PrefixCache, Tensor,
+    DType, GraftComposite, GraftCompositeOptions, GraftLayerSource, LogitsProcessor, ModelWeights,
+    PrefixCache, Tensor, apply_penalties, apply_penalties_slice,
 };
+use rayon::prelude::*;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
@@ -35,6 +36,11 @@ pub(crate) struct PendingPrediction {
     already_appended: bool,
 }
 
+struct PreparedEmbeddingPosition {
+    token_ids: Vec<u32>,
+    weights: Vec<f32>,
+}
+
 // ---------------------------------------------------------------------------
 // ModelEngineInner — the actual model-owning state (runs on actor thread)
 // ---------------------------------------------------------------------------
@@ -49,6 +55,7 @@ pub(crate) struct ModelEngineInner {
     pub(crate) awaiting_commit: bool,
     pub(crate) pending_logits: Option<Tensor>,
     pub(crate) sampler: LogitsProcessor,
+    pub(crate) seed: u64,
     pub(crate) top_k: usize,
     pub(crate) tail_samples: usize,
     pub(crate) repeat_penalty: f32,
@@ -345,12 +352,14 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
                                 .index_select(&id_tensor, 0)
                                 .map_err(|e| Error::ModelError(e.to_string()))?;
                             // Shape: [1, hidden_dim] → squeeze to [hidden_dim]
-                            let squeezed = embed.reshape((embed.dims().last().copied().unwrap_or(0),))
+                            let squeezed = embed
+                                .reshape((embed.dims().last().copied().unwrap_or(0),))
                                 .map_err(|e| Error::ModelError(e.to_string()))?;
                             position_embeddings.push(squeezed);
                         } else {
                             // Compute weighted embedding from dark-knowledge distribution
-                            let ids: Vec<u32> = st.dark_knowledge.iter().map(|e| e.token_id).collect();
+                            let ids: Vec<u32> =
+                                st.dark_knowledge.iter().map(|e| e.token_id).collect();
                             let mut probs: Vec<f32> =
                                 st.dark_knowledge.iter().map(|e| e.log_prob.exp()).collect();
 
@@ -594,57 +603,44 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
         }
     }
 
-
-    /// Compute per-position embeddings for a single sequence of ModelInput items.
-    /// Returns (embeddings, token_ids) where:
-    /// - embeddings: one [hidden_dim] tensor per position
-    /// - token_ids: the concrete token ID for each position (for repeat penalty tracking).
-    ///   For Soft positions this is the predicted token ID.
-    fn compute_sequence_embeddings(
+    /// Prepare the sparse embedding mixture for every position in one sequence.
+    ///
+    /// This does CPU-only preparation. The complete batch is gathered and
+    /// reduced on the accelerator in `build_batched_embedding_tensor`, instead
+    /// of launching embedding/reduction kernels once per position.
+    fn prepare_sequence_embeddings(
         &self,
         seq_inputs: &[ModelInput],
-    ) -> Result<(Vec<Tensor>, Vec<u32>), Error> {
-        let embed_weights = self.model.embedding_weights();
-        let device = embed_weights.device().clone();
-
+    ) -> Result<(Vec<PreparedEmbeddingPosition>, Vec<u32>), Error> {
         let mut embeddings = Vec::new();
         let mut token_ids = Vec::new();
 
         for input in seq_inputs {
             match input {
                 ModelInput::Text(text) => {
-                    let encoding = self.tokenizer.encode(text.as_str(), true)
+                    let encoding = self
+                        .tokenizer
+                        .encode(text.as_str(), true)
                         .map_err(|e| Error::TokenizeError(e.to_string()))?;
                     let ids: Vec<u32> = encoding.get_ids().to_vec();
                     self.validate_token_ids(&ids, "batched sequence embeddings:text")?;
-                    if !ids.is_empty() {
-                        let ids_tensor = Tensor::new(ids.as_slice(), &device)
-                            .map_err(|e| Error::ModelError(e.to_string()))?;
-                        let selected = embed_weights.index_select(&ids_tensor, 0)
-                            .map_err(|e| Error::ModelError(e.to_string()))?;
-                        // Shape: [count, hidden_dim] — split into per-position tensors
-                        for i in 0..ids.len() {
-                            let pos_embed = selected.get(i)
-                                .map_err(|e| Error::ModelError(e.to_string()))?;
-                            embeddings.push(pos_embed);
-                        }
-                        token_ids.extend(ids);
+                    for &id in &ids {
+                        embeddings.push(PreparedEmbeddingPosition {
+                            token_ids: vec![id],
+                            weights: vec![1.0],
+                        });
                     }
+                    token_ids.extend(ids);
                 }
                 ModelInput::Tokens(ids) => {
                     self.validate_token_ids(ids, "batched sequence embeddings:tokens")?;
-                    if !ids.is_empty() {
-                        let ids_tensor = Tensor::new(ids.as_slice(), &device)
-                            .map_err(|e| Error::ModelError(e.to_string()))?;
-                        let selected = embed_weights.index_select(&ids_tensor, 0)
-                            .map_err(|e| Error::ModelError(e.to_string()))?;
-                        for i in 0..ids.len() {
-                            let pos_embed = selected.get(i)
-                                .map_err(|e| Error::ModelError(e.to_string()))?;
-                            embeddings.push(pos_embed);
-                        }
-                        token_ids.extend_from_slice(ids);
+                    for &id in ids {
+                        embeddings.push(PreparedEmbeddingPosition {
+                            token_ids: vec![id],
+                            weights: vec![1.0],
+                        });
                     }
+                    token_ids.extend_from_slice(ids);
                 }
                 ModelInput::Soft(soft_tokens) => {
                     for st in soft_tokens {
@@ -655,17 +651,11 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
                         }
                         self.validate_token_ids(&all_ids, "batched sequence embeddings:soft")?;
 
-                        let pos_embed = if st.dark_knowledge.is_empty() {
-                            // No dark knowledge — use the predicted token's embedding directly
-                            let id_tensor = Tensor::new(&[st.predicted], &device)
-                                .map_err(|e| Error::ModelError(e.to_string()))?;
-                            let embed = embed_weights.index_select(&id_tensor, 0)
-                                .map_err(|e| Error::ModelError(e.to_string()))?;
-                            embed.reshape((embed.dims().last().copied().unwrap_or(0),))
-                                .map_err(|e| Error::ModelError(e.to_string()))?
+                        let (ids, weights) = if st.dark_knowledge.is_empty() {
+                            (vec![st.predicted], vec![1.0])
                         } else {
-                            // Compute weighted embedding from dark-knowledge distribution
-                            let ids: Vec<u32> = st.dark_knowledge.iter().map(|e| e.token_id).collect();
+                            let ids: Vec<u32> =
+                                st.dark_knowledge.iter().map(|e| e.token_id).collect();
                             let mut probs: Vec<f32> =
                                 st.dark_knowledge.iter().map(|e| e.log_prob.exp()).collect();
 
@@ -676,19 +666,12 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
                                     *p /= prob_sum;
                                 }
                             }
-
-                            let ids_tensor = Tensor::new(ids.as_slice(), &device)
-                                .map_err(|e| Error::ModelError(e.to_string()))?;
-                            let sparse_embeds = embed_weights.index_select(&ids_tensor, 0)
-                                .map_err(|e| Error::ModelError(e.to_string()))?;
-                            let probs_tensor = Tensor::new(probs.as_slice(), &device)
-                                .and_then(|t| t.unsqueeze(1))
-                                .map_err(|e| Error::ModelError(e.to_string()))?;
-                            sparse_embeds.broadcast_mul(&probs_tensor)
-                                .and_then(|t| t.sum(0))
-                                .map_err(|e| Error::ModelError(e.to_string()))?
+                            (ids, probs)
                         };
-                        embeddings.push(pos_embed);
+                        embeddings.push(PreparedEmbeddingPosition {
+                            token_ids: ids,
+                            weights,
+                        });
                         token_ids.push(st.predicted);
                     }
                 }
@@ -696,6 +679,78 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
         }
 
         Ok((embeddings, token_ids))
+    }
+
+    fn build_batched_embedding_tensor(
+        &self,
+        sequences: &[Vec<PreparedEmbeddingPosition>],
+        padding_lengths: &[usize],
+        max_len: usize,
+    ) -> Result<Tensor, Error> {
+        let n = sequences.len();
+        let embed_weights = self.model.embedding_weights();
+        let hidden_dim = *embed_weights.dims().last().unwrap_or(&0);
+        let support_len = sequences
+            .iter()
+            .flat_map(|sequence| sequence.iter())
+            .map(|position| position.token_ids.len())
+            .sum();
+
+        let mut ids = Vec::with_capacity(support_len);
+        let mut weights = Vec::with_capacity(support_len);
+        let mut destination_positions = Vec::with_capacity(support_len);
+        for (sequence_index, sequence) in sequences.iter().enumerate() {
+            let position_base = sequence_index * max_len + padding_lengths[sequence_index];
+            for (position_index, position) in sequence.iter().enumerate() {
+                ids.extend_from_slice(&position.token_ids);
+                weights.extend_from_slice(&position.weights);
+                destination_positions.extend(
+                    std::iter::repeat((position_base + position_index) as u32)
+                        .take(position.token_ids.len()),
+                );
+            }
+        }
+
+        let device = embed_weights.device();
+        let embeddings = Tensor::zeros((n * max_len, hidden_dim), embed_weights.dtype(), device)
+            .map_err(|e| Error::ModelError(e.to_string()))?;
+
+        // Bound the two [support, hidden] intermediates to roughly 64 MiB
+        // combined. A single unchunked gather can otherwise consume multiple
+        // GiB for long prompts with a large dark-knowledge top-k.
+        const SPARSE_TENSOR_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+        let bytes_per_row = hidden_dim
+            .saturating_mul(embed_weights.dtype().size_in_bytes())
+            .max(1);
+        let chunk_rows = (SPARSE_TENSOR_CHUNK_BYTES / bytes_per_row).max(1);
+        for chunk_start in (0..support_len).step_by(chunk_rows) {
+            let chunk_end = (chunk_start + chunk_rows).min(support_len);
+            let chunk_len = chunk_end - chunk_start;
+            let chunk_ids = Tensor::from_slice(&ids[chunk_start..chunk_end], chunk_len, device)
+                .map_err(|e| Error::ModelError(e.to_string()))?;
+            let weighted_embeddings = embed_weights
+                .index_select(&chunk_ids, 0)
+                .and_then(|sparse_embeddings| {
+                    Tensor::from_slice(&weights[chunk_start..chunk_end], (chunk_len, 1), device)
+                        .and_then(|weights| weights.to_dtype(sparse_embeddings.dtype()))
+                        .and_then(|weights| sparse_embeddings.broadcast_mul(&weights))
+                })
+                .map_err(|e| Error::ModelError(e.to_string()))?;
+            let chunk_destinations = Tensor::from_slice(
+                &destination_positions[chunk_start..chunk_end],
+                chunk_len,
+                device,
+            )
+            .map_err(|e| Error::ModelError(e.to_string()))?;
+            embeddings
+                .index_add_set(&chunk_destinations, &weighted_embeddings, 0)
+                .map_err(|e| Error::ModelError(e.to_string()))?;
+        }
+
+        embeddings
+            .reshape((n, max_len, hidden_dim))
+            .and_then(|tensor| tensor.to_dtype(self.model.dtype()))
+            .map_err(|e| Error::ModelError(e.to_string()))
     }
 
     /// Run batched completion for N sequences simultaneously.
@@ -736,15 +791,18 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
 
         // Compute per-position embeddings and token IDs for each sequence.
         // This handles Text, Tokens, and Soft inputs uniformly.
-        let mut seq_embeddings: Vec<Vec<Tensor>> = Vec::with_capacity(n);
+        let mut seq_embeddings: Vec<Vec<PreparedEmbeddingPosition>> = Vec::with_capacity(n);
         let mut seq_tokens: Vec<Vec<u32>> = Vec::with_capacity(n);
         let mut has_soft_inputs = false;
         for (i, seq_inputs) in inputs.iter().enumerate() {
             // Check if this sequence has any Soft inputs
-            if seq_inputs.iter().any(|inp| matches!(inp, ModelInput::Soft(_))) {
+            if seq_inputs
+                .iter()
+                .any(|inp| matches!(inp, ModelInput::Soft(_)))
+            {
                 has_soft_inputs = true;
             }
-            match self.compute_sequence_embeddings(seq_inputs) {
+            match self.prepare_sequence_embeddings(seq_inputs) {
                 Ok((embeds, tokens)) => {
                     seq_embeddings.push(embeds);
                     seq_tokens.push(tokens);
@@ -789,74 +847,39 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
             return;
         }
 
-        // Determine hidden_dim from the first non-empty embedding (or from embedding weights shape)
-        let embed_weights = self.model.embedding_weights();
-        let hidden_dim = *embed_weights.dims().last().unwrap_or(&0);
-
         // Prefill: choose token-based or embedding-based forward pass
         let logits = if has_soft_inputs {
-            // Embedding-based path: build [N, max_len, hidden_dim] tensor from embeddings
-            // Left-pad each sequence's embeddings with zero vectors, then stack.
-            let mut padded_embeddings: Vec<Tensor> = Vec::with_capacity(n * max_len);
-            for (i, seq_embeds) in seq_embeddings.iter().enumerate() {
-                let pad_len = padding_lengths[i];
-                // Pad positions: create zero embeddings
-                if pad_len > 0 {
-                    let zero_data: Vec<f32> = vec![0.0f32; pad_len * hidden_dim];
-                    let zero_tensor = match Tensor::from_slice(
-                        &zero_data, (pad_len, hidden_dim), &self.device
-                    ) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            let _ = tx.send(Err(Error::ModelError(format!(
-                                "Failed to create padding tensor for seq {}: {}", i, e
-                            )))).await;
-                            self.cleanup_batched();
-                            return;
-                        }
-                    };
-                    for j in 0..pad_len {
-                        match zero_tensor.get(j) {
-                            Ok(pos) => padded_embeddings.push(pos),
-                            Err(e) => {
-                                let _ = tx.send(Err(Error::ModelError(format!(
-                                    "Failed to slice padding tensor for seq {}: {}", i, e
-                                )))).await;
-                                self.cleanup_batched();
-                                return;
-                            }
-                        }
-                    }
-                }
-                // Actual embeddings
-                for emb in seq_embeds {
-                    padded_embeddings.push(emb.clone());
-                }
-            }
-
-            // Stack into [N, max_len, hidden_dim]
-            let embedding_tensor = match Tensor::stack(&padded_embeddings, 0)
-                .and_then(|t| t.reshape((n, max_len, hidden_dim)))
-                .and_then(|t| t.to_dtype(self.model.dtype()))
-            {
+            // Gather all sparse mixtures and reduce them in a few batched GPU
+            // operations, including zero-valued left padding.
+            let embedding_tensor = match self.build_batched_embedding_tensor(
+                &seq_embeddings,
+                &padding_lengths,
+                max_len,
+            ) {
                 Ok(t) => t,
                 Err(e) => {
-                    let _ = tx.send(Err(Error::ModelError(format!(
-                        "Failed to build embedding tensor: {}", e
-                    )))).await;
+                    let _ = tx
+                        .send(Err(Error::ModelError(format!(
+                            "Failed to build embedding tensor: {}",
+                            e
+                        ))))
+                        .await;
                     self.cleanup_batched();
                     return;
                 }
             };
 
             match self.model.forward_with_embeddings_batched(
-                &embedding_tensor, 0, 0.0, &padding_lengths
+                &embedding_tensor,
+                0,
+                0.0,
+                &padding_lengths,
             ) {
                 Ok(l) => l,
                 Err(e) => {
-                    let _ = tx.send(Err(Error::ModelError(format!(
-                        "Prefill failed: {}", e
-                    )))).await;
+                    let _ = tx
+                        .send(Err(Error::ModelError(format!("Prefill failed: {}", e))))
+                        .await;
                     self.cleanup_batched();
                     return;
                 }
@@ -874,20 +897,26 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
             let input_tensor = match Tensor::from_slice(&padded_input, (n, max_len), &self.device) {
                 Ok(t) => t,
                 Err(e) => {
-                    let _ = tx.send(Err(Error::ModelError(format!(
-                        "Failed to create input tensor: {}", e
-                    )))).await;
+                    let _ = tx
+                        .send(Err(Error::ModelError(format!(
+                            "Failed to create input tensor: {}",
+                            e
+                        ))))
+                        .await;
                     self.cleanup_batched();
                     return;
                 }
             };
 
-            match self.model.forward_batched(&input_tensor, 0, &padding_lengths) {
+            match self
+                .model
+                .forward_batched(&input_tensor, 0, &padding_lengths)
+            {
                 Ok(l) => l,
                 Err(e) => {
-                    let _ = tx.send(Err(Error::ModelError(format!(
-                        "Prefill failed: {}", e
-                    )))).await;
+                    let _ = tx
+                        .send(Err(Error::ModelError(format!("Prefill failed: {}", e))))
+                        .await;
                     self.cleanup_batched();
                     return;
                 }
@@ -909,7 +938,7 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
         let mut per_seq_tokens: Vec<Vec<u32>> = seq_tokens;
 
         // Create per-sequence samplers with derived seeds
-        let base_seed = 299792458u64; // default seed
+        let base_seed = self.seed;
         let sampling = self.sampler.sampling().clone();
         let mut per_seq_samplers: Vec<LogitsProcessor> = (0..n)
             .map(|i| {
@@ -929,115 +958,102 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
                 break;
             }
 
-            // Sample N tokens from logits
+            // Download the complete [batch, vocab] matrix once. Per-row
+            // downloads serialize CUDA and used to cause 2*N synchronizations
+            // per decode step (distribution plus penalties/sampling).
+            let vocab_size = current_logits.dims().last().copied().unwrap_or(0);
+            let logits_host = current_logits
+                .to_dtype(DType::F32)
+                .and_then(|tensor| tensor.contiguous())
+                .and_then(|tensor| tensor.flatten_all())
+                .and_then(|tensor| tensor.to_vec1::<f32>());
+            let logits_host = match logits_host {
+                Ok(logits) if vocab_size > 0 && logits.len() == n * vocab_size => logits,
+                Ok(logits) => {
+                    let _ = tx
+                        .send(Err(Error::ModelError(format!(
+                            "Unexpected batched logits shape {:?} ({} values for batch {})",
+                            current_logits.dims(),
+                            logits.len(),
+                            n,
+                        ))))
+                        .await;
+                    self.cleanup_batched();
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(Error::ModelError(e.to_string()))).await;
+                    self.cleanup_batched();
+                    return;
+                }
+            };
+
+            let repeat_penalty = self.repeat_penalty;
+            let presence_penalty = self.presence_penalty;
+            let penalty_last_n = self.penalty_last_n;
+            let distribution_top_k = self.top_k;
+            let tail_samples = self.tail_samples;
+            let sampled_rows: Vec<Result<Option<(Distribution, u32)>, Error>> = per_seq_samplers
+                .par_iter_mut()
+                .enumerate()
+                .map(|(i, sampler)| {
+                    if !active[i] {
+                        return Ok(None);
+                    }
+                    let row = &logits_host[i * vocab_size..(i + 1) * vocab_size];
+                    let distribution =
+                        logits_slice_to_distribution(row, distribution_top_k, tail_samples);
+                    let token_id = if repeat_penalty == 1.0 && presence_penalty == 0.0 {
+                        sampler.sample_slice(row)
+                    } else {
+                        let mut penalized = row.to_vec();
+                        let penalty_start = per_seq_tokens[i].len().saturating_sub(penalty_last_n);
+                        apply_penalties_slice(
+                            &mut penalized,
+                            repeat_penalty,
+                            presence_penalty,
+                            &per_seq_tokens[i][penalty_start..],
+                        );
+                        sampler.sample_slice(&penalized)
+                    }
+                    .map_err(|e| Error::ModelError(e.to_string()))?;
+                    Ok(Some((distribution, token_id)))
+                })
+                .collect();
+
             let mut predictions = Vec::with_capacity(n);
             let mut next_tokens = Vec::with_capacity(n);
-
-            for i in 0..n {
-                if !active[i] {
-                    // Inactive: emit padding prediction (EOS)
+            for (i, sampled) in sampled_rows.into_iter().enumerate() {
+                let Some((distribution, token_id)) = (match sampled {
+                    Ok(sampled) => sampled,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        self.cleanup_batched();
+                        return;
+                    }
+                }) else {
+                    let token_id = eos_token.unwrap_or(0);
                     predictions.push(Predicted {
-                        token_id: eos_token.unwrap_or(0),
+                        token_id,
                         text: None,
                         top_k: Vec::new(),
                         tail: Vec::new(),
                         tail_mass: 0.0,
                         expert_indices: Vec::new(),
                     });
-                    next_tokens.push(eos_token.unwrap_or(0));
+                    next_tokens.push(token_id);
                     continue;
-                }
-
-                // Extract logits for batch element i
-                let row_logits = match current_logits.get(i) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(Error::ModelError(format!(
-                                "Failed to extract logits for seq {}: {}",
-                                i, e
-                            ))))
-                            .await;
-                        self.cleanup_batched();
-                        return;
-                    }
                 };
 
-                // Squeeze if needed (may be [1, vocab] or [vocab])
-                let row_logits = if row_logits.rank() == 2 {
-                    match row_logits.squeeze(0) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            let _ = tx.send(Err(Error::ModelError(e.to_string()))).await;
-                            self.cleanup_batched();
-                            return;
-                        }
-                    }
-                } else {
-                    row_logits
-                };
-
-                let row_logits = match row_logits.to_dtype(DType::F32) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        let _ = tx.send(Err(Error::ModelError(e.to_string()))).await;
-                        self.cleanup_batched();
-                        return;
-                    }
-                };
-
-                // Build distribution from raw logits
-                let distribution =
-                    match logits_to_distribution(&row_logits, self.top_k, self.tail_samples) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            let _ = tx.send(Err(Error::ModelError(e.to_string()))).await;
-                            self.cleanup_batched();
-                            return;
-                        }
-                    };
-
-                // Apply per-sequence penalties
-                let penalty_start = per_seq_tokens[i].len().saturating_sub(self.penalty_last_n);
-                let penalty_context = &per_seq_tokens[i][penalty_start..];
-                let penalized = match apply_penalties(
-                    &row_logits,
-                    self.repeat_penalty,
-                    self.presence_penalty,
-                    penalty_context,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let _ = tx.send(Err(Error::ModelError(e.to_string()))).await;
-                        self.cleanup_batched();
-                        return;
-                    }
-                };
-
-                // Sample
-                let token_id = match per_seq_samplers[i].sample(&penalized) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let _ = tx.send(Err(Error::ModelError(e.to_string()))).await;
-                        self.cleanup_batched();
-                        return;
-                    }
-                };
-
-                // Check stop condition
-                let should_stop = Some(token_id) == im_end_token || Some(token_id) == eos_token;
-                if should_stop {
+                if Some(token_id) == im_end_token || Some(token_id) == eos_token {
                     active[i] = false;
                 }
-
                 per_seq_tokens[i].push(token_id);
-
                 let text = self
                     .tokenizer
                     .decode(&[token_id], false)
                     .ok()
                     .filter(|s| !s.is_empty());
-
                 predictions.push(Predicted {
                     token_id,
                     text,
@@ -1294,6 +1310,7 @@ This usually indicates tokenizer/model mismatch (for example, using a Qwen3.5 to
     }
 
     pub async fn reseed(&mut self, seed: u64) -> Result<(), Error> {
+        self.seed = seed;
         self.sampler.reseed(seed);
         Ok(())
     }
@@ -2004,10 +2021,7 @@ impl ModelEngine {
         let (tx, rx) = oneshot::channel();
         self.actor
             .sender()
-            .send(ModelCommand::PerturbUp {
-                seed,
-                respond: tx,
-            })
+            .send(ModelCommand::PerturbUp { seed, respond: tx })
             .await
             .map_err(|_| Error::ModelError("Model actor stopped".into()))?;
         rx.await
@@ -2019,9 +2033,7 @@ impl ModelEngine {
         let (tx, rx) = oneshot::channel();
         self.actor
             .sender()
-            .send(ModelCommand::PerturbDown {
-                respond: tx,
-            })
+            .send(ModelCommand::PerturbDown { respond: tx })
             .await
             .map_err(|_| Error::ModelError("Model actor stopped".into()))?;
         rx.await

@@ -187,12 +187,13 @@ impl PreallocatedKvCache {
 /// Used when `KvCacheQuantization` is set to `Q8_0` or `Q4K` for memory-efficient
 /// long-context inference with significant VRAM savings.
 pub(super) struct PreallocatedQuantizedKvCache {
-    /// Pre-allocated quantized K buffer (stores raw quantized bytes)
+    /// Optional pre-allocated host K buffer (stores raw quantized bytes).
+    /// CUDA Q8 keeps no host backing during normal inference.
     /// Shape conceptually: [batch, num_kv_heads, max_seq_len, head_dim]
     /// But stored as flat quantized data with block structure
-    pub(super) k_cache: Vec<u8>,
-    /// Pre-allocated quantized V buffer
-    pub(super) v_cache: Vec<u8>,
+    pub(super) k_cache: Option<Vec<u8>>,
+    /// Optional pre-allocated host V buffer.
+    pub(super) v_cache: Option<Vec<u8>>,
     /// GGML dtype for quantization
     pub(super) ggml_dtype: GgmlDType,
     /// Current number of tokens stored
@@ -224,6 +225,13 @@ pub(super) struct PreallocatedQuantizedKvCache {
     pub(super) k_gpu_storage: Option<QStorage>,
     #[cfg(feature = "cuda")]
     pub(super) v_gpu_storage: Option<QStorage>,
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_q8_host_mirror_requested() -> bool {
+    std::env::var("PARAMECIA_CUDA_Q8_SYNC_HOST_MIRROR")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 impl std::fmt::Debug for PreallocatedQuantizedKvCache {
@@ -274,9 +282,25 @@ impl PreallocatedQuantizedKvCache {
         let total_rows = batch_size * num_kv_heads * max_seq_len;
         let total_bytes = total_rows * bytes_per_row;
 
-        // Pre-allocate with zeros
-        let k_cache = vec![0u8; total_bytes];
-        let v_cache = vec![0u8; total_bytes];
+        // CUDA Q8 keeps the authoritative cache on-device. Avoid allocating
+        // full-capacity host mirrors that would otherwise scale with
+        // batch * max_seq_len for every full-attention layer.
+        #[cfg(feature = "cuda")]
+        let keep_host_mirror = !(matches!(device, Device::Cuda(_))
+            && ggml_dtype == GgmlDType::Q8_0
+            && !cuda_q8_host_mirror_requested());
+        #[cfg(not(feature = "cuda"))]
+        let keep_host_mirror = true;
+        let k_cache = if keep_host_mirror {
+            Some(vec![0u8; total_bytes])
+        } else {
+            None
+        };
+        let v_cache = if keep_host_mirror {
+            Some(vec![0u8; total_bytes])
+        } else {
+            None
+        };
 
         let cache = Self {
             k_cache,
@@ -315,6 +339,23 @@ impl PreallocatedQuantizedKvCache {
         self.seq_len * self.rows_per_position() * self.bytes_per_row
     }
 
+    #[inline]
+    #[cfg(feature = "cuda")]
+    pub(super) fn capacity_bytes(&self) -> usize {
+        self.max_seq_len * self.rows_per_position() * self.bytes_per_row
+    }
+
+    #[cfg(feature = "cuda")]
+    fn discard_cuda_q8_host_mirror(&mut self) {
+        if matches!(self.device, Device::Cuda(_))
+            && self.ggml_dtype == GgmlDType::Q8_0
+            && !cuda_q8_host_mirror_requested()
+        {
+            self.k_cache = None;
+            self.v_cache = None;
+        }
+    }
+
     #[cfg(feature = "vulkan")]
     pub(super) fn maybe_init_gpu_storage(&mut self) -> Result<()> {
         if self.ggml_dtype != GgmlDType::Q8_0 {
@@ -328,13 +369,23 @@ impl PreallocatedQuantizedKvCache {
             return Ok(());
         }
         if self.k_gpu_storage.is_none() || self.v_gpu_storage.is_none() {
+            let k_cache = self.k_cache.as_deref().ok_or_else(|| {
+                paramecia_core::Error::Msg(
+                    "quantized K cache is missing its host backing".to_string(),
+                )
+            })?;
+            let v_cache = self.v_cache.as_deref().ok_or_else(|| {
+                paramecia_core::Error::Msg(
+                    "quantized V cache is missing its host backing".to_string(),
+                )
+            })?;
             self.k_gpu_storage = Some(QStorage::from_data(
-                std::borrow::Cow::Borrowed(&self.k_cache),
+                std::borrow::Cow::Borrowed(k_cache),
                 &self.device,
                 self.ggml_dtype,
             )?);
             self.v_gpu_storage = Some(QStorage::from_data(
-                std::borrow::Cow::Borrowed(&self.v_cache),
+                std::borrow::Cow::Borrowed(v_cache),
                 &self.device,
                 self.ggml_dtype,
             )?);
@@ -349,32 +400,57 @@ impl PreallocatedQuantizedKvCache {
     }
 
     /// Ensure CUDA GPU buffers have at least `needed_bytes` capacity.
-    /// Returns true if (re)allocation occurred (caller must re-upload existing data).
+    ///
+    /// Existing valid bytes are copied device-to-device when the buffers grow.
     #[cfg(feature = "cuda")]
     pub(super) fn ensure_gpu_capacity(&mut self, needed_bytes: usize) -> Result<bool> {
         if !matches!(self.device, Device::Cuda(_)) {
             return Ok(false);
         }
-        let has_capacity = match &self.k_gpu_storage {
-            Some(s) => paramecia_core::quantized::cuda::kv_buffer_capacity(s) >= needed_bytes,
-            None => false,
+        let has_capacity = match (&self.k_gpu_storage, &self.v_gpu_storage) {
+            (Some(k), Some(v)) => {
+                paramecia_core::quantized::cuda::kv_buffer_capacity(k) >= needed_bytes
+                    && paramecia_core::quantized::cuda::kv_buffer_capacity(v) >= needed_bytes
+            }
+            _ => false,
         };
         if has_capacity {
             return Ok(false);
         }
         // Allocate with 2x growth, capped at max capacity
-        let alloc_bytes = (needed_bytes * 2).min(self.k_cache.len());
+        let alloc_bytes = (needed_bytes * 2).min(self.capacity_bytes());
         let cuda_dev = self.device.as_cuda_device()?;
-        self.k_gpu_storage = Some(paramecia_core::quantized::cuda::alloc_kv_buffer(
+        let mut new_k = paramecia_core::quantized::cuda::alloc_kv_buffer(
             cuda_dev,
             alloc_bytes,
             self.ggml_dtype,
-        )?);
-        self.v_gpu_storage = Some(paramecia_core::quantized::cuda::alloc_kv_buffer(
+        )?;
+        let mut new_v = paramecia_core::quantized::cuda::alloc_kv_buffer(
             cuda_dev,
             alloc_bytes,
             self.ggml_dtype,
-        )?);
+        )?;
+        let preserve_bytes = self.valid_bytes();
+        if preserve_bytes > 0 {
+            if let (Some(old_k), Some(old_v)) = (&self.k_gpu_storage, &self.v_gpu_storage) {
+                paramecia_core::quantized::cuda::kv_buffer_copy_prefix(
+                    old_k,
+                    &mut new_k,
+                    preserve_bytes,
+                )?;
+                paramecia_core::quantized::cuda::kv_buffer_copy_prefix(
+                    old_v,
+                    &mut new_v,
+                    preserve_bytes,
+                )?;
+            } else if self.k_gpu_storage.is_some() || self.v_gpu_storage.is_some() {
+                paramecia_core::bail!(
+                    "quantized CUDA KV cache has only one initialized GPU buffer"
+                );
+            }
+        }
+        self.k_gpu_storage = Some(new_k);
+        self.v_gpu_storage = Some(new_v);
         Ok(true)
     }
 
@@ -385,13 +461,19 @@ impl PreallocatedQuantizedKvCache {
             self.v_gpu_storage = None;
             return Ok(());
         }
+        let k_cache = self.k_cache.as_deref().ok_or_else(|| {
+            paramecia_core::Error::Msg("quantized K cache is missing its host backing".to_string())
+        })?;
+        let v_cache = self.v_cache.as_deref().ok_or_else(|| {
+            paramecia_core::Error::Msg("quantized V cache is missing its host backing".to_string())
+        })?;
         self.k_gpu_storage = Some(QStorage::from_data(
-            std::borrow::Cow::Borrowed(&self.k_cache),
+            std::borrow::Cow::Borrowed(k_cache),
             &self.device,
             self.ggml_dtype,
         )?);
         self.v_gpu_storage = Some(QStorage::from_data(
-            std::borrow::Cow::Borrowed(&self.v_cache),
+            std::borrow::Cow::Borrowed(v_cache),
             &self.device,
             self.ggml_dtype,
         )?);
@@ -402,21 +484,32 @@ impl PreallocatedQuantizedKvCache {
     pub(super) fn rebuild_gpu_storage_from_host(&mut self) -> Result<()> {
         self.k_gpu_storage = None;
         self.v_gpu_storage = None;
-        if !matches!(self.device, Device::Cuda(_)) || self.seq_len == 0 {
+        if !matches!(self.device, Device::Cuda(_)) {
+            return Ok(());
+        }
+        if self.seq_len == 0 {
+            self.discard_cuda_q8_host_mirror();
             return Ok(());
         }
         let valid = self.valid_bytes();
         self.ensure_gpu_capacity(valid)?;
+        let k_cache = self.k_cache.as_deref().ok_or_else(|| {
+            paramecia_core::Error::Msg("quantized K cache is missing its host backing".to_string())
+        })?;
+        let v_cache = self.v_cache.as_deref().ok_or_else(|| {
+            paramecia_core::Error::Msg("quantized V cache is missing its host backing".to_string())
+        })?;
         paramecia_core::quantized::cuda::kv_buffer_append(
             self.k_gpu_storage.as_mut().unwrap(),
-            &self.k_cache[..valid],
+            &k_cache[..valid],
             0,
         )?;
         paramecia_core::quantized::cuda::kv_buffer_append(
             self.v_gpu_storage.as_mut().unwrap(),
-            &self.v_cache[..valid],
+            &v_cache[..valid],
             0,
         )?;
+        self.discard_cuda_q8_host_mirror();
         Ok(())
     }
 
@@ -458,22 +551,27 @@ impl PreallocatedQuantizedKvCache {
                 return Ok((QStorage::Vulkan(k_view), QStorage::Vulkan(v_view)));
             }
         }
-        #[cfg(feature = "cuda")]
-        {
-            if let (Some(k_store), Some(v_store)) = (&self.k_gpu_storage, &self.v_gpu_storage) {
-                let k_view = paramecia_core::quantized::cuda::kv_buffer_view(k_store, valid_bytes)?;
-                let v_view = paramecia_core::quantized::cuda::kv_buffer_view(v_store, valid_bytes)?;
-                return Ok((k_view, v_view));
+        let (k_cache, v_cache) = match (self.k_cache.as_deref(), self.v_cache.as_deref()) {
+            (Some(k), Some(v)) => (k, v),
+            _ => {
+                paramecia_core::bail!("quantized cache is missing GPU storage and its host backing")
             }
+        };
+        if k_cache.len() < valid_bytes || v_cache.len() < valid_bytes {
+            paramecia_core::bail!(
+                "quantized cache is missing GPU storage and a valid host mirror: k={} v={} expected={}",
+                k_cache.len(),
+                v_cache.len(),
+                valid_bytes,
+            );
         }
-
         let k_storage = QStorage::from_data(
-            std::borrow::Cow::Borrowed(&self.k_cache[..valid_bytes]),
+            std::borrow::Cow::Borrowed(&k_cache[..valid_bytes]),
             &self.device,
             self.ggml_dtype,
         )?;
         let v_storage = QStorage::from_data(
-            std::borrow::Cow::Borrowed(&self.v_cache[..valid_bytes]),
+            std::borrow::Cow::Borrowed(&v_cache[..valid_bytes]),
             &self.device,
             self.ggml_dtype,
         )?;
@@ -554,6 +652,27 @@ impl PreallocatedQuantizedKvCache {
             return Ok((Vec::new(), Vec::new()));
         }
         let valid_bytes = self.valid_bytes();
+        #[cfg(feature = "cuda")]
+        if matches!(self.device, Device::Cuda(_)) {
+            let (k_storage, v_storage) = match (&self.k_gpu_storage, &self.v_gpu_storage) {
+                (Some(k), Some(v)) => (k, v),
+                _ => paramecia_core::bail!(
+                    "quantized CUDA cache is missing K/V GPU storage during snapshot"
+                ),
+            };
+            return Ok((
+                paramecia_core::quantized::cuda::kv_buffer_download_range(
+                    k_storage,
+                    0,
+                    valid_bytes,
+                )?,
+                paramecia_core::quantized::cuda::kv_buffer_download_range(
+                    v_storage,
+                    0,
+                    valid_bytes,
+                )?,
+            ));
+        }
         let (k_storage, v_storage) = self.storage_views()?;
         let shape = (
             self.seq_len,
@@ -577,6 +696,72 @@ impl PreallocatedQuantizedKvCache {
             k_data[..valid_bytes].to_vec(),
             v_data[..valid_bytes].to_vec(),
         ))
+    }
+
+    pub(super) fn restore_quantized_bytes(
+        &mut self,
+        seq_len: usize,
+        k_data: &[u8],
+        v_data: &[u8],
+    ) -> Result<()> {
+        if seq_len > self.max_seq_len {
+            paramecia_core::bail!(
+                "quantized KV restore length {} exceeds capacity {}",
+                seq_len,
+                self.max_seq_len
+            );
+        }
+        let expected_bytes = seq_len
+            .checked_mul(self.rows_per_position())
+            .and_then(|rows| rows.checked_mul(self.bytes_per_row))
+            .ok_or_else(|| {
+                paramecia_core::Error::Msg("quantized KV restore byte count overflow".to_string())
+            })?;
+        if k_data.len() != expected_bytes || v_data.len() != expected_bytes {
+            paramecia_core::bail!(
+                "quantized KV restore size mismatch: k={} v={} expected={}",
+                k_data.len(),
+                v_data.len(),
+                expected_bytes
+            );
+        }
+
+        if let (Some(k_cache), Some(v_cache)) = (&mut self.k_cache, &mut self.v_cache) {
+            if k_cache.len() < expected_bytes || v_cache.len() < expected_bytes {
+                paramecia_core::bail!("quantized KV restore host backing is smaller than expected");
+            }
+            k_cache[..expected_bytes].copy_from_slice(k_data);
+            v_cache[..expected_bytes].copy_from_slice(v_data);
+        }
+
+        #[cfg(feature = "cuda")]
+        if matches!(self.device, Device::Cuda(_)) {
+            self.k_gpu_storage = None;
+            self.v_gpu_storage = None;
+            self.seq_len = 0;
+            if expected_bytes > 0 {
+                self.ensure_gpu_capacity(expected_bytes)?;
+                paramecia_core::quantized::cuda::kv_buffer_append(
+                    self.k_gpu_storage.as_mut().unwrap(),
+                    k_data,
+                    0,
+                )?;
+                paramecia_core::quantized::cuda::kv_buffer_append(
+                    self.v_gpu_storage.as_mut().unwrap(),
+                    v_data,
+                    0,
+                )?;
+            }
+            self.seq_len = seq_len;
+            self.discard_cuda_q8_host_mirror();
+            return Ok(());
+        }
+
+        if self.k_cache.is_none() || self.v_cache.is_none() {
+            paramecia_core::bail!("quantized KV restore requires host storage on this backend");
+        }
+        self.seq_len = seq_len;
+        self.rebuild_gpu_storage_from_host()
     }
 
     /// Append new K/V tensors to the cache.
@@ -634,20 +819,7 @@ impl PreallocatedQuantizedKvCache {
         #[cfg(feature = "cuda")]
         if matches!(self.device, Device::Cuda(_)) && self.ggml_dtype == GgmlDType::Q8_0 {
             let new_valid_bytes = start_offset + bytes_to_copy;
-            let reallocated = self.ensure_gpu_capacity(new_valid_bytes)?;
-            // On reallocation, re-upload existing prefix from CPU mirror.
-            if reallocated && start_offset > 0 {
-                paramecia_core::quantized::cuda::kv_buffer_append(
-                    self.k_gpu_storage.as_mut().unwrap(),
-                    &self.k_cache[..start_offset],
-                    0,
-                )?;
-                paramecia_core::quantized::cuda::kv_buffer_append(
-                    self.v_gpu_storage.as_mut().unwrap(),
-                    &self.v_cache[..start_offset],
-                    0,
-                )?;
-            }
+            self.ensure_gpu_capacity(new_valid_bytes)?;
 
             // Prepare seq-major contiguous f32 source on CUDA: [seq, batch, head, d] flattened.
             let new_k_seq = new_k_padded
@@ -670,14 +842,14 @@ impl PreallocatedQuantizedKvCache {
                 }
             };
 
-            let new_k_bytes = paramecia_core::quantized::cuda::kv_buffer_append_quantized_q8_0_f32(
+            paramecia_core::quantized::cuda::kv_buffer_append_quantized_q8_0_f32(
                 self.k_gpu_storage.as_mut().unwrap(),
                 new_k_cuda,
                 self.padded_head_dim,
                 new_seq_len * rows_per_position,
                 start_offset,
             )?;
-            let new_v_bytes = paramecia_core::quantized::cuda::kv_buffer_append_quantized_q8_0_f32(
+            paramecia_core::quantized::cuda::kv_buffer_append_quantized_q8_0_f32(
                 self.v_gpu_storage.as_mut().unwrap(),
                 new_v_cuda,
                 self.padded_head_dim,
@@ -685,9 +857,27 @@ impl PreallocatedQuantizedKvCache {
                 start_offset,
             )?;
 
-            // Keep host mirrors in sync for snapshot/restore/reallocation paths.
-            self.k_cache[start_offset..start_offset + bytes_to_copy].copy_from_slice(&new_k_bytes);
-            self.v_cache[start_offset..start_offset + bytes_to_copy].copy_from_slice(&new_v_bytes);
+            // Optional A/B/debug mode that restores the old decode-time host
+            // synchronization. The default keeps the cache GPU-resident.
+            if let (Some(k_cache), Some(v_cache)) = (&mut self.k_cache, &mut self.v_cache) {
+                if k_cache.len() < new_valid_bytes || v_cache.len() < new_valid_bytes {
+                    paramecia_core::bail!(
+                        "quantized CUDA KV host backing is smaller than expected"
+                    );
+                }
+                let k_bytes = paramecia_core::quantized::cuda::kv_buffer_download_range(
+                    self.k_gpu_storage.as_ref().unwrap(),
+                    start_offset,
+                    bytes_to_copy,
+                )?;
+                let v_bytes = paramecia_core::quantized::cuda::kv_buffer_download_range(
+                    self.v_gpu_storage.as_ref().unwrap(),
+                    start_offset,
+                    bytes_to_copy,
+                )?;
+                k_cache[start_offset..new_valid_bytes].copy_from_slice(&k_bytes);
+                v_cache[start_offset..new_valid_bytes].copy_from_slice(&v_bytes);
+            }
 
             self.seq_len = new_end;
             return Ok(());
@@ -726,9 +916,15 @@ impl PreallocatedQuantizedKvCache {
         let new_v_bytes = new_v_qtensor.data()?;
 
         // Copy quantized data to pre-allocated buffer
-        self.k_cache[start_offset..start_offset + bytes_to_copy]
+        let k_cache = self.k_cache.as_mut().ok_or_else(|| {
+            paramecia_core::Error::Msg("quantized K cache is missing host backing".to_string())
+        })?;
+        let v_cache = self.v_cache.as_mut().ok_or_else(|| {
+            paramecia_core::Error::Msg("quantized V cache is missing host backing".to_string())
+        })?;
+        k_cache[start_offset..start_offset + bytes_to_copy]
             .copy_from_slice(&new_k_bytes.as_ref()[..bytes_to_copy]);
-        self.v_cache[start_offset..start_offset + bytes_to_copy]
+        v_cache[start_offset..start_offset + bytes_to_copy]
             .copy_from_slice(&new_v_bytes.as_ref()[..bytes_to_copy]);
 
         // Sync to persistent GPU buffer (CUDA path)
@@ -736,20 +932,7 @@ impl PreallocatedQuantizedKvCache {
         {
             if matches!(self.device, Device::Cuda(_)) {
                 let new_valid_bytes = start_offset + bytes_to_copy;
-                let reallocated = self.ensure_gpu_capacity(new_valid_bytes)?;
-                // On reallocation, re-upload all existing data from CPU cache
-                if reallocated && start_offset > 0 {
-                    paramecia_core::quantized::cuda::kv_buffer_append(
-                        self.k_gpu_storage.as_mut().unwrap(),
-                        &self.k_cache[..start_offset],
-                        0,
-                    )?;
-                    paramecia_core::quantized::cuda::kv_buffer_append(
-                        self.v_gpu_storage.as_mut().unwrap(),
-                        &self.v_cache[..start_offset],
-                        0,
-                    )?;
-                }
+                self.ensure_gpu_capacity(new_valid_bytes)?;
                 // Upload only the new bytes
                 paramecia_core::quantized::cuda::kv_buffer_append(
                     self.k_gpu_storage.as_mut().unwrap(),
@@ -769,14 +952,6 @@ impl PreallocatedQuantizedKvCache {
         Ok(())
     }
 
-    /// Backwards-compatible helper: append then dequantize the full cache.
-    ///
-    /// This is expensive (O(seq_len)) and should be avoided on the hot path.
-    pub(super) fn append(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor)> {
-        self.append_quantized(new_k, new_v)?;
-        self.get_kv()
-    }
-
     /// Get the current K/V tensors (dequantized)
     pub(super) fn get_kv(&self) -> Result<(Tensor, Tensor)> {
         if self.seq_len == 0 {
@@ -794,32 +969,43 @@ impl PreallocatedQuantizedKvCache {
             return Ok((k, v));
         }
 
-        // Calculate how many bytes represent the current sequence
-        let (k_storage, v_storage) = self.storage_views()?;
-
         // Storage is seq-major: [seq, batch, head, d]
-        let k_qtensor = QTensor::new(
-            k_storage,
-            (
-                self.seq_len,
-                self.batch_size,
-                self.num_kv_heads,
-                self.padded_head_dim,
-            ),
-        )?;
-        let v_qtensor = QTensor::new(
-            v_storage,
-            (
-                self.seq_len,
-                self.batch_size,
-                self.num_kv_heads,
-                self.padded_head_dim,
-            ),
-        )?;
+        let storage_shape: paramecia_core::Shape = (
+            self.seq_len,
+            self.batch_size,
+            self.num_kv_heads,
+            self.padded_head_dim,
+        )
+            .into();
+        #[cfg(feature = "cuda")]
+        let cuda_dequantized = if matches!(self.device, Device::Cuda(_)) {
+            let (k_storage, v_storage) = match (&self.k_gpu_storage, &self.v_gpu_storage) {
+                (Some(k), Some(v)) => (k, v),
+                _ => paramecia_core::bail!(
+                    "quantized CUDA cache is missing K/V GPU storage during dequantization"
+                ),
+            };
+            Some((
+                paramecia_core::quantized::cuda::kv_buffer_dequantize(k_storage, &storage_shape)?,
+                paramecia_core::quantized::cuda::kv_buffer_dequantize(v_storage, &storage_shape)?,
+            ))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        let cuda_dequantized: Option<(Tensor, Tensor)> = None;
 
-        // Dequantize
-        let k_deq = k_qtensor.dequantize(&self.device)?;
-        let v_deq = v_qtensor.dequantize(&self.device)?;
+        let (k_deq, v_deq) = if let Some(dequantized) = cuda_dequantized {
+            dequantized
+        } else {
+            let (k_storage, v_storage) = self.storage_views()?;
+            let k_qtensor = QTensor::new(k_storage, storage_shape.clone())?;
+            let v_qtensor = QTensor::new(v_storage, storage_shape)?;
+            (
+                k_qtensor.dequantize(&self.device)?,
+                v_qtensor.dequantize(&self.device)?,
+            )
+        };
 
         // Convert to [batch, head, seq, d] and trim padding.
         let k = k_deq.permute((1, 2, 0, 3))?.narrow(3, 0, self.head_dim)?;
@@ -830,14 +1016,14 @@ impl PreallocatedQuantizedKvCache {
 
     /// Get K/V tensors as quantized storage for Q8_0 flash attention
     ///
-    /// Returns (k_storage, v_storage, k_layout, v_layout) for direct
-    /// use with Q8_0 flash attention kernel, avoiding dequantization.
-    #[allow(dead_code)]
+    /// Returns borrowed storage because cloning cudarc's `CudaSlice` allocates
+    /// and copies the full device buffer.
+    #[cfg(any(feature = "cuda", feature = "vulkan"))]
     pub(super) fn get_kv_storage(
         &self,
     ) -> Result<(
-        QStorage,
-        QStorage,
+        &QStorage,
+        &QStorage,
         paramecia_core::Layout,
         paramecia_core::Layout,
     )> {
@@ -845,8 +1031,10 @@ impl PreallocatedQuantizedKvCache {
             paramecia_core::bail!("Cannot get storage from empty cache");
         }
 
-        // Calculate how many bytes represent the current sequence
-        let (k_storage, v_storage) = self.storage_views()?;
+        let (k_storage, v_storage) = match (&self.k_gpu_storage, &self.v_gpu_storage) {
+            (Some(k), Some(v)) => (k, v),
+            _ => paramecia_core::bail!("quantized cache is missing K/V GPU storage"),
+        };
 
         // Storage is seq-major: [seq, batch, head, d], exposed as [batch, seq, head, d].
         let k_shape = paramecia_core::Shape::from((
@@ -888,12 +1076,95 @@ impl PreallocatedQuantizedKvCache {
         if batch_size != self.batch_size {
             let total_rows = batch_size * self.num_kv_heads * self.max_seq_len;
             let total_bytes = total_rows * self.bytes_per_row;
-            self.k_cache = vec![0u8; total_bytes];
-            self.v_cache = vec![0u8; total_bytes];
+            #[cfg(feature = "cuda")]
+            let keep_host_mirror = !(matches!(self.device, Device::Cuda(_))
+                && self.ggml_dtype == GgmlDType::Q8_0
+                && !cuda_q8_host_mirror_requested());
+            #[cfg(not(feature = "cuda"))]
+            let keep_host_mirror = true;
+            self.k_cache = if keep_host_mirror {
+                Some(vec![0u8; total_bytes])
+            } else {
+                None
+            };
+            self.v_cache = if keep_host_mirror {
+                Some(vec![0u8; total_bytes])
+            } else {
+                None
+            };
             self.batch_size = batch_size;
             self.seq_len = 0;
             self.rebuild_gpu_storage_from_host()?;
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod quantized_cache_tests {
+    use super::PreallocatedQuantizedKvCache;
+    use paramecia_core::quantized::GgmlDType;
+    use paramecia_core::{Device, Result, Tensor};
+
+    #[test]
+    fn cpu_q8_snapshot_contains_only_valid_prefix() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cache = PreallocatedQuantizedKvCache::new(1, 1, 4, 32, GgmlDType::Q8_0, &device)?;
+        let values = (0..64).map(|value| value as f32 / 64.0).collect::<Vec<_>>();
+        let k = Tensor::from_vec(values.clone(), (1, 1, 2, 32), &device)?;
+        let v = Tensor::from_vec(values, (1, 1, 2, 32), &device)?;
+
+        cache.append_quantized(&k, &v)?;
+        let (k_bytes, v_bytes) = cache.snapshot_quantized_bytes()?;
+        let expected_bytes = 2 * GgmlDType::Q8_0.type_size();
+        assert_eq!(k_bytes.len(), expected_bytes);
+        assert_eq!(v_bytes.len(), expected_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_q8_snapshot_restore_round_trip() -> Result<()> {
+        let device = Device::Cpu;
+        let values = (0..64).map(|value| value as f32 / 64.0).collect::<Vec<_>>();
+        let tensor = Tensor::from_vec(values, (1, 1, 2, 32), &device)?;
+        let mut source = PreallocatedQuantizedKvCache::new(1, 1, 4, 32, GgmlDType::Q8_0, &device)?;
+        source.append_quantized(&tensor, &tensor)?;
+        let (k_bytes, v_bytes) = source.snapshot_quantized_bytes()?;
+
+        let mut restored =
+            PreallocatedQuantizedKvCache::new(1, 1, 4, 32, GgmlDType::Q8_0, &device)?;
+        restored.restore_quantized_bytes(2, &k_bytes, &v_bytes)?;
+        assert_eq!(restored.snapshot_quantized_bytes()?, (k_bytes, v_bytes));
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_q8_append_after_truncate_overwrites_tail() -> Result<()> {
+        let device = Device::Cpu;
+        let first_values = (0..64).map(|value| value as f32 / 64.0).collect::<Vec<_>>();
+        let first_token_values = first_values[..32].to_vec();
+        let replacement_values = (0..32)
+            .map(|value| 2.0 + value as f32 / 32.0)
+            .collect::<Vec<_>>();
+        let first = Tensor::from_vec(first_values, (1, 1, 2, 32), &device)?;
+        let replacement = Tensor::from_vec(replacement_values, (1, 1, 1, 32), &device)?;
+
+        let mut truncated =
+            PreallocatedQuantizedKvCache::new(1, 1, 4, 32, GgmlDType::Q8_0, &device)?;
+        truncated.append_quantized(&first, &first)?;
+        truncated.truncate(1);
+        truncated.append_quantized(&replacement, &replacement)?;
+
+        let mut expected =
+            PreallocatedQuantizedKvCache::new(1, 1, 4, 32, GgmlDType::Q8_0, &device)?;
+        let first_token = Tensor::from_vec(first_token_values, (1, 1, 1, 32), &device)?;
+        expected.append_quantized(&first_token, &first_token)?;
+        expected.append_quantized(&replacement, &replacement)?;
+
+        assert_eq!(
+            truncated.snapshot_quantized_bytes()?,
+            expected.snapshot_quantized_bytes()?
+        );
         Ok(())
     }
 }

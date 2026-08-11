@@ -2570,24 +2570,31 @@ impl MoeExperts {
             return false;
         }
 
-        // Check if weights have supported dtype
+        // Every projection can have a different dtype in mixed GGUF
+        // quantizations such as Q4_K_M, so validate all three independently.
+        let is_supported = |dtype| {
+            matches!(
+                dtype,
+                GgmlDType::Q2K
+                    | GgmlDType::Q3K
+                    | GgmlDType::Q4K
+                    | GgmlDType::Q5K
+                    | GgmlDType::Q6K
+                    | GgmlDType::Q8_0
+            )
+        };
         let gate_lock = self.gate_exps.read().unwrap();
-        let gate_dtype = gate_lock.dtype();
-        let supported = matches!(
-            gate_dtype,
-            GgmlDType::Q2K
-                | GgmlDType::Q3K
-                | GgmlDType::Q4K
-                | GgmlDType::Q5K
-                | GgmlDType::Q6K
-                | GgmlDType::Q8_0
-        );
+        let up_lock = self.up_exps.read().unwrap();
+        let down_lock = self.down_exps.read().unwrap();
+        let supported = is_supported(gate_lock.dtype())
+            && is_supported(up_lock.dtype())
+            && is_supported(down_lock.dtype());
 
         // All expert projections must be on GPU for indexed_moe_forward
         supported
             && is_gpu_device(&gate_lock.device())
-            && is_gpu_device(&self.up_exps.read().unwrap().device())
-            && is_gpu_device(&self.down_exps.read().unwrap().device())
+            && is_gpu_device(&up_lock.device())
+            && is_gpu_device(&down_lock.device())
     }
 
     pub(super) fn forward_expert(

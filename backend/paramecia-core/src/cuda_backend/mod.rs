@@ -2084,6 +2084,18 @@ impl BackendStorage for CudaStorage {
         IndexAdd(ids, ids_l, dim).map(&mut acc.slice, l, &src.slice, src_l, &device)?;
         Ok(acc)
     }
+    fn index_add_set(
+        &mut self,
+        l: &Layout,
+        ids: &Self,
+        ids_l: &Layout,
+        src: &Self,
+        src_l: &Layout,
+        dim: usize,
+    ) -> Result<()> {
+        let device = self.device().clone();
+        IndexAdd(ids, ids_l, dim).map(&mut self.slice, l, &src.slice, src_l, &device)
+    }
 
     fn matmul(
         &self,

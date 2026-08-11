@@ -43,6 +43,22 @@ type DeltaNet4Shape = Shape4<B, N, DtRank, DState>;
 type NamedQTensorRef<'a> = (&'static str, &'a paramecia_core::quantized::QTensor);
 type BetaAlphaQtensorsForSave<'a> = (Option<NamedQTensorRef<'a>>, Option<NamedQTensorRef<'a>>);
 
+fn fused_gated_rms_norm_enabled(_device: &Device) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| {
+        std::env::var("PARAMECIA_CUDA_FUSED_GATED_RMS_NORM")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }) {
+        return false;
+    }
+    #[cfg(feature = "cuda")]
+    if matches!(_device, Device::Cuda(_)) {
+        return true;
+    }
+    false
+}
+
 // ── Arrow-composed flows ──────────────────────────────────────────────────
 
 // Output projection: [B, N, DInner] → [B, N, S]
@@ -869,11 +885,22 @@ impl LinearAttention {
         };
         log_shape("linear_attn.delta_net_out", attn_out_typed.inner());
 
-        // Stage 7: Gated norm (per-head RMS norm × SiLU gate) — arrow flow
-        let z: TDeltaNet4 = z.reshape((b, l, num_v_heads, head_v_dim))?.try_into()?;
-        let attn_out_norm: TDeltaNet4 = self
-            .gated_norm_flow
-            .traced_forward(&mut (), (attn_out_typed, z))?;
+        // Stage 7: Gated norm (per-head RMS norm × SiLU gate).
+        let z = z.reshape((b, l, num_v_heads, head_v_dim))?;
+        let attn_out_norm: TDeltaNet4 =
+            if fused_gated_rms_norm_enabled(z.device()) && !self.ssm_norm.zero_centered() {
+                let rows = b * l * num_v_heads;
+                let x_flat = attn_out_typed.inner().reshape((rows, head_v_dim))?;
+                let z_flat = z.reshape((rows, head_v_dim))?;
+                let weight = self.ssm_norm.resolved_weight(&x_flat)?;
+                crate::ops::gated_rms_norm(&x_flat, &z_flat, &weight, self.ssm_norm.eps() as f32)?
+                    .reshape((b, l, num_v_heads, head_v_dim))?
+                    .try_into()?
+            } else {
+                let z: TDeltaNet4 = z.try_into()?;
+                self.gated_norm_flow
+                    .traced_forward(&mut (), (attn_out_typed, z))?
+            };
         let attn_out_norm = attn_out_norm
             .inner()
             .reshape((b, l, num_v_heads * head_v_dim))?;

@@ -123,7 +123,7 @@ pub struct ControlArgs {
     pub cpu: bool,
 
     /// Device offload mode for MoE expert weights
-    #[arg(long, default_value = "experts")]
+    #[arg(long, default_value = "auto")]
     pub offload: String,
 
     /// Disable KV-cache quantization

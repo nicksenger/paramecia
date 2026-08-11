@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use paramecia_engine::{
     Device, DeviceOffloadMode, Error, KvCacheQuantization, ModelEngineBuilder, TokenOutputStream,
@@ -79,6 +79,7 @@ enum DeviceArg {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OffloadArg {
+    Auto,
     None,
     Experts,
     Down,
@@ -88,6 +89,7 @@ enum OffloadArg {
 impl OffloadArg {
     fn to_mode(self) -> DeviceOffloadMode {
         match self {
+            Self::Auto => DeviceOffloadMode::default(),
             Self::None => DeviceOffloadMode::FullGpu,
             Self::Experts => DeviceOffloadMode::ExpertsOnCpu,
             Self::Down => DeviceOffloadMode::DownProjectionsOnCpu,
@@ -119,7 +121,7 @@ struct Args {
     device: DeviceArg,
 
     /// Expert offload mode.
-    #[arg(long, value_enum, default_value_t = OffloadArg::Experts)]
+    #[arg(long, value_enum, default_value_t = OffloadArg::Auto)]
     offload: OffloadArg,
 
     /// KV-cache quantization mode (f16, bf16, q8_0, q4k, ...).
@@ -288,8 +290,7 @@ fn select_system_prompt_tokens(
 
 fn build_chatml_prompt_tokens(tokenizer: &Tokenizer, system_tokens: &[u32]) -> Result<Vec<u32>> {
     const SYSTEM_PREFIX: &str = "<|im_start|>system\n";
-    const CHAT_SUFFIX: &str =
-        "\n<|im_end|>\n<|im_start|>user\nWhat is the Rust programming language?\n<|im_end|>\n<|im_start|>assistant\n";
+    const CHAT_SUFFIX: &str = "\n<|im_end|>\n<|im_start|>user\nWhat is the Rust programming language?\n<|im_end|>\n<|im_start|>assistant\n";
 
     let mut prompt_tokens = encode_piece(tokenizer, SYSTEM_PREFIX)?;
     prompt_tokens.extend_from_slice(system_tokens);

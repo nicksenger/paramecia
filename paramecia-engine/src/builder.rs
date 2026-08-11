@@ -1,12 +1,12 @@
 //! Builder for ModelEngine — consolidates model loading logic.
 
 use crate::executor::{ModelEngine, ModelEngineInner};
-use crate::model_actor::{spawn_model_actor, TrainingConfig};
+use crate::model_actor::{TrainingConfig, spawn_model_actor};
 use crate::types::Error;
 
 use paramecia_model::{
-    select_best_device, Device, DeviceOffloadMode, KvCacheQuantization, LayerDeviceMap,
-    LogitsProcessor, ModelWeights, YarnConfig,
+    Device, DeviceOffloadMode, KvCacheQuantization, LayerDeviceMap, LogitsProcessor, ModelWeights,
+    YarnConfig, select_best_device,
 };
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -62,7 +62,7 @@ impl ModelEngineBuilder {
             tokenizer_path: None,
             device: None,
             cpu: false,
-            offload_mode: DeviceOffloadMode::ExpertsOnCpu,
+            offload_mode: DeviceOffloadMode::default(),
             kv_cache_quant: KvCacheQuantization::Q8_0,
             yarn_config: None,
             layer_split: None,
@@ -330,8 +330,11 @@ Use a tokenizer that matches the loaded model.",
                 .map_err(|e| Error::ModelError(format!("Failed to enable prefetch: {e}")))?;
         }
 
-        // Always capture expert indices (negligible overhead)
-        model.set_capture_expert_indices(true);
+        // A single synthetic expert represents dense FFNs, so capturing its
+        // all-zero route is not useful. More importantly, capture forces the
+        // slower stats path and copies per-layer indices back to the host on
+        // every token. Preserve routing metadata for actual MoE models only.
+        model.set_capture_expert_indices(model.num_experts() > 1);
 
         // Snapshot directory
         std::fs::create_dir_all(&self.snapshot_dir)
@@ -375,6 +378,7 @@ Use a tokenizer that matches the loaded model.",
             awaiting_commit: false,
             pending_logits: None,
             sampler,
+            seed: self.seed,
             top_k: self.top_k,
             tail_samples: self.tail_samples,
             repeat_penalty: self.repeat_penalty,

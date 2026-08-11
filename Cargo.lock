@@ -4994,6 +4994,7 @@ dependencies = [
  "paramecia-model",
  "paramecia-opt",
  "rand 0.9.2",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror 2.0.17",

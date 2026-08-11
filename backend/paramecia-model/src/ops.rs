@@ -19,6 +19,13 @@ pub fn depthwise_conv1d(input: &Tensor, weight: &Tensor) -> Result<Tensor> {
     paramecia_core::deltanet_ops::depthwise_conv1d(input, weight)
 }
 
+/// Fused SiLU gate and RMS normalization.
+///
+/// Inputs are `[rows, dim]`; the weight is `[dim]`.
+pub fn gated_rms_norm(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+    paramecia_core::deltanet_ops::gated_rms_norm(x, gate, weight, eps)
+}
+
 /// Top-k routing from already-softmaxed routing weights.
 ///
 /// Input: routing_weights [batch, seq_len, n_experts] (after softmax)

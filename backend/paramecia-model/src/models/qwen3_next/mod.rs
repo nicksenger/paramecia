@@ -539,11 +539,7 @@ impl LayerWeights {
     fn snapshot_cache(&mut self) -> Result<kv_cache::LayerSnapshot> {
         match &mut self.attn {
             AttentionLayer::Full(attn) => {
-                let len = attn
-                    .preallocated_cache
-                    .as_ref()
-                    .map(|c| c.seq_len)
-                    .unwrap_or(0);
+                let len = attn.cache_seq_len();
                 Ok(kv_cache::LayerSnapshot::FullAttention { seq_len: len })
             }
             AttentionLayer::Linear(attn) => {
@@ -559,9 +555,7 @@ impl LayerWeights {
     fn restore_cache(&mut self, snapshot: kv_cache::LayerSnapshot) {
         match (&mut self.attn, snapshot) {
             (AttentionLayer::Full(attn), kv_cache::LayerSnapshot::FullAttention { seq_len }) => {
-                if let Some(ref mut cache) = attn.preallocated_cache {
-                    cache.seq_len = seq_len;
-                }
+                attn.truncate_kv_cache(seq_len);
             }
             (AttentionLayer::Linear(attn), kv_cache::LayerSnapshot::LinearAttention) => {
                 attn.restore_state();
