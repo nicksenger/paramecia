@@ -2674,7 +2674,13 @@ impl ModelWeights {
 
         let linear_v_heads_tiled_order = architecture
             .as_deref()
-            .map(|a| a == "qwen35" || a == "qwen35moe" || a == "qwen38" || a == "qwen3_8")
+            .map(|a| {
+                a == "qwen35"
+                    || a == "qwen35moe"
+                    || a == "qwen38"
+                    || a == "qwen3_8"
+                    || a == "qwen3.8"
+            })
             .or_else(|| {
                 md_get_opt(&[
                     "qwen35moe.block_count",
