@@ -2131,20 +2131,19 @@ impl MoeExperts {
             .copied()
             .unwrap_or(64);
 
-        let cache = if cache_capacity == 0 {
-            None
-        } else if should_cache_experts(&gate_exps, &up_exps, &down_exps, compute_device) {
+        let should_enable_cache = cache_capacity > 0
+            && should_cache_experts(&gate_exps, &up_exps, &down_exps, compute_device);
+        let cache = if should_enable_cache {
             Some(ExpertCache::new(compute_device.clone(), cache_capacity))
         } else {
             None
         };
 
-        let training_cache =
-            if should_cache_experts(&gate_exps, &up_exps, &down_exps, compute_device) {
-                Some(ExpertCache::new(compute_device.clone(), cache_capacity))
-            } else {
-                None
-            };
+        let training_cache = if should_enable_cache {
+            Some(ExpertCache::new(compute_device.clone(), cache_capacity))
+        } else {
+            None
+        };
 
         // Create GPU hot cache if:
         // 1. We have a GPU device
