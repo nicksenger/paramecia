@@ -3046,7 +3046,7 @@ impl ModelWeights {
                 config.num_experts_per_tok,
                 config.dtype,
                 compute_device,
-                default_cache_capacity(config.num_experts_per_tok),
+                default_cache_capacity(config.num_experts, config.num_experts_per_tok),
                 layer_idx,
             );
         }
@@ -3063,7 +3063,7 @@ impl ModelWeights {
             &format!("{}.ffn_down_exps.weight", prefix),
             down_device,
         )?;
-        let cache_capacity = default_cache_capacity(config.num_experts_per_tok);
+        let cache_capacity = default_cache_capacity(config.num_experts, config.num_experts_per_tok);
 
         let gate = gg
             .typed_qmatmul::<paramecia_tensor::glowstick::Shape2<super::shape::E, super::shape::S>>(

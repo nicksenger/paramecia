@@ -2989,12 +2989,19 @@ impl SharedExpert {
     }
 }
 
-pub(super) fn default_cache_capacity(num_experts_per_tok: usize) -> usize {
+pub(super) fn default_cache_capacity(num_experts: usize, num_experts_per_tok: usize) -> usize {
     let env_override = std::env::var("QWEN3NEXT_MOE_CACHE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok());
     if let Some(value) = env_override {
         return value;
+    }
+
+    // Dense (single-expert) models should not cache by default.
+    // Caching that single "expert" keeps the entire FFN resident on GPU and
+    // defeats ExpertsOnCpu offload, causing large VRAM spikes.
+    if num_experts <= 1 {
+        return 0;
     }
 
     let scaled = num_experts_per_tok.saturating_mul(3);
@@ -3081,7 +3088,7 @@ impl MoeBlock {
             );
         }
         let cache_capacity = if cache_capacity == 0 {
-            default_cache_capacity(num_experts_per_tok)
+            default_cache_capacity(num_experts, num_experts_per_tok)
         } else {
             cache_capacity
         };
