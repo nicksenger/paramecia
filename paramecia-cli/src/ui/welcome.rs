@@ -26,6 +26,8 @@ const BUILD_FEATURE_NAME: &str = "qwen35_4b";
 const BUILD_FEATURE_NAME: &str = "qwen35_9b";
 #[cfg(feature = "qwen35_27b")]
 const BUILD_FEATURE_NAME: &str = "qwen35_27b";
+#[cfg(feature = "qwen38_27b")]
+const BUILD_FEATURE_NAME: &str = "qwen38_27b";
 #[cfg(not(any(
     feature = "qwen3next_80b_a3b",
     feature = "qwen35moe_35b_a3b",
@@ -35,7 +37,8 @@ const BUILD_FEATURE_NAME: &str = "qwen35_27b";
     feature = "qwen35_2b",
     feature = "qwen35_4b",
     feature = "qwen35_9b",
-    feature = "qwen35_27b"
+    feature = "qwen35_27b",
+    feature = "qwen38_27b"
 )))]
 const BUILD_FEATURE_NAME: &str = "qwen35_0p8b";
 
@@ -47,6 +50,7 @@ fn format_build_feature_name(feature_name: &str) -> String {
     let mut parts = feature_name.split('_');
     let family = match parts.next().unwrap_or_default() {
         "qwen35" => "Qwen 3.5".to_string(),
+        "qwen38" => "Qwen 3.8".to_string(),
         "qwen35moe" => "Qwen 3.5 MoE".to_string(),
         "qwen3next" => "Qwen 3 Next".to_string(),
         other => title_case_token(other),
@@ -294,6 +298,7 @@ mod tests {
         assert_eq!(format_build_feature_name("qwen35_2b"), "Qwen 3.5 2b");
         assert_eq!(format_build_feature_name("qwen35_9b"), "Qwen 3.5 9b");
         assert_eq!(format_build_feature_name("qwen35_0p8b"), "Qwen 3.5 0.8b");
+        assert_eq!(format_build_feature_name("qwen38_27b"), "Qwen 3.8 27b");
     }
 
     #[test]

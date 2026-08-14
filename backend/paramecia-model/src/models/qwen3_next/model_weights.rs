@@ -78,6 +78,8 @@ const MODEL_NODE_LABEL: &str = "Qwen3.5-4B";
 const MODEL_NODE_LABEL: &str = "Qwen3.5-9B";
 #[cfg(feature = "qwen35_27b")]
 const MODEL_NODE_LABEL: &str = "Qwen3.5-27B";
+#[cfg(feature = "qwen38_27b")]
+const MODEL_NODE_LABEL: &str = "Qwen3.8-27B";
 #[cfg(not(any(
     feature = "qwen3next_80b_a3b",
     feature = "qwen35moe_35b_a3b",
@@ -87,7 +89,8 @@ const MODEL_NODE_LABEL: &str = "Qwen3.5-27B";
     feature = "qwen35_2b",
     feature = "qwen35_4b",
     feature = "qwen35_9b",
-    feature = "qwen35_27b"
+    feature = "qwen35_27b",
+    feature = "qwen38_27b"
 )))]
 const MODEL_NODE_LABEL: &str = "Qwen3.5-0.8B";
 
@@ -2342,9 +2345,12 @@ impl ModelWeights {
 
         let num_attention_heads = md_get_any(&[
             "qwen35.attention.head_count",
+            "qwen38.attention.head_count",
             "qwen35moe.attention.head_count",
             "qwen3_5_moe.attention.head_count",
             "qwen3_5.attention.head_count",
+            "qwen3_8.attention.head_count",
+            "qwen3.attention.head_count",
             "qwen3next.attention.head_count",
             "qwen3moe.attention.head_count",
             "llama.attention.head_count",
@@ -2352,9 +2358,12 @@ impl ModelWeights {
         .to_u32()? as usize;
         let num_key_value_heads = md_get_any(&[
             "qwen35.attention.head_count_kv",
+            "qwen38.attention.head_count_kv",
             "qwen35moe.attention.head_count_kv",
             "qwen3_5_moe.attention.head_count_kv",
             "qwen3_5.attention.head_count_kv",
+            "qwen3_8.attention.head_count_kv",
+            "qwen3.attention.head_count_kv",
             "qwen3next.attention.head_count_kv",
             "qwen3moe.attention.head_count_kv",
             "llama.attention.head_count_kv",
@@ -2362,9 +2371,12 @@ impl ModelWeights {
         .to_u32()? as usize;
         let head_dim = md_get_any(&[
             "qwen35.attention.key_length",
+            "qwen38.attention.key_length",
             "qwen35moe.attention.key_length",
             "qwen3_5_moe.attention.key_length",
             "qwen3_5.attention.key_length",
+            "qwen3_8.attention.key_length",
+            "qwen3.attention.key_length",
             "qwen3next.attention.key_length",
             "qwen3moe.attention.key_length",
             "llama.attention.key_length",
@@ -2372,9 +2384,12 @@ impl ModelWeights {
         .to_u32()? as usize;
         let num_layers = md_get_any(&[
             "qwen35.block_count",
+            "qwen38.block_count",
             "qwen35moe.block_count",
             "qwen3_5_moe.block_count",
             "qwen3_5.block_count",
+            "qwen3_8.block_count",
+            "qwen3.block_count",
             "qwen3next.block_count",
             "qwen3moe.block_count",
             "llama.block_count",
@@ -2382,9 +2397,12 @@ impl ModelWeights {
         .to_u32()? as usize;
         let hidden_size = md_get_any(&[
             "qwen35.embedding_length",
+            "qwen38.embedding_length",
             "qwen35moe.embedding_length",
             "qwen3_5_moe.embedding_length",
             "qwen3_5.embedding_length",
+            "qwen3_8.embedding_length",
+            "qwen3.embedding_length",
             "qwen3next.embedding_length",
             "qwen3moe.embedding_length",
             "llama.embedding_length",
@@ -2392,9 +2410,12 @@ impl ModelWeights {
         .to_u32()? as usize;
         let max_position_embeddings = md_get_any(&[
             "qwen35.context_length",
+            "qwen38.context_length",
             "qwen35moe.context_length",
             "qwen3_5_moe.context_length",
             "qwen3_5.context_length",
+            "qwen3_8.context_length",
+            "qwen3.context_length",
             "qwen3next.context_length",
             "qwen3moe.context_length",
             "llama.context_length",
@@ -2402,9 +2423,12 @@ impl ModelWeights {
         .to_u32()? as usize;
         let rms_norm_eps = md_get_any(&[
             "qwen35.attention.layer_norm_rms_epsilon",
+            "qwen38.attention.layer_norm_rms_epsilon",
             "qwen35moe.attention.layer_norm_rms_epsilon",
             "qwen3_5_moe.attention.layer_norm_rms_epsilon",
             "qwen3_5.attention.layer_norm_rms_epsilon",
+            "qwen3_8.attention.layer_norm_rms_epsilon",
+            "qwen3.attention.layer_norm_rms_epsilon",
             "qwen3next.attention.layer_norm_rms_epsilon",
             "qwen3moe.attention.layer_norm_rms_epsilon",
             "llama.attention.layer_norm_rms_epsilon",
@@ -2412,9 +2436,12 @@ impl ModelWeights {
         .to_f32()? as f64;
         let rope_freq_base = md_get_any(&[
             "qwen35.rope.freq_base",
+            "qwen38.rope.freq_base",
             "qwen35moe.rope.freq_base",
             "qwen3_5_moe.rope.freq_base",
             "qwen3_5.rope.freq_base",
+            "qwen3_8.rope.freq_base",
+            "qwen3.rope.freq_base",
             "qwen3next.rope.freq_base",
             "qwen3moe.rope.freq_base",
             "llama.rope.freq_base",
@@ -2426,9 +2453,12 @@ impl ModelWeights {
         // The remaining dimensions pass through unchanged.
         let n_rot = md_get_opt(&[
             "qwen35.rope.dimension_count",
+            "qwen38.rope.dimension_count",
             "qwen35moe.rope.dimension_count",
             "qwen3_5_moe.rope.dimension_count",
             "qwen3_5.rope.dimension_count",
+            "qwen3_8.rope.dimension_count",
+            "qwen3.rope.dimension_count",
             "qwen3next.rope.dimension_count",
             "qwen3moe.rope.dimension_count",
             "llama.rope.dimension_count",
@@ -2439,9 +2469,12 @@ impl ModelWeights {
 
         let rope_dimension_sections = md_get_opt(&[
             "qwen35.rope.dimension_sections",
+            "qwen38.rope.dimension_sections",
             "qwen35moe.rope.dimension_sections",
             "qwen3_5_moe.rope.dimension_sections",
             "qwen3_5.rope.dimension_sections",
+            "qwen3_8.rope.dimension_sections",
+            "qwen3.rope.dimension_sections",
             "qwen3next.rope.dimension_sections",
             "qwen3moe.rope.dimension_sections",
             "llama.rope.dimension_sections",
@@ -2465,9 +2498,12 @@ impl ModelWeights {
 
         let rope_interleaved = md_get_opt(&[
             "qwen35.rope.interleaved",
+            "qwen38.rope.interleaved",
             "qwen35moe.rope.interleaved",
             "qwen3_5_moe.rope.interleaved",
             "qwen3_5.rope.interleaved",
+            "qwen3_8.rope.interleaved",
+            "qwen3.rope.interleaved",
             "qwen3next.rope.interleaved",
             "qwen3moe.rope.interleaved",
             "llama.rope.interleaved",
@@ -2496,43 +2532,72 @@ impl ModelWeights {
         let architecture = md_get_opt(&["general.architecture"])
             .and_then(|v| v.to_string().ok())
             .map(|s| s.to_ascii_lowercase());
-        let dense_qwen35 = matches!(
+        let dense_qwen_family = matches!(
             architecture.as_deref(),
-            Some("qwen35") | Some("qwen3_5") | Some("qwen3.5")
+            Some("qwen35")
+                | Some("qwen3_5")
+                | Some("qwen3.5")
+                | Some("qwen38")
+                | Some("qwen3_8")
+                | Some("qwen3.8")
+                | Some("qwen3")
         );
+        let has_moe_experts = gg.ct.tensor_infos.iter().any(|(name, _)| {
+            name.ends_with(".ffn_gate_exps.weight")
+                || name.ends_with(".ffn_up_exps.weight")
+                || name.ends_with(".ffn_down_exps.weight")
+        });
 
         let num_experts = md_get_opt(&[
             "qwen35.expert_count",
+            "qwen38.expert_count",
             "qwen35moe.expert_count",
             "qwen3_5_moe.expert_count",
             "qwen3_5.expert_count",
+            "qwen3_8.expert_count",
+            "qwen3.expert_count",
             "qwen3next.expert_count",
             "qwen3moe.expert_count",
         ])
         .and_then(|v| v.to_u32().ok())
         .map(|v| v as usize)
-        .unwrap_or_else(|| if dense_qwen35 { 1 } else { 256 });
+        .unwrap_or_else(|| {
+            if dense_qwen_family || !has_moe_experts {
+                1
+            } else {
+                256
+            }
+        });
         let num_experts_per_tok = md_get_opt(&[
             "qwen35.expert_used_count",
+            "qwen38.expert_used_count",
             "qwen35moe.expert_used_count",
             "qwen3_5_moe.expert_used_count",
             "qwen3_5.expert_used_count",
+            "qwen3_8.expert_used_count",
+            "qwen3.expert_used_count",
             "qwen3next.expert_used_count",
             "qwen3moe.expert_used_count",
         ])
         .and_then(|v| v.to_u32().ok())
         .map(|v| v as usize)
-        .unwrap_or_else(|| if dense_qwen35 { 1 } else { 8 });
+        .unwrap_or_else(|| if num_experts == 1 { 1 } else { 8 });
 
         let ssm_d_inner = md_get_opt(&[
             "qwen35.ssm.inner_size",
             "qwen35.ssm.d_inner",
+            "qwen38.ssm.inner_size",
+            "qwen38.ssm.d_inner",
             "qwen35moe.ssm.inner_size",
             "qwen35moe.ssm.d_inner",
             "qwen3_5_moe.ssm.inner_size",
             "qwen3_5_moe.ssm.d_inner",
             "qwen3_5.ssm.inner_size",
             "qwen3_5.ssm.d_inner",
+            "qwen3_8.ssm.inner_size",
+            "qwen3_8.ssm.d_inner",
+            "qwen3.ssm.inner_size",
+            "qwen3.ssm.d_inner",
             "qwen3next.ssm.inner_size",
             "qwen3next.ssm.d_inner",
             "qwen3moe.ssm.inner_size",
@@ -2543,12 +2608,18 @@ impl ModelWeights {
         let ssm_d_state = md_get_opt(&[
             "qwen35.ssm.state_size",
             "qwen35.ssm.d_state",
+            "qwen38.ssm.state_size",
+            "qwen38.ssm.d_state",
             "qwen35moe.ssm.state_size",
             "qwen35moe.ssm.d_state",
             "qwen3_5_moe.ssm.state_size",
             "qwen3_5_moe.ssm.d_state",
             "qwen3_5.ssm.state_size",
             "qwen3_5.ssm.d_state",
+            "qwen3_8.ssm.state_size",
+            "qwen3_8.ssm.d_state",
+            "qwen3.ssm.state_size",
+            "qwen3.ssm.d_state",
             "qwen3next.ssm.state_size",
             "qwen3next.ssm.d_state",
             "qwen3moe.ssm.state_size",
@@ -2559,12 +2630,18 @@ impl ModelWeights {
         let ssm_n_groups = md_get_opt(&[
             "qwen35.ssm.group_count",
             "qwen35.ssm.n_groups",
+            "qwen38.ssm.group_count",
+            "qwen38.ssm.n_groups",
             "qwen35moe.ssm.group_count",
             "qwen35moe.ssm.n_groups",
             "qwen3_5_moe.ssm.group_count",
             "qwen3_5_moe.ssm.n_groups",
             "qwen3_5.ssm.group_count",
             "qwen3_5.ssm.n_groups",
+            "qwen3_8.ssm.group_count",
+            "qwen3_8.ssm.n_groups",
+            "qwen3.ssm.group_count",
+            "qwen3.ssm.n_groups",
             "qwen3next.ssm.group_count",
             "qwen3next.ssm.n_groups",
             "qwen3moe.ssm.group_count",
@@ -2575,12 +2652,18 @@ impl ModelWeights {
         let ssm_dt_rank = md_get_opt(&[
             "qwen35.ssm.time_step_rank",
             "qwen35.ssm.dt_rank",
+            "qwen38.ssm.time_step_rank",
+            "qwen38.ssm.dt_rank",
             "qwen35moe.ssm.time_step_rank",
             "qwen35moe.ssm.dt_rank",
             "qwen3_5_moe.ssm.time_step_rank",
             "qwen3_5_moe.ssm.dt_rank",
             "qwen3_5.ssm.time_step_rank",
             "qwen3_5.ssm.dt_rank",
+            "qwen3_8.ssm.time_step_rank",
+            "qwen3_8.ssm.dt_rank",
+            "qwen3.ssm.time_step_rank",
+            "qwen3.ssm.dt_rank",
             "qwen3next.ssm.time_step_rank",
             "qwen3next.ssm.dt_rank",
             "qwen3moe.ssm.time_step_rank",
@@ -2591,10 +2674,23 @@ impl ModelWeights {
 
         let linear_v_heads_tiled_order = architecture
             .as_deref()
-            .map(|a| a == "qwen35" || a == "qwen35moe")
+            .map(|a| a == "qwen35" || a == "qwen35moe" || a == "qwen38" || a == "qwen3_8")
             .or_else(|| {
-                md_get_opt(&["qwen35moe.block_count", "qwen3_5_moe.block_count"])
-                    .or_else(|| md_get_opt(&["qwen35.block_count", "qwen3_5.block_count"]))
+                md_get_opt(&[
+                    "qwen35moe.block_count",
+                    "qwen3_5_moe.block_count",
+                    "qwen38.block_count",
+                    "qwen3_8.block_count",
+                ])
+                .or_else(|| {
+                    md_get_opt(&[
+                        "qwen35.block_count",
+                        "qwen3_5.block_count",
+                        "qwen38.block_count",
+                        "qwen3_8.block_count",
+                        "qwen3.block_count",
+                    ])
+                })
                     .map(|_| true)
             })
             .unwrap_or(false);
@@ -2604,9 +2700,12 @@ impl ModelWeights {
             .map(|i| {
                 md_get_opt(&[
                     &format!("qwen35.layer.{}.is_recurrent", i),
+                    &format!("qwen38.layer.{}.is_recurrent", i),
                     &format!("qwen35moe.layer.{}.is_recurrent", i),
                     &format!("qwen3_5_moe.layer.{}.is_recurrent", i),
                     &format!("qwen3_5.layer.{}.is_recurrent", i),
+                    &format!("qwen3_8.layer.{}.is_recurrent", i),
+                    &format!("qwen3.layer.{}.is_recurrent", i),
                     &format!("qwen3next.layer.{}.is_recurrent", i),
                     &format!("qwen3moe.layer.{}.is_recurrent", i),
                 ])
@@ -2659,9 +2758,12 @@ impl ModelWeights {
 
         let scaling_type = md_get_any(&[
             "qwen35.rope.scaling.type",
+            "qwen38.rope.scaling.type",
             "qwen35moe.rope.scaling.type",
             "qwen3_5_moe.rope.scaling.type",
             "qwen3_5.rope.scaling.type",
+            "qwen3_8.rope.scaling.type",
+            "qwen3.rope.scaling.type",
             "qwen3next.rope.scaling.type",
             "qwen3moe.rope.scaling.type",
             "llama.rope.scaling.type",
@@ -2670,16 +2772,22 @@ impl ModelWeights {
 
         let scale_factor = md_get_any(&[
             "qwen35.rope.scaling.factor",
+            "qwen38.rope.scaling.factor",
             "qwen35moe.rope.scaling.factor",
             "qwen3_5_moe.rope.scaling.factor",
             "qwen3_5.rope.scaling.factor",
+            "qwen3_8.rope.scaling.factor",
+            "qwen3.rope.scaling.factor",
             "qwen3next.rope.scaling.factor",
             "qwen3moe.rope.scaling.factor",
             "llama.rope.scaling.factor",
             "qwen35.rope.scale_linear",
+            "qwen38.rope.scale_linear",
             "qwen35moe.rope.scale_linear",
             "qwen3_5_moe.rope.scale_linear",
             "qwen3_5.rope.scale_linear",
+            "qwen3_8.rope.scale_linear",
+            "qwen3.rope.scale_linear",
             "qwen3next.rope.scale_linear",
             "llama.rope.scale_linear",
         ])
@@ -2687,9 +2795,12 @@ impl ModelWeights {
 
         let original_context = md_get_any(&[
             "qwen35.rope.scaling.original_context_length",
+            "qwen38.rope.scaling.original_context_length",
             "qwen35moe.rope.scaling.original_context_length",
             "qwen3_5_moe.rope.scaling.original_context_length",
             "qwen3_5.rope.scaling.original_context_length",
+            "qwen3_8.rope.scaling.original_context_length",
+            "qwen3.rope.scaling.original_context_length",
             "qwen3next.rope.scaling.original_context_length",
             "qwen3moe.rope.scaling.original_context_length",
             "llama.rope.scaling.original_context_length",
@@ -2699,9 +2810,12 @@ impl ModelWeights {
 
         let beta_fast = md_get_any(&[
             "qwen35.rope.scaling.yarn.beta_fast",
+            "qwen38.rope.scaling.yarn.beta_fast",
             "qwen35moe.rope.scaling.yarn.beta_fast",
             "qwen3_5_moe.rope.scaling.yarn.beta_fast",
             "qwen3_5.rope.scaling.yarn.beta_fast",
+            "qwen3_8.rope.scaling.yarn.beta_fast",
+            "qwen3.rope.scaling.yarn.beta_fast",
             "qwen3next.rope.scaling.yarn.beta_fast",
             "llama.rope.scaling.yarn.beta_fast",
         ])
@@ -2710,9 +2824,12 @@ impl ModelWeights {
 
         let beta_slow = md_get_any(&[
             "qwen35.rope.scaling.yarn.beta_slow",
+            "qwen38.rope.scaling.yarn.beta_slow",
             "qwen35moe.rope.scaling.yarn.beta_slow",
             "qwen3_5_moe.rope.scaling.yarn.beta_slow",
             "qwen3_5.rope.scaling.yarn.beta_slow",
+            "qwen3_8.rope.scaling.yarn.beta_slow",
+            "qwen3.rope.scaling.yarn.beta_slow",
             "qwen3next.rope.scaling.yarn.beta_slow",
             "llama.rope.scaling.yarn.beta_slow",
         ])
@@ -2721,9 +2838,12 @@ impl ModelWeights {
 
         let attn_factor = md_get_any(&[
             "qwen35.rope.scaling.yarn.attn_factor",
+            "qwen38.rope.scaling.yarn.attn_factor",
             "qwen35moe.rope.scaling.yarn.attn_factor",
             "qwen3_5_moe.rope.scaling.yarn.attn_factor",
             "qwen3_5.rope.scaling.yarn.attn_factor",
+            "qwen3_8.rope.scaling.yarn.attn_factor",
+            "qwen3.rope.scaling.yarn.attn_factor",
             "qwen3next.rope.scaling.yarn.attn_factor",
             "llama.rope.scaling.yarn.attn_factor",
         ])

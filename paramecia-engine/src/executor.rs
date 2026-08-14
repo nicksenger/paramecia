@@ -4,13 +4,13 @@
 //! `ModelEngine` is a cheap, cloneable handle that forwards async calls
 //! to `ModelEngineInner` running on a dedicated OS thread via channels.
 
-use crate::distribution::{Distribution, logits_slice_to_distribution, logits_to_distribution};
+use crate::distribution::{logits_slice_to_distribution, logits_to_distribution, Distribution};
 use crate::model_actor::{ModelActorHandle, ModelCommand};
 use crate::types::*;
 
 use paramecia_model::{
-    DType, GraftComposite, GraftCompositeOptions, GraftLayerSource, LogitsProcessor, ModelWeights,
-    PrefixCache, Tensor, apply_penalties, apply_penalties_slice,
+    apply_penalties, apply_penalties_slice, DType, GraftComposite, GraftCompositeOptions,
+    GraftLayerSource, LogitsProcessor, ModelWeights, PrefixCache, Tensor,
 };
 use rayon::prelude::*;
 use std::collections::{HashMap, VecDeque};
@@ -2197,8 +2197,11 @@ pub fn describe_model(path: &Path) -> Result<ModelDescription, Error> {
     let n_layers = md
         .get("qwen35moe.block_count")
         .or_else(|| md.get("qwen35.block_count"))
+        .or_else(|| md.get("qwen38.block_count"))
         .or_else(|| md.get("qwen3_5_moe.block_count"))
         .or_else(|| md.get("qwen3_5.block_count"))
+        .or_else(|| md.get("qwen3_8.block_count"))
+        .or_else(|| md.get("qwen3.block_count"))
         .or_else(|| md.get("qwen3next.block_count"))
         .or_else(|| md.get("qwen3moe.block_count"))
         .or_else(|| md.get("llama.block_count"))
@@ -2208,8 +2211,11 @@ pub fn describe_model(path: &Path) -> Result<ModelDescription, Error> {
     let n_experts_metadata = md
         .get("qwen35moe.expert_count")
         .or_else(|| md.get("qwen35.expert_count"))
+        .or_else(|| md.get("qwen38.expert_count"))
         .or_else(|| md.get("qwen3_5_moe.expert_count"))
         .or_else(|| md.get("qwen3_5.expert_count"))
+        .or_else(|| md.get("qwen3_8.expert_count"))
+        .or_else(|| md.get("qwen3.expert_count"))
         .or_else(|| md.get("qwen3next.expert_count"))
         .or_else(|| md.get("qwen3moe.expert_count"))
         .and_then(|v| v.to_u32().ok())
@@ -2218,8 +2224,11 @@ pub fn describe_model(path: &Path) -> Result<ModelDescription, Error> {
     let n_experts_per_tok = md
         .get("qwen35moe.expert_used_count")
         .or_else(|| md.get("qwen35.expert_used_count"))
+        .or_else(|| md.get("qwen38.expert_used_count"))
         .or_else(|| md.get("qwen3_5_moe.expert_used_count"))
         .or_else(|| md.get("qwen3_5.expert_used_count"))
+        .or_else(|| md.get("qwen3_8.expert_used_count"))
+        .or_else(|| md.get("qwen3.expert_used_count"))
         .or_else(|| md.get("qwen3next.expert_used_count"))
         .or_else(|| md.get("qwen3moe.expert_used_count"))
         .and_then(|v| v.to_u32().ok())

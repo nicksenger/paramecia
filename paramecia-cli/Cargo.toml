@@ -110,3 +110,9 @@ qwen35_27b = [
     "paramecia-host/qwen35_27b",
     "paramecia-harness/qwen35_27b",
 ]
+qwen38_27b = [
+    "paramecia-text/qwen38_27b",
+    "paramecia-engine/qwen38_27b",
+    "paramecia-host/qwen38_27b",
+    "paramecia-harness/qwen38_27b",
+]

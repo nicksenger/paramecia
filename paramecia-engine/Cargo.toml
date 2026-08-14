@@ -69,3 +69,7 @@ qwen35_27b = [
     "paramecia-model/qwen35_27b",
     "paramecia-opt/qwen35_27b",
 ]
+qwen38_27b = [
+    "paramecia-model/qwen38_27b",
+    "paramecia-opt/qwen38_27b",
+]

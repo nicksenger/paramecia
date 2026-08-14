@@ -155,6 +155,21 @@ mod arch_cfg {
     pub type SI = U17408;
 }
 
+#[cfg(feature = "qwen38_27b")]
+mod arch_cfg {
+    use super::*;
+    pub type V = U248320;
+    pub type A = U24;
+    pub type K = U4;
+    pub type S = U5120;
+    pub type I = U17408;
+    pub type DInner = U6144;
+    pub type DtRank = U48;
+    pub type E = U1;
+    pub type TopK = U1;
+    pub type SI = U17408;
+}
+
 #[cfg(feature = "qwen35_0p8b")]
 mod arch_cfg {
     use super::*;
@@ -179,7 +194,8 @@ mod arch_cfg {
     feature = "qwen35_2b",
     feature = "qwen35_4b",
     feature = "qwen35_9b",
-    feature = "qwen35_27b"
+    feature = "qwen35_27b",
+    feature = "qwen38_27b"
 )))]
 mod arch_cfg {
     use super::*;

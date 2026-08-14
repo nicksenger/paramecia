@@ -125,6 +125,7 @@ impl Default for DeviceOffloadMode {
             feature = "qwen35_4b",
             feature = "qwen35_9b",
             feature = "qwen35_27b",
+            feature = "qwen38_27b",
         )));
         if cfg!(feature = "qwen35_0p8b") || default_architecture_is_0p8b {
             Self::FullGpu

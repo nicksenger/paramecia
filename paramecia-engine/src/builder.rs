@@ -1,12 +1,12 @@
 //! Builder for ModelEngine — consolidates model loading logic.
 
 use crate::executor::{ModelEngine, ModelEngineInner};
-use crate::model_actor::{TrainingConfig, spawn_model_actor};
+use crate::model_actor::{spawn_model_actor, TrainingConfig};
 use crate::types::Error;
 
 use paramecia_model::{
-    Device, DeviceOffloadMode, KvCacheQuantization, LayerDeviceMap, LogitsProcessor, ModelWeights,
-    YarnConfig, select_best_device,
+    select_best_device, Device, DeviceOffloadMode, KvCacheQuantization, LayerDeviceMap,
+    LogitsProcessor, ModelWeights, YarnConfig,
 };
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -456,8 +456,11 @@ fn read_num_layers(model_path: &PathBuf) -> Result<usize, Error> {
     let md = &ct.metadata;
     md.get("qwen35moe.block_count")
         .or_else(|| md.get("qwen35.block_count"))
+        .or_else(|| md.get("qwen38.block_count"))
         .or_else(|| md.get("qwen3_5_moe.block_count"))
         .or_else(|| md.get("qwen3_5.block_count"))
+        .or_else(|| md.get("qwen3_8.block_count"))
+        .or_else(|| md.get("qwen3.block_count"))
         .or_else(|| md.get("qwen3next.block_count"))
         .or_else(|| md.get("qwen3moe.block_count"))
         .or_else(|| md.get("llama.block_count"))

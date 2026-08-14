@@ -55,6 +55,9 @@ qwen35_9b = [
 qwen35_27b = [
     "paramecia-engine/qwen35_27b",
 ]
+qwen38_27b = [
+    "paramecia-engine/qwen38_27b",
+]
 
 [build-dependencies]
 paramecia-wit = { path = "../paramecia-wit" }
