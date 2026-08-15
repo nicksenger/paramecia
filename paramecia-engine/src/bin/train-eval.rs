@@ -1,8 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use paramecia_engine::{
-    Device, DeviceOffloadMode, KvCacheQuantization, ModelEngineBuilder, ModelInput,
-    TokenOutputStream, TrainingConfig,
+    Device, DeviceOffloadMode, ErrorFeedbackMode, ErrorFeedbackParams, HyperParameterUpdate,
+    KvCacheQuantization, ModelEngineBuilder, ModelInput, ReplayParams, TokenOutputStream,
+    TrainingConfig,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -31,6 +32,23 @@ enum OffloadArg {
     Experts,
     Down,
     Updown,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ErrorFeedbackArg {
+    None,
+    Persistent,
+    Replay,
+}
+
+impl ErrorFeedbackArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Persistent => "persistent",
+            Self::Replay => "replay",
+        }
+    }
 }
 
 impl OffloadArg {
@@ -140,11 +158,28 @@ struct Args {
     /// Generate one perturbation tensor at a time to bound peak host memory.
     #[arg(long)]
     lazy_perturbations: bool,
+
+    /// QuZO quantization-error feedback mode.
+    #[arg(long, value_enum, default_value_t = ErrorFeedbackArg::None)]
+    error_feedback: ErrorFeedbackArg,
+
+    /// Temporal decay for persistent or replay error residuals.
+    #[arg(long, default_value_t = 0.9)]
+    error_decay: f64,
+
+    /// Influence of accumulated error residuals on quantization.
+    #[arg(long, default_value_t = 1.0)]
+    error_gain: f64,
+
+    /// Number of prior updates reconstructed by replay error feedback.
+    #[arg(long, default_value_t = 8)]
+    error_replay_steps: u32,
 }
 
 #[derive(Debug, Serialize)]
 struct TrainEvalOutput {
     batch_size: usize,
+    error_feedback: &'static str,
     perturb_up_seconds: Option<f64>,
     perturb_down_seconds: Option<f64>,
     optimization_seconds: Option<f64>,
@@ -170,6 +205,15 @@ async fn run(args: Args) -> Result<()> {
     }
     if args.batch_size == 0 {
         bail!("--batch-size must be greater than 0");
+    }
+    if !(0.0..=1.0).contains(&args.error_decay) {
+        bail!("--error-decay must be between 0 and 1");
+    }
+    if !(0.0..=1.0).contains(&args.error_gain) {
+        bail!("--error-gain must be between 0 and 1");
+    }
+    if matches!(args.error_feedback, ErrorFeedbackArg::Replay) && args.error_replay_steps == 0 {
+        bail!("--error-replay-steps must be greater than 0 in replay mode");
     }
 
     let mut builder = ModelEngineBuilder::new(&args.model_path)
@@ -212,6 +256,8 @@ async fn run(args: Args) -> Result<()> {
     let engine = builder
         .build_for_training()
         .map_err(|e| anyhow!("failed to build model engine for training: {e}"))?;
+
+    configure_error_feedback(&engine, &args).await?;
 
     let (perturb_up_seconds, perturb_down_seconds, optimization_seconds) =
         run_training_phases(&engine, &args).await?;
@@ -289,6 +335,7 @@ async fn run(args: Args) -> Result<()> {
         .elapsed();
     let output = TrainEvalOutput {
         batch_size: args.batch_size,
+        error_feedback: args.error_feedback.as_str(),
         perturb_up_seconds,
         perturb_down_seconds,
         optimization_seconds,
@@ -305,6 +352,32 @@ async fn run(args: Args) -> Result<()> {
 
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+async fn configure_error_feedback(
+    engine: &paramecia_engine::ModelEngine,
+    args: &Args,
+) -> Result<()> {
+    let error_feedback = match args.error_feedback {
+        ErrorFeedbackArg::None => return Ok(()),
+        ErrorFeedbackArg::Persistent => ErrorFeedbackMode::Persistent(ErrorFeedbackParams {
+            decay: args.error_decay,
+            gain: args.error_gain,
+        }),
+        ErrorFeedbackArg::Replay => ErrorFeedbackMode::Replay(ReplayParams {
+            steps: args.error_replay_steps,
+            decay: args.error_decay,
+            gain: args.error_gain,
+        }),
+    };
+
+    engine
+        .set_hyper_parameters(HyperParameterUpdate {
+            error_feedback: Some(error_feedback),
+            ..HyperParameterUpdate::default()
+        })
+        .await
+        .map_err(|e| anyhow!("failed to configure error feedback: {e}"))
 }
 
 async fn run_training_phases(
@@ -447,6 +520,12 @@ mod tests {
             "1.5",
             "--loss-down",
             "0.5",
+            "--error-feedback",
+            "persistent",
+            "--error-decay",
+            "0.8",
+            "--error-gain",
+            "0.75",
         ])
         .expect("training phase arguments should parse");
 
@@ -457,5 +536,25 @@ mod tests {
         assert_eq!(args.optimize_tensors, "qk");
         assert_eq!(args.loss_up, 1.5);
         assert_eq!(args.loss_down, 0.5);
+        assert!(matches!(args.error_feedback, ErrorFeedbackArg::Persistent));
+        assert_eq!(args.error_decay, 0.8);
+        assert_eq!(args.error_gain, 0.75);
+    }
+
+    #[test]
+    fn replay_error_feedback_flags_parse() {
+        let args = Args::try_parse_from([
+            "train-eval",
+            "--model-path",
+            "model.gguf",
+            "--error-feedback",
+            "replay",
+            "--error-replay-steps",
+            "4",
+        ])
+        .expect("replay error feedback arguments should parse");
+
+        assert!(matches!(args.error_feedback, ErrorFeedbackArg::Replay));
+        assert_eq!(args.error_replay_steps, 4);
     }
 }
