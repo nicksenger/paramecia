@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use paramecia_engine::{
     Device, DeviceOffloadMode, KvCacheQuantization, ModelEngineBuilder, ModelInput,
-    TokenOutputStream,
+    TokenOutputStream, TrainingConfig,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -104,11 +104,50 @@ struct Args {
     /// RNG seed.
     #[arg(long, default_value_t = 299_792_458)]
     seed: u64,
+
+    /// Apply the positive QuZO perturbation before evaluation.
+    #[arg(long)]
+    perturb_up: bool,
+
+    /// Apply positive then negative QuZO perturbations before evaluation.
+    #[arg(long)]
+    perturb_down: bool,
+
+    /// Run a complete QuZO perturb-up, perturb-down, and update cycle before evaluation.
+    #[arg(long)]
+    opt: bool,
+
+    /// Loss at the positive perturbation, used by --opt.
+    #[arg(long, default_value_t = 1.0)]
+    loss_up: f32,
+
+    /// Loss at the negative perturbation, used by --opt.
+    #[arg(long, default_value_t = 0.0)]
+    loss_down: f32,
+
+    /// QuZO learning rate.
+    #[arg(long, default_value_t = 0.0001)]
+    learning_rate: f64,
+
+    /// QuZO perturbation epsilon.
+    #[arg(long, default_value_t = 0.001)]
+    epsilon: f64,
+
+    /// Tensors to optimize (all, attention, or qk).
+    #[arg(long, default_value = "all")]
+    optimize_tensors: String,
+
+    /// Generate one perturbation tensor at a time to bound peak host memory.
+    #[arg(long)]
+    lazy_perturbations: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct TrainEvalOutput {
     batch_size: usize,
+    perturb_up_seconds: Option<f64>,
+    perturb_down_seconds: Option<f64>,
+    optimization_seconds: Option<f64>,
     prefill_tokens_per_second: f64,
     generation_tokens_per_second: f64,
     generated_text: Vec<String>,
@@ -139,7 +178,14 @@ async fn run(args: Args) -> Result<()> {
         .temperature(args.temperature)
         .top_k(args.top_k)
         .tail_samples(args.tail_samples)
-        .seed(args.seed);
+        .seed(args.seed)
+        .training_config(TrainingConfig {
+            lr: args.learning_rate,
+            epsilon: args.epsilon,
+            optimize_tensors: args.optimize_tensors.clone(),
+            lazy_perturbations: args.lazy_perturbations,
+            ..TrainingConfig::default()
+        });
 
     if let Some(top_p) = args.top_p {
         builder = builder.top_p(top_p);
@@ -166,6 +212,9 @@ async fn run(args: Args) -> Result<()> {
     let engine = builder
         .build_for_training()
         .map_err(|e| anyhow!("failed to build model engine for training: {e}"))?;
+
+    let (perturb_up_seconds, perturb_down_seconds, optimization_seconds) =
+        run_training_phases(&engine, &args).await?;
 
     let tokenizer = engine.tokenizer().clone();
     let system_tokens = select_system_prompt_tokens(&tokenizer, args.prefill_system_tokens)?;
@@ -240,6 +289,9 @@ async fn run(args: Args) -> Result<()> {
         .elapsed();
     let output = TrainEvalOutput {
         batch_size: args.batch_size,
+        perturb_up_seconds,
+        perturb_down_seconds,
+        optimization_seconds,
         prefill_tokens_per_second: tokens_per_second(
             prompt_tokens.len() * args.batch_size,
             prefill_elapsed,
@@ -253,6 +305,53 @@ async fn run(args: Args) -> Result<()> {
 
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+async fn run_training_phases(
+    engine: &paramecia_engine::ModelEngine,
+    args: &Args,
+) -> Result<(Option<f64>, Option<f64>, Option<f64>)> {
+    let run_up = args.perturb_up || args.perturb_down || args.opt;
+    let run_down = args.perturb_down || args.opt;
+
+    let perturb_up_seconds = if run_up {
+        let start = Instant::now();
+        engine
+            .perturb_up(Some(args.seed))
+            .await
+            .map_err(|e| anyhow!("positive perturbation failed: {e}"))?;
+        Some(start.elapsed().as_secs_f64())
+    } else {
+        None
+    };
+
+    let perturb_down_seconds = if run_down {
+        let start = Instant::now();
+        engine
+            .perturb_down()
+            .await
+            .map_err(|e| anyhow!("negative perturbation failed: {e}"))?;
+        Some(start.elapsed().as_secs_f64())
+    } else {
+        None
+    };
+
+    let optimization_seconds = if args.opt {
+        let start = Instant::now();
+        engine
+            .update(args.loss_up, args.loss_down)
+            .await
+            .map_err(|e| anyhow!("optimization update failed: {e}"))?;
+        Some(start.elapsed().as_secs_f64())
+    } else {
+        None
+    };
+
+    Ok((
+        perturb_up_seconds,
+        perturb_down_seconds,
+        optimization_seconds,
+    ))
 }
 
 fn select_system_prompt_tokens(
@@ -328,5 +427,35 @@ mod tests {
         ])
         .expect("configured arguments should parse");
         assert_eq!(configured_args.batch_size, 2);
+    }
+
+    #[test]
+    fn training_phase_flags_parse_with_large_model_options() {
+        let args = Args::try_parse_from([
+            "train-eval",
+            "--model-path",
+            "model.gguf",
+            "--opt",
+            "--lazy-perturbations",
+            "--learning-rate",
+            "0.0002",
+            "--epsilon",
+            "0.002",
+            "--optimize-tensors",
+            "qk",
+            "--loss-up",
+            "1.5",
+            "--loss-down",
+            "0.5",
+        ])
+        .expect("training phase arguments should parse");
+
+        assert!(args.opt);
+        assert!(args.lazy_perturbations);
+        assert_eq!(args.learning_rate, 0.0002);
+        assert_eq!(args.epsilon, 0.002);
+        assert_eq!(args.optimize_tensors, "qk");
+        assert_eq!(args.loss_up, 1.5);
+        assert_eq!(args.loss_down, 0.5);
     }
 }

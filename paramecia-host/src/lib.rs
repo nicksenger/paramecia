@@ -267,6 +267,7 @@ pub fn run_host_cli(options: HostOptions) -> Result<()> {
             lr: options.training_lr,
             epsilon: options.training_epsilon,
             optimize_tensors: options.optimize_tensors.clone(),
+            lazy_perturbations: false,
             mtp_speculation_depth: options.n_speculative_training,
             mtp_decay_factor: 0.5,
             checkpoint_dir: checkpoint_dir.clone(),
