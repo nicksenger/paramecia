@@ -735,7 +735,6 @@ extern "C" __global__ void delta_net_autoregressive_step_f32(
     float* s_v = shared + 2 * head_dim;            // [head_dim]
     float* s_kv_mem = shared + 3 * head_dim;       // [head_dim]
     float* s_delta = shared + 4 * head_dim;        // [head_dim]
-    float* s_out = shared + 5 * head_dim;          // [head_dim]
     
     const size_t qkv_offset = b * num_heads * head_dim + h * head_dim;
     const size_t gate_offset = b * num_heads + h;
@@ -801,23 +800,27 @@ extern "C" __global__ void delta_net_autoregressive_step_f32(
     float g = expf(gate[gate_offset]);       // exp(gate) for decay
     float beta_sig = 1.0f / (1.0f + expf(-beta[gate_offset]));  // sigmoid(beta)
     
-    // Step 1: Decay state FIRST (matching llama.cpp reference)
-    // new_state = state * g
-    for (size_t i = tid; i < head_dim; i += blockDim.x) {
-        for (size_t j = 0; j < head_dim; ++j) {
-            new_state[state_offset + i * head_dim + j] = state[state_offset + i * head_dim + j] * g;
-        }
+    // Step 1: Decay state FIRST (matching llama.cpp reference).
+    // Walk the matrix linearly so adjacent threads access adjacent elements.
+    // The old row-per-thread traversal made every warp issue strided 512-byte
+    // accesses for the common head_dim=128 case.
+    const size_t state_size = head_dim * head_dim;
+    for (size_t idx = tid; idx < state_size; idx += blockDim.x) {
+        new_state[state_offset + idx] = state[state_offset + idx] * g;
     }
     __syncthreads();
     
     // Step 2: Compute kv_mem from DECAYED state (no extra g!)
     // kv_mem[i] = sum_j(decayed_state[i, j] * k[j])
-    for (size_t i = tid; i < head_dim; i += blockDim.x) {
+    // Assign one warp per row so state reads are coalesced and the dot product
+    // is reduced with warp shuffles instead of running serially in one thread.
+    for (size_t i = warp_id; i < head_dim; i += num_warps) {
         float acc = 0.0f;
-        for (size_t j = 0; j < head_dim; ++j) {
+        for (size_t j = lane; j < head_dim; j += WARP_SIZE) {
             acc += new_state[state_offset + i * head_dim + j] * s_k[j];
         }
-        s_kv_mem[i] = acc;
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) s_kv_mem[i] = acc;
     }
     __syncthreads();
     
@@ -830,15 +833,16 @@ extern "C" __global__ void delta_net_autoregressive_step_f32(
     // Step 4: Update decayed state and compute output
     // new_state[i, j] = decayed_state[i, j] + k[j] * delta[i]  (no extra g!)
     // output[i] = sum_j(new_state[i, j] * q[j])
-    for (size_t i = tid; i < head_dim; i += blockDim.x) {
+    for (size_t i = warp_id; i < head_dim; i += num_warps) {
         float out_acc = 0.0f;
-        for (size_t j = 0; j < head_dim; ++j) {
+        for (size_t j = lane; j < head_dim; j += WARP_SIZE) {
             float decayed_val = new_state[state_offset + i * head_dim + j];
             float updated_val = decayed_val + s_k[j] * s_delta[i];
             new_state[state_offset + i * head_dim + j] = updated_val;
             out_acc += updated_val * s_q[j];
         }
-        output[qkv_offset + i] = out_acc;
+        out_acc = warp_reduce_sum(out_acc);
+        if (lane == 0) output[qkv_offset + i] = out_acc;
     }
 }
 

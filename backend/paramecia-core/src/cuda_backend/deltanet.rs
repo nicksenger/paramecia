@@ -629,8 +629,8 @@ pub fn delta_net_autoregressive_step(
     let output_elems = batch * num_heads * head_dim;
     let state_elems = batch * num_heads * head_dim * head_dim;
 
-    // Shared memory: 6 * head_dim floats (q, k, v, kv_mem, delta, out)
-    let shared_mem = (6 * head_dim * std::mem::size_of::<f32>()) as u32;
+    // Shared memory: q, k, v, kv_mem, and delta.
+    let shared_mem = (5 * head_dim * std::mem::size_of::<f32>()) as u32;
     let threads = 256.min(head_dim) as u32;
 
     let cfg = cudarc::driver::LaunchConfig {

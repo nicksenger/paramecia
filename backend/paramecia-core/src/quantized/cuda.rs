@@ -970,13 +970,15 @@ impl QCudaStorage {
             // Dense Qwen models are represented as a one-expert MoE. The
             // generic indexed kernel launches an independent matvec for every
             // batch item, causing each item to reread the same expert weights.
-            // Route this case through MMVQ so one block computes up to eight
-            // batch columns while loading each weight block only once.
+            // Route this case through the regular quantized matrix kernels so
+            // a block computes several batch columns while loading each
+            // weight block only once. MMVQ handles narrow batches and MMQ/MMA
+            // handles larger flattened prefill batches. Mid-sized decode
+            // batches stay on the indexed kernel, which has lower latency.
             if num_experts == 1
                 && input_dim1 == 1
                 && topk == 1
-                && (1..=8).contains(&batch)
-                && (batch == 1 || n % 2 == 0)
+                && (batch > 32 || ((1..=8).contains(&batch) && (batch == 1 || n % 2 == 0)))
             {
                 let input_view = if input_dtype == crate::DType::F32 {
                     match input_l.contiguous_offsets() {
@@ -993,15 +995,28 @@ impl QCudaStorage {
                     // original view's offset no longer applies.
                     input_storage.slice(..input_l.shape().elem_count())
                 };
-                let out = mul_mat_vec_via_q8_1(
-                    &self.data,
-                    &input_view,
-                    self.dtype(),
-                    k,
-                    n,
-                    batch,
-                    &self.device,
-                )?;
+                let out = if batch <= 8 {
+                    mul_mat_vec_via_q8_1(
+                        &self.data,
+                        &input_view,
+                        self.dtype(),
+                        k,
+                        n,
+                        batch,
+                        &self.device,
+                    )?
+                } else {
+                    mul_mat_via_q8_1(
+                        &self.data,
+                        &input_view,
+                        self.dtype(),
+                        n,
+                        k,
+                        k,
+                        batch,
+                        &self.device,
+                    )?
+                };
                 let out_shape: crate::Shape = (batch, topk, n).into();
                 let out = if input_dtype != crate::DType::F32 {
                     let out_layout = crate::Layout::contiguous(&out_shape);
