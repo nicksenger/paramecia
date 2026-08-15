@@ -52,6 +52,7 @@ pub struct ModelEngineBuilder {
     mtp_allow_inference_override: bool,
     // Training
     training_config: TrainingConfig,
+    load_for_training: bool,
 }
 
 impl ModelEngineBuilder {
@@ -84,6 +85,7 @@ impl ModelEngineBuilder {
             training_mtp_speculation_depth: None,
             mtp_allow_inference_override: false,
             training_config: TrainingConfig::default(),
+            load_for_training: false,
         }
     }
 
@@ -233,6 +235,16 @@ impl ModelEngineBuilder {
 
     /// Build the ModelEngine.
     pub fn build(self) -> Result<ModelEngine, Error> {
+        self.build_inner()
+    }
+
+    /// Build the [`ModelEngine`] with mutable weights suitable for training.
+    pub fn build_for_training(mut self) -> Result<ModelEngine, Error> {
+        self.load_for_training = true;
+        self.build_inner()
+    }
+
+    fn build_inner(self) -> Result<ModelEngine, Error> {
         // Select device
         let device = if let Some(d) = self.device {
             d
@@ -288,23 +300,41 @@ impl ModelEngineBuilder {
             let layer_device_map = LayerDeviceMap::from_proportions(split, num_layers)
                 .map_err(|e| Error::ModelError(e.to_string()))?;
             let primary = layer_device_map.primary_device().clone();
-            let model = ModelWeights::from_gguf_with_layer_split(
-                &model_path,
-                layer_device_map,
-                offload_mode,
-                self.kv_cache_quant,
-                self.yarn_config,
-            )
+            let model = if self.load_for_training {
+                ModelWeights::from_gguf_for_training_with_layer_split(
+                    &model_path,
+                    layer_device_map,
+                    offload_mode,
+                    self.kv_cache_quant,
+                )
+            } else {
+                ModelWeights::from_gguf_with_layer_split(
+                    &model_path,
+                    layer_device_map,
+                    offload_mode,
+                    self.kv_cache_quant,
+                    self.yarn_config,
+                )
+            }
             .map_err(|e| Error::ModelError(e.to_string()))?;
             (model, primary)
         } else {
-            let model = ModelWeights::from_gguf_with_offload_and_yarn(
-                &model_path,
-                &device,
-                offload_mode,
-                self.kv_cache_quant,
-                self.yarn_config,
-            )
+            let model = if self.load_for_training {
+                ModelWeights::from_gguf_for_training_with_offload(
+                    &model_path,
+                    &device,
+                    offload_mode,
+                    self.kv_cache_quant,
+                )
+            } else {
+                ModelWeights::from_gguf_with_offload_and_yarn(
+                    &model_path,
+                    &device,
+                    offload_mode,
+                    self.kv_cache_quant,
+                    self.yarn_config,
+                )
+            }
             .map_err(|e| Error::ModelError(e.to_string()))?;
             (model, device)
         };
