@@ -2957,12 +2957,7 @@ impl ModelWeights {
                     )
                 })?;
 
-            let is_recurrent = config.recurrent_layers.get(i).copied().unwrap_or(false)
-                || gg
-                    .try_tensor(&format!("{}.ssm_in.weight", prefix))?
-                    .is_some()
-                || gg.try_tensor(&format!("{}.ssm_in", prefix))?.is_some()
-                || gg.try_tensor(&format!("{}.ssm_a", prefix))?.is_some();
+            let is_recurrent = Self::layer_is_recurrent(gg, config, i, &prefix);
 
             let layer_rotary = if layer_device_map.is_multi_gpu() {
                 let key = format!("{:?}", layer_device);
@@ -3017,6 +3012,54 @@ impl ModelWeights {
         }
 
         Ok(layers)
+    }
+
+    /// Determine the attention implementation from the tensors in the GGUF when possible.
+    ///
+    /// Some hybrid-model GGUFs omit the per-layer `is_recurrent` metadata. The metadata
+    /// fallback captures the usual 3:1 layout, but it does not describe exceptional layers
+    /// such as Qwen3.8-27B's final full-attention block. Tensor names are authoritative in
+    /// those files and also distinguish the fused and split linear-attention layouts.
+    fn layer_is_recurrent<R: Read + Seek>(
+        gg: &Gguf<R>,
+        config: &ModelConfig,
+        layer_idx: usize,
+        prefix: &str,
+    ) -> bool {
+        let configured = config
+            .recurrent_layers
+            .get(layer_idx)
+            .copied()
+            .unwrap_or(false);
+        Self::recurrent_from_tensor_layout(configured, |suffix| {
+            gg.ct
+                .tensor_infos
+                .contains_key(&format!("{prefix}.{suffix}"))
+        })
+    }
+
+    fn recurrent_from_tensor_layout(
+        configured: bool,
+        mut contains_suffix: impl FnMut(&str) -> bool,
+    ) -> bool {
+        let has_recurrent_tensors = [
+            "ssm_in.weight",
+            "ssm_in",
+            "ssm_a",
+            "attn_qkv.weight",
+            "attn_qkv",
+        ]
+        .iter()
+        .any(|suffix| contains_suffix(suffix));
+        let has_full_attention_tensors = ["attn_q.weight", "attn_k.weight", "attn_v.weight"]
+            .iter()
+            .all(|suffix| contains_suffix(suffix));
+
+        match (has_recurrent_tensors, has_full_attention_tensors) {
+            (true, false) => true,
+            (false, true) => false,
+            _ => configured,
+        }
     }
 
     fn load_expert_tensor(path: &Path, tensor_name: &str, device: &Device) -> Result<QTensor> {
@@ -3828,12 +3871,7 @@ impl ModelWeights {
                     )
                 })?;
 
-            let is_recurrent = config.recurrent_layers.get(i).copied().unwrap_or(false)
-                || gg
-                    .try_tensor(&format!("{}.ssm_in.weight", prefix))?
-                    .is_some()
-                || gg.try_tensor(&format!("{}.ssm_in", prefix))?.is_some()
-                || gg.try_tensor(&format!("{}.ssm_a", prefix))?.is_some();
+            let is_recurrent = Self::layer_is_recurrent(&gg, &config, i, &prefix);
 
             let attn = if is_recurrent {
                 AttentionLayer::Linear(LinearAttention::new(
@@ -4024,12 +4062,7 @@ impl ModelWeights {
                     )
                 })?;
 
-            let is_recurrent = config.recurrent_layers.get(i).copied().unwrap_or(false)
-                || gg
-                    .try_tensor(&format!("{}.ssm_in.weight", prefix))?
-                    .is_some()
-                || gg.try_tensor(&format!("{}.ssm_in", prefix))?.is_some()
-                || gg.try_tensor(&format!("{}.ssm_a", prefix))?.is_some();
+            let is_recurrent = Self::layer_is_recurrent(&gg, &config, i, &prefix);
 
             let attn = if is_recurrent {
                 AttentionLayer::Linear(LinearAttention::new(
@@ -6105,3 +6138,28 @@ impl ArrowNode for GeneralHeadNormApplyOp {
 }
 
 impl_qwen_leaf_node!(U177, GeneralHeadOutputOp);
+
+#[cfg(test)]
+mod tests {
+    use super::ModelWeights;
+
+    #[test]
+    fn full_attention_tensors_override_recurrent_layout_fallback() {
+        let tensors = ["attn_q.weight", "attn_k.weight", "attn_v.weight"];
+
+        assert!(!ModelWeights::recurrent_from_tensor_layout(
+            true,
+            |suffix| tensors.contains(&suffix),
+        ));
+    }
+
+    #[test]
+    fn split_linear_attention_tensors_override_full_layout_fallback() {
+        let tensors = ["attn_qkv.weight", "attn_gate.weight", "ssm_a"];
+
+        assert!(ModelWeights::recurrent_from_tensor_layout(
+            false,
+            |suffix| tensors.contains(&suffix),
+        ));
+    }
+}
