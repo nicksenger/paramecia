@@ -384,7 +384,7 @@ fn mul_mat_vec_via_q8_1(
     let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
     // https://github.com/ggerganov/llama.cpp/blob/facb8b56f8fd3bb10a693bf0943ae9d69d0828ef/ggml-cuda/mmvq.cu#L98
     let (nblocks, nwarps) = match b_size {
-        1 => (nrows as u32, 4),
+        1 => (nrows as u32, 1),
         2..=4 => ((nrows as u32).div_ceil(2), 4),
         5..=8 => ((nrows as u32).div_ceil(2), 2),
         _ => crate::bail!("unexpected bsize {b_size}"),
@@ -466,7 +466,7 @@ fn mul_mat_vec_swiglu_via_q8_1(
 
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (nrows as u32, 1, 1),
-        block_dim: (WARP_SIZE as u32, 4, 1),
+        block_dim: (WARP_SIZE as u32, 1, 1),
         shared_mem_bytes: 0,
     };
 

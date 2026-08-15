@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use paramecia_engine::{
     Device, DeviceOffloadMode, Error, KvCacheQuantization, ModelEngineBuilder, TokenOutputStream,
@@ -121,7 +121,7 @@ struct Args {
     device: DeviceArg,
 
     /// Expert offload mode.
-    #[arg(long, value_enum, default_value_t = OffloadArg::Auto)]
+    #[arg(long, value_enum, default_value_t = OffloadArg::None)]
     offload: OffloadArg,
 
     /// KV-cache quantization mode (f16, bf16, q8_0, q4k, ...).

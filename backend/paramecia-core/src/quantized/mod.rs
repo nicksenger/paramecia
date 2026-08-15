@@ -2616,6 +2616,50 @@ impl QTensor {
         x: &Tensor,
         ids: &Tensor,
     ) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        {
+            use crate::Storage;
+
+            if let (QStorage::Cuda(gate_s), QStorage::Cuda(up_s)) =
+                (gate_weights.storage.as_ref(), up_weights.storage.as_ref())
+            {
+                let (gate_experts, gate_rows, gate_cols) = gate_weights.shape().dims3()?;
+                let (up_experts, up_rows, up_cols) = up_weights.shape().dims3()?;
+                let batch_size = match x.dims() {
+                    [batch, tokens, _] => batch * tokens,
+                    [batch, _] => *batch,
+                    _ => usize::MAX,
+                };
+                let (ids_batch, top_k) = ids.dims2()?;
+
+                // Dense models are represented as one-expert MoEs. During
+                // single-token decode the expert index is necessarily zero,
+                // so use the non-indexed fused CUDA kernel and avoid a second
+                // input quantization plus separate SwiGLU elementwise ops.
+                if gate_experts == 1
+                    && up_experts == 1
+                    && gate_rows == up_rows
+                    && gate_cols == up_cols
+                    && batch_size == 1
+                    && ids_batch == 1
+                    && top_k == 1
+                {
+                    let dense_shape: crate::Shape = (gate_rows, gate_cols).into();
+                    if let Storage::Cuda(x_storage) = &*x.storage() {
+                        let (storage, shape) = cuda::QCudaStorage::gate_up_swiglu_fwd(
+                            gate_s,
+                            up_s,
+                            &dense_shape,
+                            &dense_shape,
+                            x_storage,
+                            x.layout(),
+                        )?;
+                        return Ok(crate::tensor::from_storage(Storage::Cuda(storage), shape));
+                    }
+                }
+            }
+        }
+
         #[cfg(feature = "vulkan")]
         {
             use crate::Storage;

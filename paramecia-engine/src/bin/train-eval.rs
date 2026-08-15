@@ -66,7 +66,7 @@ struct Args {
     device: DeviceArg,
 
     /// Expert offload mode.
-    #[arg(long, value_enum, default_value_t = OffloadArg::Auto)]
+    #[arg(long, value_enum, default_value_t = OffloadArg::None)]
     offload: OffloadArg,
 
     /// KV-cache quantization mode (f16, bf16, q8_0, q4k, ...).
@@ -317,6 +317,7 @@ mod tests {
         let default_args = Args::try_parse_from(["train-eval", "--model-path", "model.gguf"])
             .expect("default arguments should parse");
         assert_eq!(default_args.batch_size, 32);
+        assert!(matches!(default_args.offload, OffloadArg::None));
 
         let configured_args = Args::try_parse_from([
             "train-eval",

@@ -84,3 +84,37 @@ fn dense_indexed_moe_large_batch_matches_cpu() -> Result<()> {
     assert!(max_abs_diff(&cpu_output, &cuda_output)? < 5e-3);
     Ok(())
 }
+
+#[test]
+fn dense_indexed_moe_decode_swiglu_matches_cpu() -> Result<()> {
+    if !utils::cuda_is_available() {
+        return Ok(());
+    }
+
+    let cuda = Device::new_cuda(0)?;
+    let (n, k) = (256, 256);
+    let gate: Vec<f32> = (0..n * k)
+        .map(|i| ((i as f32 + 1.0) * 0.007).sin() * 0.05)
+        .collect();
+    let up: Vec<f32> = (0..n * k)
+        .map(|i| ((i as f32 + 3.0) * 0.009).cos() * 0.05)
+        .collect();
+    let input: Vec<f32> = (0..k)
+        .map(|i| ((i as f32 + 2.0) * 0.011).cos() * 0.1)
+        .collect();
+
+    let run = |device: &Device| -> Result<Tensor> {
+        let gate = Tensor::from_slice(&gate, (1, n, k), device)?;
+        let up = Tensor::from_slice(&up, (1, n, k), device)?;
+        let gate = QTensor::quantize(&gate, GgmlDType::Q3K)?;
+        let up = QTensor::quantize(&up, GgmlDType::Q3K)?;
+        let input = Tensor::from_slice(&input, (1, 1, k), device)?;
+        let ids = Tensor::zeros((1, 1), paramecia_core::DType::U32, device)?;
+        QTensor::indexed_moe_gate_up_swiglu(&gate, &up, &input, &ids)
+    };
+
+    let cpu_output = run(&Device::Cpu)?;
+    let cuda_output = run(&cuda)?;
+    assert!(max_abs_diff(&cpu_output, &cuda_output)? < 5e-3);
+    Ok(())
+}

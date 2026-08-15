@@ -63,7 +63,7 @@ impl ModelEngineBuilder {
             tokenizer_path: None,
             device: None,
             cpu: false,
-            offload_mode: DeviceOffloadMode::default(),
+            offload_mode: DeviceOffloadMode::FullGpu,
             kv_cache_quant: KvCacheQuantization::Q8_0,
             yarn_config: None,
             layer_split: None,
@@ -497,4 +497,15 @@ fn read_num_layers(model_path: &PathBuf) -> Result<usize, Error> {
         .and_then(|v| v.to_u32().ok())
         .map(|n| n as usize)
         .ok_or_else(|| Error::ModelError("Could not read num_layers from GGUF".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_full_gpu() {
+        let builder = ModelEngineBuilder::new("model.gguf");
+        assert_eq!(builder.offload_mode, DeviceOffloadMode::FullGpu);
+    }
 }

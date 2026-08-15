@@ -2632,7 +2632,7 @@ static __device__ void mul_mat_vec_q(
     constexpr int nwarps              = 1;
     constexpr int rows_per_cuda_block = 1;
 #else
-    constexpr int nwarps              = ncols_y <= 4 ? 4 : 2;
+    constexpr int nwarps              = ncols_y == 1 ? 1 : (ncols_y <= 4 ? 4 : 2);
     constexpr int rows_per_cuda_block = ncols_y == 1 ? 1 : 2;
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
 
@@ -3359,7 +3359,7 @@ static __device__ void mul_mat_vec_q_swiglu(
     const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
 
-    constexpr int nwarps = 4;
+    constexpr int nwarps = 1;
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
     const     int row0 = blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
