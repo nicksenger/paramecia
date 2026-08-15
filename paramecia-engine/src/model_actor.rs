@@ -131,7 +131,14 @@ pub struct TrainingConfig {
     pub lr: f64,
     pub epsilon: f64,
     pub optimize_tensors: String,
+    /// Always regenerate perturbations one tensor at a time.
     pub lazy_perturbations: bool,
+    /// Maximum aggregate size of eagerly retained f32 perturbations.
+    ///
+    /// The optimizer automatically switches to lazy perturbations when the
+    /// selected tensors would exceed this budget. A value of zero therefore
+    /// forces the bounded-memory path.
+    pub perturbation_memory_budget_bytes: u64,
     pub mtp_speculation_depth: Option<usize>,
     pub mtp_decay_factor: f64,
     pub checkpoint_dir: PathBuf,
@@ -149,6 +156,7 @@ impl Default for TrainingConfig {
             epsilon: 0.001,
             optimize_tensors: "all".to_string(),
             lazy_perturbations: false,
+            perturbation_memory_budget_bytes: 4 * 1024 * 1024 * 1024,
             mtp_speculation_depth: None,
             mtp_decay_factor: 0.5,
             checkpoint_dir: PathBuf::from("/tmp/paramecia-checkpoints"),
@@ -279,6 +287,7 @@ struct TrainingSubsystem {
     epsilon_config: EpsilonConfig,
     optimize_tensors: OptimizeTensors,
     lazy_perturbations: bool,
+    perturbation_memory_budget_bytes: u64,
     minibatch_size: usize,
     n_grad_steps: usize,
     lr: f64,
@@ -319,6 +328,7 @@ fn ensure_training_subsystem<'a>(
             epsilon_config: EpsilonConfig::default(),
             optimize_tensors: paramecia_opt::parse_optimize_tensors(&config.optimize_tensors),
             lazy_perturbations: config.lazy_perturbations,
+            perturbation_memory_budget_bytes: config.perturbation_memory_budget_bytes,
             minibatch_size: config.minibatch_size,
             n_grad_steps: config.n_grad_steps,
             lr: config.lr,
@@ -485,6 +495,22 @@ fn setup_optimizer(
         .map(|(name, _)| ts.epsilon_config.multiplier_for(name))
         .collect();
 
+    let perturbation_bytes = filtered.iter().fold(0u64, |total, (_, qt)| {
+        let elem_count = qt.read().unwrap().shape().elem_count() as u64;
+        total.saturating_add(elem_count.saturating_mul(std::mem::size_of::<f32>() as u64))
+    });
+    let lazy_perturbations = should_use_lazy_perturbations(
+        ts.lazy_perturbations,
+        perturbation_bytes,
+        ts.perturbation_memory_budget_bytes,
+    );
+    info!(
+        "Perturbation storage: estimated {:.2} GiB, budget {:.2} GiB; using {} mode",
+        bytes_to_gib(perturbation_bytes),
+        bytes_to_gib(ts.perturbation_memory_budget_bytes),
+        if lazy_perturbations { "lazy" } else { "eager" }
+    );
+
     let optimizer_tensors: Vec<_> = filtered.into_iter().map(|(_, qt)| qt.clone()).collect();
 
     let params = ParamsQuZO {
@@ -492,9 +518,10 @@ fn setup_optimizer(
         epsilon: ts.epsilon,
         num_samples: 1,
         clip_threshold: ts.clip_threshold,
+        // Scoped fused state limits on-the-fly perturbation to this optimizer set.
         use_fused: true,
         epsilon_multipliers: Some(epsilon_multipliers),
-        lazy_perturbations: ts.lazy_perturbations,
+        lazy_perturbations,
         error_feedback: ts.error_feedback.as_ref().and_then(|ef| match ef {
             ErrorFeedbackMode::None => None,
             ErrorFeedbackMode::Persistent(_) => Some(paramecia_opt::ErrorFeedbackMode::Persistent),
@@ -512,6 +539,14 @@ fn setup_optimizer(
             "Failed to create optimizer: {e}"
         ))),
     }
+}
+
+fn should_use_lazy_perturbations(forced: bool, estimated_bytes: u64, budget_bytes: u64) -> bool {
+    forced || estimated_bytes > budget_bytes
+}
+
+fn bytes_to_gib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
 /// Process a single training sample: convert, buffer, and run a step when batch is full.
@@ -699,6 +734,10 @@ async fn process_command(
             let _ = respond.send(result);
         }
         ModelCommand::ResetState { respond } => {
+            if let Some(dzo) = decomposed_zo.as_mut() {
+                dzo.optimizer.clear_decomposed_perturbation();
+                dzo.pending_state = None;
+            }
             executor.reset_state();
             let _ = respond.send(Ok(()));
         }
@@ -842,6 +881,10 @@ async fn process_command(
             let _ = respond.send(result);
         }
         ModelCommand::UnloadModel { respond } => {
+            if let Some(dzo) = decomposed_zo.as_mut() {
+                dzo.optimizer.clear_decomposed_perturbation();
+                dzo.pending_state = None;
+            }
             executor.unload_model();
             let _ = respond.send(Ok(()));
         }
@@ -938,5 +981,18 @@ pub(crate) fn spawn_model_actor(
     ModelActorHandle {
         tx: Some(tx),
         join: Some(join),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_use_lazy_perturbations;
+
+    #[test]
+    fn perturbation_memory_policy_honors_force_and_budget() {
+        assert!(should_use_lazy_perturbations(true, 1, u64::MAX));
+        assert!(!should_use_lazy_perturbations(false, 1024, 1024));
+        assert!(should_use_lazy_perturbations(false, 1025, 1024));
+        assert!(should_use_lazy_perturbations(false, 1, 0));
     }
 }

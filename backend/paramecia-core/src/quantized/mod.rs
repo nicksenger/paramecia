@@ -50,6 +50,7 @@ pub use k_quants::GgmlType;
 // applying on-the-fly perturbation using the specified seed and epsilon.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 /// Perturbation state for fused forward passes.
 #[derive(Debug, Clone, Copy)]
@@ -62,6 +63,9 @@ pub struct PerturbationState {
 
 thread_local! {
     static PERTURBATION_STATE: RefCell<Option<PerturbationState>> = const { RefCell::new(None) };
+    // Maps the current storage identity to a stable tensor ordinal. Keeping this
+    // separate preserves the small Copy perturbation state used by hot forwards.
+    static PERTURBATION_TENSOR_ORDINALS: RefCell<Option<HashMap<u64, u64>>> = const { RefCell::new(None) };
 }
 
 /// Set the perturbation state for the current thread.
@@ -69,6 +73,21 @@ thread_local! {
 pub fn set_perturbation_state(seed: u64, epsilon: f32) {
     PERTURBATION_STATE.with(|state| {
         *state.borrow_mut() = Some(PerturbationState { seed, epsilon });
+    });
+    PERTURBATION_TENSOR_ORDINALS.with(|ordinals| *ordinals.borrow_mut() = None);
+}
+
+/// Set perturbation state for a model-scoped set of tensors.
+///
+/// Tensor storage identities are used only for lookup. The Philox stream is
+/// derived from the stable ordinal, so perturbations remain deterministic when
+/// device allocations change across model reloads.
+pub fn set_scoped_perturbation_state(seed: u64, epsilon: f32, tensor_ordinals: &[(u64, u64)]) {
+    PERTURBATION_STATE.with(|state| {
+        *state.borrow_mut() = Some(PerturbationState { seed, epsilon });
+    });
+    PERTURBATION_TENSOR_ORDINALS.with(|ordinals| {
+        *ordinals.borrow_mut() = Some(tensor_ordinals.iter().copied().collect());
     });
 }
 
@@ -78,11 +97,28 @@ pub fn clear_perturbation_state() {
     PERTURBATION_STATE.with(|state| {
         *state.borrow_mut() = None;
     });
+    PERTURBATION_TENSOR_ORDINALS.with(|ordinals| *ordinals.borrow_mut() = None);
 }
 
 /// Get the current perturbation state for the current thread.
 pub fn get_perturbation_state() -> Option<PerturbationState> {
     PERTURBATION_STATE.with(|state| *state.borrow())
+}
+
+/// Get perturbation state for a particular tensor storage identity.
+///
+/// In model-scoped mode tensors outside the registered optimizer set return
+/// `None`. The adjusted seed cancels the backend kernel's storage-pointer XOR
+/// and replaces it with a stable ordinal-derived stream.
+pub fn get_perturbation_state_for_tensor(tensor_id: u64) -> Option<PerturbationState> {
+    let state = get_perturbation_state()?;
+    PERTURBATION_TENSOR_ORDINALS.with(|ordinals| match ordinals.borrow().as_ref() {
+        None => Some(state),
+        Some(ordinals) => ordinals.get(&tensor_id).map(|ordinal| PerturbationState {
+            seed: state.seed ^ ordinal ^ tensor_id,
+            epsilon: state.epsilon,
+        }),
+    })
 }
 
 /// RAII guard that sets perturbation state and clears it on drop.
@@ -101,6 +137,24 @@ impl PerturbationGuard {
 impl Drop for PerturbationGuard {
     fn drop(&mut self) {
         clear_perturbation_state();
+    }
+}
+
+#[cfg(test)]
+mod perturbation_state_tests {
+    use super::*;
+
+    #[test]
+    fn scoped_state_uses_stable_ordinals_and_filters_other_tensors() {
+        set_scoped_perturbation_state(7, 0.25, &[(100, 3)]);
+
+        let state = get_perturbation_state_for_tensor(100).expect("registered tensor state");
+        assert_eq!(state.seed, 7 ^ 3 ^ 100);
+        assert_eq!(state.epsilon, 0.25);
+        assert!(get_perturbation_state_for_tensor(101).is_none());
+
+        clear_perturbation_state();
+        assert!(get_perturbation_state().is_none());
     }
 }
 
@@ -3578,117 +3632,129 @@ impl crate::CustomOp1 for QTensor {
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         // Check for fused perturbation state (QuZO training)
-        if let Some(perturb) = get_perturbation_state() {
+        if let Some(_base_perturb) = get_perturbation_state() {
             match self {
                 Self::QTensor(t) => {
-                    // CUDA fused path
-                    #[cfg(feature = "cuda")]
-                    if t.device().is_cuda()
-                        && matches!(
-                            t.dtype(),
-                            GgmlDType::Q8_0
-                                | GgmlDType::Q4K
-                                | GgmlDType::Q2K
-                                | GgmlDType::Q3K
-                                | GgmlDType::Q5K
-                                | GgmlDType::Q6K
-                                | GgmlDType::BF16
-                        )
-                    {
-                        return t.fused_fwd(xs, perturb.seed, perturb.epsilon);
-                    }
-                    // Metal fused path
-                    #[cfg(feature = "metal")]
-                    if t.device().is_metal()
-                        && matches!(
-                            t.dtype(),
-                            GgmlDType::Q8_0
-                                | GgmlDType::Q4K
-                                | GgmlDType::Q2K
-                                | GgmlDType::Q3K
-                                | GgmlDType::Q5K
-                                | GgmlDType::Q6K
-                                | GgmlDType::BF16
-                        )
-                    {
-                        return t.fused_fwd(xs, perturb.seed, perturb.epsilon);
-                    }
-                    // Vulkan fused path
-                    #[cfg(feature = "vulkan")]
-                    if t.device().is_vulkan()
-                        && matches!(
-                            t.dtype(),
-                            GgmlDType::Q8_0
-                                | GgmlDType::Q4K
-                                | GgmlDType::Q2K
-                                | GgmlDType::Q3K
-                                | GgmlDType::Q5K
-                                | GgmlDType::Q6K
-                                | GgmlDType::BF16
-                        )
-                    {
-                        return t.fused_fwd(xs, perturb.seed, perturb.epsilon);
-                    }
-                    // CPU fused path - dequantize with perturbation then matmul
-                    if t.device().is_cpu() {
-                        return t.fused_cpu_forward(xs, perturb.seed, perturb.epsilon);
+                    #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+                    let perturb = get_perturbation_state_for_tensor(t.fused_tensor_id());
+                    #[cfg(not(any(feature = "cuda", feature = "metal", feature = "vulkan")))]
+                    let perturb = Some(_base_perturb);
+                    if let Some(perturb) = perturb {
+                        // CUDA fused path
+                        #[cfg(feature = "cuda")]
+                        if t.device().is_cuda()
+                            && matches!(
+                                t.dtype(),
+                                GgmlDType::Q8_0
+                                    | GgmlDType::Q4K
+                                    | GgmlDType::Q2K
+                                    | GgmlDType::Q3K
+                                    | GgmlDType::Q5K
+                                    | GgmlDType::Q6K
+                                    | GgmlDType::BF16
+                            )
+                        {
+                            return t.fused_fwd(xs, perturb.seed, perturb.epsilon);
+                        }
+                        // Metal fused path
+                        #[cfg(feature = "metal")]
+                        if t.device().is_metal()
+                            && matches!(
+                                t.dtype(),
+                                GgmlDType::Q8_0
+                                    | GgmlDType::Q4K
+                                    | GgmlDType::Q2K
+                                    | GgmlDType::Q3K
+                                    | GgmlDType::Q5K
+                                    | GgmlDType::Q6K
+                                    | GgmlDType::BF16
+                            )
+                        {
+                            return t.fused_fwd(xs, perturb.seed, perturb.epsilon);
+                        }
+                        // Vulkan fused path
+                        #[cfg(feature = "vulkan")]
+                        if t.device().is_vulkan()
+                            && matches!(
+                                t.dtype(),
+                                GgmlDType::Q8_0
+                                    | GgmlDType::Q4K
+                                    | GgmlDType::Q2K
+                                    | GgmlDType::Q3K
+                                    | GgmlDType::Q5K
+                                    | GgmlDType::Q6K
+                                    | GgmlDType::BF16
+                            )
+                        {
+                            return t.fused_fwd(xs, perturb.seed, perturb.epsilon);
+                        }
+                        // CPU fused path - dequantize with perturbation then matmul
+                        if t.device().is_cpu() {
+                            return t.fused_cpu_forward(xs, perturb.seed, perturb.epsilon);
+                        }
                     }
                 }
                 Self::Shared(t) => {
                     let qt = t.read().map_err(|e| {
                         crate::Error::Msg(format!("QMatMul::Shared read lock failed: {e}"))
                     })?;
-                    // CUDA fused path
-                    #[cfg(feature = "cuda")]
-                    if qt.device().is_cuda()
-                        && matches!(
-                            qt.dtype(),
-                            GgmlDType::Q8_0
-                                | GgmlDType::Q4K
-                                | GgmlDType::Q2K
-                                | GgmlDType::Q3K
-                                | GgmlDType::Q5K
-                                | GgmlDType::Q6K
-                                | GgmlDType::BF16
-                        )
-                    {
-                        return qt.fused_fwd(xs, perturb.seed, perturb.epsilon);
-                    }
-                    // Metal fused path
-                    #[cfg(feature = "metal")]
-                    if qt.device().is_metal()
-                        && matches!(
-                            qt.dtype(),
-                            GgmlDType::Q8_0
-                                | GgmlDType::Q4K
-                                | GgmlDType::Q2K
-                                | GgmlDType::Q3K
-                                | GgmlDType::Q5K
-                                | GgmlDType::Q6K
-                                | GgmlDType::BF16
-                        )
-                    {
-                        return qt.fused_fwd(xs, perturb.seed, perturb.epsilon);
-                    }
-                    // Vulkan fused path
-                    #[cfg(feature = "vulkan")]
-                    if qt.device().is_vulkan()
-                        && matches!(
-                            qt.dtype(),
-                            GgmlDType::Q8_0
-                                | GgmlDType::Q4K
-                                | GgmlDType::Q2K
-                                | GgmlDType::Q3K
-                                | GgmlDType::Q5K
-                                | GgmlDType::Q6K
-                                | GgmlDType::BF16
-                        )
-                    {
-                        return qt.fused_fwd(xs, perturb.seed, perturb.epsilon);
-                    }
-                    // CPU fused path
-                    if qt.device().is_cpu() {
-                        return qt.fused_cpu_forward(xs, perturb.seed, perturb.epsilon);
+                    #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+                    let perturb = get_perturbation_state_for_tensor(qt.fused_tensor_id());
+                    #[cfg(not(any(feature = "cuda", feature = "metal", feature = "vulkan")))]
+                    let perturb = Some(_base_perturb);
+                    if let Some(perturb) = perturb {
+                        // CUDA fused path
+                        #[cfg(feature = "cuda")]
+                        if qt.device().is_cuda()
+                            && matches!(
+                                qt.dtype(),
+                                GgmlDType::Q8_0
+                                    | GgmlDType::Q4K
+                                    | GgmlDType::Q2K
+                                    | GgmlDType::Q3K
+                                    | GgmlDType::Q5K
+                                    | GgmlDType::Q6K
+                                    | GgmlDType::BF16
+                            )
+                        {
+                            return qt.fused_fwd(xs, perturb.seed, perturb.epsilon);
+                        }
+                        // Metal fused path
+                        #[cfg(feature = "metal")]
+                        if qt.device().is_metal()
+                            && matches!(
+                                qt.dtype(),
+                                GgmlDType::Q8_0
+                                    | GgmlDType::Q4K
+                                    | GgmlDType::Q2K
+                                    | GgmlDType::Q3K
+                                    | GgmlDType::Q5K
+                                    | GgmlDType::Q6K
+                                    | GgmlDType::BF16
+                            )
+                        {
+                            return qt.fused_fwd(xs, perturb.seed, perturb.epsilon);
+                        }
+                        // Vulkan fused path
+                        #[cfg(feature = "vulkan")]
+                        if qt.device().is_vulkan()
+                            && matches!(
+                                qt.dtype(),
+                                GgmlDType::Q8_0
+                                    | GgmlDType::Q4K
+                                    | GgmlDType::Q2K
+                                    | GgmlDType::Q3K
+                                    | GgmlDType::Q5K
+                                    | GgmlDType::Q6K
+                                    | GgmlDType::BF16
+                            )
+                        {
+                            return qt.fused_fwd(xs, perturb.seed, perturb.epsilon);
+                        }
+                        // CPU fused path
+                        if qt.device().is_cpu() {
+                            return qt.fused_cpu_forward(xs, perturb.seed, perturb.epsilon);
+                        }
                     }
                 }
                 _ => {}

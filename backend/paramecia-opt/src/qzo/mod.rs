@@ -1000,6 +1000,11 @@ pub struct QuZO {
 pub struct DecomposedZOState {
     seeds: Vec<(u64, u64)>,
     prealloc: Option<Vec<Tensor>>,
+    /// A model-wide Philox seed used by fused QMatMul kernels. Tensor-specific
+    /// effective seeds are derived from stable optimizer ordinals.
+    fused_seed: Option<u64>,
+    /// Whether each optimized tensor is handled by the fused forward path.
+    fused_tensors: Vec<bool>,
 }
 
 impl QuZO {
@@ -1126,7 +1131,6 @@ impl QuZO {
         let mut time_perturb_bwd = 0.0f32;
         let mut time_loss_minus = 0.0f32;
         let mut time_update = 0.0f32;
-
         let lazy = self.params.lazy_perturbations;
         let gain = self.params.error_gain as f32;
 
@@ -1357,6 +1361,28 @@ impl QuZO {
     ///
     /// Returns a `DecomposedZOState` that must be passed to `perturb_down`.
     pub fn perturb_up(&mut self, seed: Option<u64>) -> Result<DecomposedZOState> {
+        #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+        paramecia_core::quantized::clear_perturbation_state();
+
+        // Model loading and the actor run on different OS threads. Bind the CUDA
+        // context before any fallback tensor performs a device-to-host copy; a
+        // kernel launch would bind it implicitly, but a fully fused prefix does
+        // not launch a kernel during perturb_up.
+        #[cfg(feature = "cuda")]
+        if let Some(qt) = self.qtensors.first() {
+            let qt_read = qt.read().unwrap();
+            if qt_read.device().is_cuda() {
+                qt_read
+                    .device()
+                    .as_cuda_device()?
+                    .cuda_context()
+                    .bind_to_thread()
+                    .map_err(|e| {
+                        paramecia_core::Error::Msg(format!("failed to bind CUDA context: {e}"))
+                    })?;
+            }
+        }
+
         // Re-seed RNG when an external seed is provided
         if let Some(seed) = seed {
             self.rng = StdRng::seed_from_u64(seed);
@@ -1365,17 +1391,39 @@ impl QuZO {
         let epsilon = self.params.epsilon as f32;
         let lazy = self.params.lazy_perturbations;
 
-        // Generate seeds
-        let seeds: Vec<(u64, u64)> = (0..self.qtensors.len())
-            .map(|_| {
-                let seed_forward: u64 = self.rng.random();
-                let seed_update: u64 = self.rng.random();
-                (seed_forward, seed_update)
+        // The model-scoped seed is consumed only when at least one optimized
+        // tensor can use fused QMatMul. Unsupported or offloaded tensors retain
+        // the lazy materialized fallback.
+        #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+        let fused_tensors: Vec<bool> = self
+            .qtensors
+            .iter()
+            .map(|qt| self.params.use_fused && supports_gpu_perturb(&qt.read().unwrap()))
+            .collect();
+        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "vulkan")))]
+        let fused_tensors = vec![false; self.qtensors.len()];
+
+        let fused_seed = fused_tensors
+            .iter()
+            .any(|&fused| fused)
+            .then(|| self.rng.random::<u64>());
+
+        // Materialized tensors use independent seeded Gaussian streams. Fused
+        // tensors use the model seed above and keep only an update-rounding seed.
+        let seeds: Vec<(u64, u64)> = fused_tensors
+            .iter()
+            .map(|&fused| {
+                let seed_forward = if fused {
+                    fused_seed.expect("fused seed missing")
+                } else {
+                    self.rng.random()
+                };
+                (seed_forward, self.rng.random())
             })
             .collect();
 
         // Pre-allocate perturbation tensors if not lazy
-        let prealloc: Option<Vec<Tensor>> = if !lazy {
+        let prealloc: Option<Vec<Tensor>> = if !lazy && fused_seed.is_none() {
             let specs: Vec<_> = self
                 .qtensors
                 .iter()
@@ -1397,6 +1445,9 @@ impl QuZO {
 
         // Apply +ε perturbation
         for (i, (qt, &(seed_forward, _))) in self.qtensors.iter().zip(&seeds).enumerate() {
+            if fused_tensors[i] {
+                continue;
+            }
             let eps_i = epsilon * self.epsilon_multipliers[i] as f32;
             let qt_read = qt.read().unwrap();
             let continuous = if let Some(ref tensors) = prealloc {
@@ -1416,7 +1467,30 @@ impl QuZO {
             qt.replace(perturbed);
         }
 
-        Ok(DecomposedZOState { seeds, prealloc })
+        #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+        if let Some(seed) = fused_seed {
+            let tensor_ordinals: Vec<_> = self
+                .qtensors
+                .iter()
+                .zip(&fused_tensors)
+                .enumerate()
+                .filter_map(|(ordinal, (qt, &fused))| {
+                    fused.then(|| (qt.read().unwrap().fused_tensor_id(), ordinal as u64))
+                })
+                .collect();
+            paramecia_core::quantized::set_scoped_perturbation_state(
+                seed,
+                epsilon,
+                &tensor_ordinals,
+            );
+        }
+
+        Ok(DecomposedZOState {
+            seeds,
+            prealloc,
+            fused_seed,
+            fused_tensors,
+        })
     }
 
     /// Phase 2: Go from +ε to -ε perturbation. The caller should then
@@ -1426,25 +1500,56 @@ impl QuZO {
     pub fn perturb_down(&mut self, state: &DecomposedZOState) -> Result<()> {
         let epsilon = self.params.epsilon as f32;
 
-        for (i, (qt, &(seed_forward, _))) in self.qtensors.iter().zip(&state.seeds).enumerate() {
-            let eps_i = epsilon * self.epsilon_multipliers[i] as f32;
-            let qt_read = qt.read().unwrap();
-            let continuous = if let Some(ref tensors) = state.prealloc {
-                tensors[i].clone()
-            } else {
-                generate_perturbation(state.seeds[i].0, qt_read.shape())?
-            };
+        let materialized_result = (|| -> Result<()> {
+            for (i, (qt, &(seed_forward, _))) in self.qtensors.iter().zip(&state.seeds).enumerate()
+            {
+                if state.fused_tensors[i] {
+                    continue;
+                }
+                let eps_i = epsilon * self.epsilon_multipliers[i] as f32;
+                let qt_read = qt.read().unwrap();
+                let continuous = if let Some(ref tensors) = state.prealloc {
+                    tensors[i].clone()
+                } else {
+                    generate_perturbation(state.seeds[i].0, qt_read.shape())?
+                };
+                #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+                let perturbed = if supports_gpu_perturb(&qt_read) {
+                    qt_read.perturb_weights_gpu(&continuous, 2.0 * eps_i, seed_forward, false)?
+                } else {
+                    qt_read.perturb_weights(&continuous, 2.0 * eps_i, seed_forward, false)?
+                };
+                #[cfg(not(any(feature = "cuda", feature = "metal", feature = "vulkan")))]
+                let perturbed =
+                    qt_read.perturb_weights(&continuous, 2.0 * eps_i, seed_forward, false)?;
+                drop(qt_read);
+                qt.replace(perturbed);
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = materialized_result {
             #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
-            let perturbed = if supports_gpu_perturb(&qt_read) {
-                qt_read.perturb_weights_gpu(&continuous, 2.0 * eps_i, seed_forward, false)?
-            } else {
-                qt_read.perturb_weights(&continuous, 2.0 * eps_i, seed_forward, false)?
-            };
-            #[cfg(not(any(feature = "cuda", feature = "metal", feature = "vulkan")))]
-            let perturbed =
-                qt_read.perturb_weights(&continuous, 2.0 * eps_i, seed_forward, false)?;
-            drop(qt_read);
-            qt.replace(perturbed);
+            paramecia_core::quantized::clear_perturbation_state();
+            return Err(error);
+        }
+
+        #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+        if let Some(seed) = state.fused_seed {
+            let tensor_ordinals: Vec<_> = self
+                .qtensors
+                .iter()
+                .zip(&state.fused_tensors)
+                .enumerate()
+                .filter_map(|(ordinal, (qt, &fused))| {
+                    fused.then(|| (qt.read().unwrap().fused_tensor_id(), ordinal as u64))
+                })
+                .collect();
+            paramecia_core::quantized::set_scoped_perturbation_state(
+                seed,
+                -epsilon,
+                &tensor_ordinals,
+            );
         }
 
         Ok(())
@@ -1459,6 +1564,11 @@ impl QuZO {
         loss_up: f32,
         loss_down: f32,
     ) -> Result<f32> {
+        // Fused forward state must never leak into update, error, or subsequent
+        // inference paths. The update regenerates matching Philox values below.
+        #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+        paramecia_core::quantized::clear_perturbation_state();
+
         self.step_count += 1;
 
         let epsilon = self.params.epsilon as f32;
@@ -1501,11 +1611,48 @@ impl QuZO {
             let eps_i = epsilon * self.epsilon_multipliers[i] as f32;
             let update_scale_i = update_scale * self.epsilon_multipliers[i] as f32;
             let qt_read = qt.read().unwrap();
-            let continuous = if let Some(ref tensors) = state.prealloc {
+            let continuous = if state.fused_tensors[i] {
+                #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+                {
+                    let tensor_seed =
+                        state.fused_seed.expect("fused tensor missing model seed") ^ i as u64;
+                    let perturb_data: Vec<f32> = (0..qt_read.shape().elem_count())
+                        .map(|index| philox_gaussian(tensor_seed, index as u64))
+                        .collect();
+                    Tensor::from_vec(
+                        perturb_data,
+                        qt_read.shape().clone(),
+                        &paramecia_core::Device::Cpu,
+                    )?
+                }
+                #[cfg(not(any(feature = "cuda", feature = "metal", feature = "vulkan")))]
+                unreachable!("fused tensors require a GPU backend")
+            } else if let Some(ref tensors) = state.prealloc {
                 tensors[i].clone()
             } else {
                 generate_perturbation(state.seeds[i].0, qt_read.shape())?
             };
+
+            if state.fused_tensors[i] {
+                let updated = if tracks_error_feedback_residuals(qt_read.dtype()) {
+                    if let Some(ref mut residuals) = active_residuals.as_mut() {
+                        qt_read.apply_quantized_update_with_residual(
+                            &continuous,
+                            update_scale_i,
+                            seed_update,
+                            &mut residuals[i],
+                            gain,
+                        )?
+                    } else {
+                        qt_read.apply_quantized_update(&continuous, update_scale_i, seed_update)?
+                    }
+                } else {
+                    qt_read.apply_quantized_update(&continuous, update_scale_i, seed_update)?
+                };
+                drop(qt_read);
+                qt.replace(updated);
+                continue;
+            }
 
             let apply_without_residual = || -> Result<_> {
                 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
@@ -1575,6 +1722,12 @@ impl QuZO {
         Ok((loss_up + loss_down) / 2.0)
     }
 
+    /// Clear any model-scoped fused perturbation installed by the decomposed API.
+    pub fn clear_decomposed_perturbation(&mut self) {
+        #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+        paramecia_core::quantized::clear_perturbation_state();
+    }
+
     /// Fused two-sided finite differences using on-the-fly perturbation.
     ///
     /// This implementation uses the fused kernel that generates perturbation
@@ -1588,9 +1741,7 @@ impl QuZO {
     where
         F: FnMut() -> Result<Tensor>,
     {
-        use paramecia_core::quantized::{
-            clear_perturbation_state, set_perturbation_state, GgmlDType,
-        };
+        use paramecia_core::quantized::{clear_perturbation_state, GgmlDType};
         use std::time::Instant;
 
         // Check if all tensors support fused mode (GPU + supported dtype)
@@ -1650,6 +1801,11 @@ impl QuZO {
         let mut time_loss_plus = 0.0f32;
         let mut time_loss_minus = 0.0f32;
         let mut time_update = 0.0f32;
+        let tensor_ordinals: Vec<_> = tensor_info
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (_, tensor_id))| (*tensor_id, ordinal as u64))
+            .collect();
 
         for _ in 0..self.params.num_samples {
             // Step 1: Generate seeds for this sample
@@ -1660,18 +1816,28 @@ impl QuZO {
 
             // Step 2: Forward pass with +ε perturbation (using fused kernel)
             let t1 = Instant::now();
-            set_perturbation_state(seed_forward, epsilon);
-            let loss_plus = loss_fn()?.to_vec0::<f32>()?;
+            paramecia_core::quantized::set_scoped_perturbation_state(
+                seed_forward,
+                epsilon,
+                &tensor_ordinals,
+            );
+            let loss_plus = loss_fn().and_then(|loss| loss.to_vec0::<f32>());
             clear_perturbation_state();
+            let loss_plus = loss_plus?;
             time_loss_plus += t1.elapsed().as_secs_f32();
             total_loss += loss_plus;
             loss_count += 1;
 
             // Step 3: Forward pass with -ε perturbation (using fused kernel)
             let t2 = Instant::now();
-            set_perturbation_state(seed_forward, -epsilon);
-            let loss_minus = loss_fn()?.to_vec0::<f32>()?;
+            paramecia_core::quantized::set_scoped_perturbation_state(
+                seed_forward,
+                -epsilon,
+                &tensor_ordinals,
+            );
+            let loss_minus = loss_fn().and_then(|loss| loss.to_vec0::<f32>());
             clear_perturbation_state();
+            let loss_minus = loss_minus?;
             time_loss_minus += t2.elapsed().as_secs_f32();
             total_loss += loss_minus;
             loss_count += 1;
@@ -1687,11 +1853,13 @@ impl QuZO {
             let t3 = Instant::now();
             let update_scale = lr * mu_clipped / (self.params.num_samples as f32);
 
-            for (qt, (shape, tensor_id)) in self.qtensors.iter().zip(&tensor_info) {
+            for (ordinal, (qt, (shape, _tensor_id))) in
+                self.qtensors.iter().zip(&tensor_info).enumerate()
+            {
                 let qt_read = qt.read().unwrap();
 
                 // Compute effective seed matching the fused kernel
-                let effective_seed = seed_forward ^ tensor_id;
+                let effective_seed = seed_forward ^ ordinal as u64;
 
                 // Generate perturbation using Philox RNG (matches fused kernel)
                 let elem_count = shape.elem_count();

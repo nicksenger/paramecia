@@ -159,6 +159,10 @@ struct Args {
     #[arg(long)]
     lazy_perturbations: bool,
 
+    /// Maximum MiB retained for eager f32 perturbations before switching to lazy mode.
+    #[arg(long, default_value_t = 4096)]
+    perturbation_memory_budget_mib: u64,
+
     /// QuZO quantization-error feedback mode.
     #[arg(long, value_enum, default_value_t = ErrorFeedbackArg::None)]
     error_feedback: ErrorFeedbackArg,
@@ -228,6 +232,9 @@ async fn run(args: Args) -> Result<()> {
             epsilon: args.epsilon,
             optimize_tensors: args.optimize_tensors.clone(),
             lazy_perturbations: args.lazy_perturbations,
+            perturbation_memory_budget_bytes: args
+                .perturbation_memory_budget_mib
+                .saturating_mul(1024 * 1024),
             ..TrainingConfig::default()
         });
 
@@ -531,6 +538,7 @@ mod tests {
 
         assert!(args.opt);
         assert!(args.lazy_perturbations);
+        assert_eq!(args.perturbation_memory_budget_mib, 4096);
         assert_eq!(args.learning_rate, 0.0002);
         assert_eq!(args.epsilon, 0.002);
         assert_eq!(args.optimize_tensors, "qk");
@@ -556,5 +564,19 @@ mod tests {
 
         assert!(matches!(args.error_feedback, ErrorFeedbackArg::Replay));
         assert_eq!(args.error_replay_steps, 4);
+    }
+
+    #[test]
+    fn perturbation_memory_budget_is_configurable() {
+        let args = Args::try_parse_from([
+            "train-eval",
+            "--model-path",
+            "model.gguf",
+            "--perturbation-memory-budget-mib",
+            "0",
+        ])
+        .expect("perturbation budget should parse");
+
+        assert_eq!(args.perturbation_memory_budget_mib, 0);
     }
 }

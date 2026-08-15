@@ -170,6 +170,8 @@ extern "C" __global__ void fused_mul_mat_vec_q8_0_f32(
 ) {
     // XOR seed with weight pointer to get unique seed per tensor
     const uint64_t effective_seed = seed ^ weight_ptr;
+    vy += (size_t)blockIdx.y * ncols;
+    dst += (size_t)blockIdx.y * nrows;
 
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= nrows) return;
@@ -233,6 +235,8 @@ extern "C" __global__ void fused_mul_mat_vec_q4_K_f32(
 ) {
     // XOR seed with weight pointer to get unique seed per tensor
     const uint64_t effective_seed = seed ^ weight_ptr;
+    vy += (size_t)blockIdx.y * ncols;
+    dst += (size_t)blockIdx.y * nrows;
 
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= nrows) return;
@@ -450,6 +454,8 @@ extern "C" __global__ void fused_mul_mat_vec_q8_0_f16(
     const uint64_t weight_ptr
 ) {
     const uint64_t effective_seed = seed ^ weight_ptr;
+    vy += (size_t)blockIdx.y * ncols;
+    dst += (size_t)blockIdx.y * nrows;
 
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= nrows) return;
@@ -498,6 +504,8 @@ extern "C" __global__ void fused_mul_mat_vec_q4_K_f16(
     const uint64_t weight_ptr
 ) {
     const uint64_t effective_seed = seed ^ weight_ptr;
+    vy += (size_t)blockIdx.y * ncols;
+    dst += (size_t)blockIdx.y * nrows;
 
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= nrows) return;
@@ -585,6 +593,8 @@ extern "C" __global__ void fused_mul_mat_vec_bf16_f32(
 ) {
     // XOR seed with weight pointer to get unique seed per tensor
     const uint64_t effective_seed = seed ^ weight_ptr;
+    vy += (size_t)blockIdx.y * ncols;
+    dst += (size_t)blockIdx.y * nrows;
 
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= nrows) return;
@@ -685,6 +695,8 @@ extern "C" __global__ void fused_mul_mat_vec_q6_K_f32(
     const uint64_t weight_ptr
 ) {
     const uint64_t effective_seed = seed ^ weight_ptr;
+    vy += (size_t)blockIdx.y * ncols;
+    dst += (size_t)blockIdx.y * nrows;
 
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= nrows) return;
@@ -770,6 +782,8 @@ extern "C" __global__ void fused_mul_mat_vec_q5_K_f32(
     const uint64_t weight_ptr
 ) {
     const uint64_t effective_seed = seed ^ weight_ptr;
+    vy += (size_t)blockIdx.y * ncols;
+    dst += (size_t)blockIdx.y * nrows;
 
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= nrows) return;
@@ -852,6 +866,8 @@ extern "C" __global__ void fused_mul_mat_vec_q2_K_f32(
     const uint64_t weight_ptr
 ) {
     const uint64_t effective_seed = seed ^ weight_ptr;
+    vy += (size_t)blockIdx.y * ncols;
+    dst += (size_t)blockIdx.y * nrows;
 
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= nrows) return;
@@ -921,6 +937,8 @@ extern "C" __global__ void fused_mul_mat_vec_q3_K_f32(
     const uint64_t weight_ptr
 ) {
     const uint64_t effective_seed = seed ^ weight_ptr;
+    vy += (size_t)blockIdx.y * ncols;
+    dst += (size_t)blockIdx.y * nrows;
 
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= nrows) return;
@@ -975,4 +993,3 @@ extern "C" __global__ void fused_mul_mat_vec_q3_K_f32(
         dst[row] = sum;
     }
 }
-

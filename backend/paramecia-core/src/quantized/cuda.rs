@@ -1841,11 +1841,10 @@ impl QCudaStorage {
 
         let dst = unsafe { self.device.alloc::<f32>(nrows * b_size)? };
 
-        // For vector case (b_size=1), each block handles one row
-        // blockDim = (32, 1, 1) - one warp per row
-        // gridDim = (nrows, 1, 1)
+        // Each x block handles one output row and each y block handles one
+        // flattened batch/prompt vector.
         let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: (nrows as u32, 1, 1),
+            grid_dim: (nrows as u32, b_size as u32, 1),
             block_dim: (WARP_SIZE as u32, 1, 1),
             shared_mem_bytes: 0,
         };
