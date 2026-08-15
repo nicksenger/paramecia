@@ -8,7 +8,6 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-const BATCH_SIZE: usize = 32;
 const RUST_BOOK_CONTENT: &str = "Welcome to The Rust Programming Language, an introductory book about Rust. The Rust programming language helps you write faster, more reliable software. High-level ergonomics and low-level control are often at odds in programming language design; Rust challenges that conflict. Through balancing powerful technical capacity and a great developer experience, Rust gives you the option to control low-level details without all the hassle traditionally associated with such control.";
 
 #[cfg(feature = "qwen3next_80b_a3b")]
@@ -48,7 +47,7 @@ impl OffloadArg {
 
 #[derive(Debug, Parser)]
 #[command(name = "train-eval")]
-#[command(about = "Benchmark a training-loaded model with a fixed batch size of 32.")]
+#[command(about = "Benchmark a training-loaded model.")]
 struct Args {
     /// Path to local GGUF model weights.
     #[arg(long)]
@@ -81,6 +80,10 @@ struct Args {
     /// Number of tokens to generate for every sequence in the batch.
     #[arg(long, default_value_t = 100)]
     generate_tokens: usize,
+
+    /// Number of sequences to evaluate in parallel.
+    #[arg(long, default_value_t = 32)]
+    batch_size: usize,
 
     /// Temperature for token sampling.
     #[arg(long, default_value_t = 0.7)]
@@ -126,6 +129,9 @@ async fn run(args: Args) -> Result<()> {
     if args.generate_tokens == 0 {
         bail!("--generate-tokens must be greater than 0");
     }
+    if args.batch_size == 0 {
+        bail!("--batch-size must be greater than 0");
+    }
 
     let mut builder = ModelEngineBuilder::new(&args.model_path)
         .offload_mode(args.offload.to_mode())
@@ -164,11 +170,11 @@ async fn run(args: Args) -> Result<()> {
     let tokenizer = engine.tokenizer().clone();
     let system_tokens = select_system_prompt_tokens(&tokenizer, args.prefill_system_tokens)?;
     let prompt_tokens = build_chatml_prompt_tokens(&tokenizer, &system_tokens)?;
-    let inputs = vec![vec![ModelInput::Tokens(prompt_tokens.clone())]; BATCH_SIZE];
-    let mut token_streams = (0..BATCH_SIZE)
+    let inputs = vec![vec![ModelInput::Tokens(prompt_tokens.clone())]; args.batch_size];
+    let mut token_streams = (0..args.batch_size)
         .map(|_| TokenOutputStream::new(tokenizer.clone()))
         .collect::<Vec<_>>();
-    let mut generated_text = vec![String::new(); BATCH_SIZE];
+    let mut generated_text = vec![String::new(); args.batch_size];
 
     let prefill_start = Instant::now();
     let (mut prediction_rx, cancel_tx) = engine
@@ -233,13 +239,13 @@ async fn run(args: Args) -> Result<()> {
         .context("benchmark produced no tokens")?
         .elapsed();
     let output = TrainEvalOutput {
-        batch_size: BATCH_SIZE,
+        batch_size: args.batch_size,
         prefill_tokens_per_second: tokens_per_second(
-            prompt_tokens.len() * BATCH_SIZE,
+            prompt_tokens.len() * args.batch_size,
             prefill_elapsed,
         ),
         generation_tokens_per_second: tokens_per_second(
-            generation_steps * BATCH_SIZE,
+            generation_steps * args.batch_size,
             generation_elapsed,
         ),
         generated_text,
@@ -299,5 +305,27 @@ fn tokens_per_second(tokens: usize, elapsed: Duration) -> f64 {
         0.0
     } else {
         tokens as f64 / secs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_size_is_configurable() {
+        let default_args = Args::try_parse_from(["train-eval", "--model-path", "model.gguf"])
+            .expect("default arguments should parse");
+        assert_eq!(default_args.batch_size, 32);
+
+        let configured_args = Args::try_parse_from([
+            "train-eval",
+            "--model-path",
+            "model.gguf",
+            "--batch-size",
+            "2",
+        ])
+        .expect("configured arguments should parse");
+        assert_eq!(configured_args.batch_size, 2);
     }
 }
