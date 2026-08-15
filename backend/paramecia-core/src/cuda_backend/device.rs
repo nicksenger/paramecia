@@ -76,6 +76,26 @@ impl CudaDevice {
         self.stream.memcpy_htod(src, dst).w()
     }
 
+    /// Copy host memory to the device and wait until the source is no longer in use.
+    ///
+    /// `CudaStream::memcpy_htod` queues an asynchronous copy. For pageable sources,
+    /// repeatedly queuing those copies can make the CUDA driver retain a model's worth
+    /// of pinned staging memory. This variant records and waits for just this point in
+    /// the stream, bounding staging memory and allowing temporary host buffers to be
+    /// released safely when it returns.
+    pub fn memcpy_htod_synchronized<
+        T: cudarc::driver::DeviceRepr,
+        Src: cudarc::driver::HostSlice<T> + ?Sized,
+        Dst: cudarc::driver::DevicePtrMut<T>,
+    >(
+        &self,
+        src: &Src,
+        dst: &mut Dst,
+    ) -> Result<()> {
+        self.stream.memcpy_htod(src, dst).w()?;
+        self.stream.record_event(None).w()?.synchronize().w()
+    }
+
     pub fn clone_dtoh<T: cudarc::driver::DeviceRepr, Src: cudarc::driver::DevicePtr<T>>(
         &self,
         src: &Src,

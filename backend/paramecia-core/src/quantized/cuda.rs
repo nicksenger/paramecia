@@ -2111,7 +2111,10 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     let dtype = T::DTYPE;
     let padded_len = data.len() + MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
     let mut inner = unsafe { device.alloc::<u8>(padded_len)? };
-    device.memcpy_htod(data, &mut inner.slice_mut(..data.len()))?;
+    // GGUF data is commonly backed by a temporary pageable Vec. Wait for each
+    // upload before that buffer is dropped so CUDA cannot accumulate a
+    // model-sized queue of driver-owned pinned staging allocations.
+    device.memcpy_htod_synchronized(data, &mut inner.slice_mut(..data.len()))?;
     Ok(QStorage::Cuda(QCudaStorage {
         data: PaddedCudaSlice {
             inner,
@@ -2303,6 +2306,27 @@ pub fn kv_buffer_append_quantized_q8_0_f32(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn cuda_load_quantized_from_temporary_pageable_data() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        let source = vec![1.25f32, -2.5, 3.75, -4.0];
+        let expected = source
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect::<Vec<_>>();
+
+        let storage = load_quantized(&dev, &source)?;
+        drop(source);
+
+        let QStorage::Cuda(storage) = storage else {
+            unreachable!("CUDA load must produce CUDA storage")
+        };
+        let actual = dev.clone_dtoh(&storage.data.inner.slice(..storage.data.len))?;
+        dev.synchronize()?;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
 
     #[test]
     fn cuda_quantize_q8_1() -> Result<()> {
