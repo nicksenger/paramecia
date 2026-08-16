@@ -2076,6 +2076,27 @@ impl std::fmt::Debug for MoeExperts {
 }
 
 impl MoeExperts {
+    /// Dense-model fast path for the single-expert representation.
+    ///
+    /// Using indexed MoE kernels for one expert needlessly routes every token,
+    /// quantizes the same input once per projection, and launches one block per
+    /// output row. Squeezing the synthetic expert dimension is a zero-copy view
+    /// and lets the regular quantized matmul path use its batched matrix kernels.
+    fn forward_dense(&self, hidden_states: &THidden) -> Result<THidden> {
+        let gate_lock = self.gate_exps.read().unwrap();
+        let up_lock = self.up_exps.read().unwrap();
+        let gate = gate_lock.squeeze(0)?;
+        let up = up_lock.squeeze(0)?;
+        let activated = QTensor::gate_up_swiglu(&gate, &up, hidden_states.inner())?;
+        drop(gate_lock);
+        drop(up_lock);
+
+        let down_lock = self.down_exps.read().unwrap();
+        let down = down_lock.squeeze(0)?;
+        let output = activated.apply_op1_no_bwd(&down)?;
+        output.try_into().map_err(paramecia_core::Error::from)
+    }
+
     fn load_expert_tensor_3d<R: Read + Seek>(
         gg: &mut Gguf<R>,
         prefix: &str,
@@ -3145,6 +3166,17 @@ impl MoeBlock {
     }
 
     pub(super) fn forward_typed(&mut self, hidden_states: &THidden) -> Result<THidden> {
+        if self.num_experts == 1 {
+            let hs_typed: THidden = paramecia_tensor::contiguous!(hidden_states.clone())?;
+            let expert_output = self.experts.forward_dense(&hs_typed)?;
+            return if let Some(ref mut shared_exp) = self.shared_expert {
+                let shared_output = shared_exp.forward(&hs_typed)?;
+                ResidualAddHiddenFlow::new(ResidualAddOp::default())
+                    .traced_forward(&mut (), (expert_output, shared_output))
+            } else {
+                Ok(expert_output)
+            };
+        }
         let (output, _) = self.forward_with_stats_typed(hidden_states)?;
         Ok(output)
     }

@@ -2744,9 +2744,9 @@ impl QTensor {
             }
         }
 
-        // Fallback: separate gate+up then SwiGLU via basic tensor ops
+        // Fallback: separate gate+up projections, then one fused SwiGLU kernel.
         let (gate_out, up_out) = Self::indexed_moe_gate_up(gate_weights, up_weights, x, ids)?;
-        gate_out.silu()?.mul(&up_out)
+        crate::deltanet_ops::fused_swiglu(&gate_out, &up_out)
     }
 
     /// Fused gate+up SwiGLU for non-MoE FFN: computes silu(gate @ x) * (up @ x).
@@ -2780,10 +2780,10 @@ impl QTensor {
             }
         }
 
-        // Fallback: separate gate, up, then SwiGLU
+        // Fallback: separate gate and up projections, then one fused SwiGLU kernel.
         let gate_out = x.apply_op1_no_bwd(gate_weights)?;
         let up_out = x.apply_op1_no_bwd(up_weights)?;
-        gate_out.silu()?.mul(&up_out)
+        crate::deltanet_ops::fused_swiglu(&gate_out, &up_out)
     }
 
     pub fn device_ptr(&self) -> Result<*const u8> {

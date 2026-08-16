@@ -4,7 +4,7 @@
 //! with support for temperature-based sampling, top-k filtering, nucleus sampling (top-p),
 //! and combinations thereof.
 use paramecia_core::{DType, Device, Error, Result, Tensor};
-use rand::{distr::Distribution, SeedableRng};
+use rand::{distr::Distribution, Rng, SeedableRng};
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Sampling {
@@ -85,6 +85,50 @@ impl LogitsProcessor {
         let distr = rand::distr::weighted::WeightedIndex::new(&prs).map_err(Error::wrap)?;
         let next_token = distr.sample(&mut self.rng) as u32;
         Ok(next_token)
+    }
+
+    /// Sample directly from temperature-scaled logits without materializing
+    /// and normalizing a vocabulary-sized probability vector.
+    fn sample_logits_multinomial(
+        &mut self,
+        logits: &[f32],
+        temperature: f64,
+        fallback: u32,
+    ) -> u32 {
+        let temperature = temperature as f32;
+        let max = logits
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(f32::NEG_INFINITY, f32::max);
+        if !max.is_finite() || !temperature.is_finite() || temperature <= 0.0 {
+            return fallback;
+        }
+
+        let sum = logits
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .map(|value| ((value - max) / temperature).exp())
+            .sum::<f32>();
+        if !sum.is_finite() || sum <= f32::EPSILON {
+            return fallback;
+        }
+
+        let mut target = self.rng.random::<f32>() * sum;
+        let mut last_finite = fallback;
+        for (index, &logit) in logits.iter().enumerate() {
+            if !logit.is_finite() {
+                continue;
+            }
+            last_finite = index as u32;
+            let weight = ((logit - max) / temperature).exp();
+            if target < weight {
+                return index as u32;
+            }
+            target -= weight;
+        }
+        last_finite
     }
 
     /// top-p sampling (or "nucleus sampling") samples from the smallest set of tokens that exceed
@@ -199,8 +243,7 @@ impl LogitsProcessor {
                 self.sample_gumbel_softmax(&logits, *temperature)?
             }
             Sampling::All { temperature } => {
-                let prs = probabilities(*temperature);
-                self.sample_multinomial(&prs, fallback)?
+                self.sample_logits_multinomial(logits, *temperature, fallback)
             }
             Sampling::TopP { p, temperature } => {
                 let mut prs = probabilities(*temperature);
@@ -289,6 +332,24 @@ mod tests {
         for _ in 0..32 {
             assert_eq!(processor.sample_slice(&[20.0, 0.0, -1.0]).unwrap(), 0);
         }
+    }
+
+    #[test]
+    fn sample_slice_all_is_seeded_and_skips_non_finite_logits() {
+        let sampling = Sampling::All { temperature: 0.7 };
+        let mut first = LogitsProcessor::from_sampling(11, sampling.clone());
+        let mut second = LogitsProcessor::from_sampling(11, sampling);
+        let logits = [f32::NAN, f32::NEG_INFINITY, 1.0, 2.0, 3.0];
+
+        let first_tokens = (0..32)
+            .map(|_| first.sample_slice(&logits).unwrap())
+            .collect::<Vec<_>>();
+        let second_tokens = (0..32)
+            .map(|_| second.sample_slice(&logits).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_tokens, second_tokens);
+        assert!(first_tokens.iter().all(|&token| token >= 2));
     }
 
     #[test]

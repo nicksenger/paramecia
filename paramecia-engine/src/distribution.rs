@@ -14,12 +14,11 @@ pub(crate) struct Distribution {
     pub tail_mass: f32,
 }
 
-/// Compute log-softmax of logits.
-fn log_softmax(logits: &[f32]) -> Vec<f32> {
+/// Compute the scalar normalization term for log-softmax.
+fn log_softmax_normalizer(logits: &[f32]) -> f32 {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exp_sum: f32 = logits.iter().map(|&x| (x - max).exp()).sum();
-    let log_sum = exp_sum.ln();
-    logits.iter().map(|&x| x - max - log_sum).collect()
+    max + exp_sum.ln()
 }
 
 /// Convert a host logits slice to distribution info with stratified tail sampling.
@@ -33,7 +32,7 @@ pub(crate) fn logits_slice_to_distribution(
     tail_samples: usize,
 ) -> Distribution {
     let vocab_size = logits.len();
-    let log_probs = log_softmax(logits);
+    let log_normalizer = log_softmax_normalizer(logits);
     let k = top_k.min(vocab_size);
 
     let near_end = k.saturating_add(k.saturating_mul(4).min(vocab_size.saturating_sub(k)));
@@ -41,8 +40,8 @@ pub(crate) fn logits_slice_to_distribution(
 
     let mut indices: Vec<usize> = (0..vocab_size).collect();
     let cmp_desc = |a: &usize, b: &usize| {
-        log_probs[*b]
-            .partial_cmp(&log_probs[*a])
+        logits[*b]
+            .partial_cmp(&logits[*a])
             .unwrap_or(std::cmp::Ordering::Equal)
     };
 
@@ -64,7 +63,7 @@ pub(crate) fn logits_slice_to_distribution(
         .iter()
         .map(|&idx| LogitEntry {
             token_id: idx as u32,
-            log_prob: log_probs[idx],
+            log_prob: logits[idx] - log_normalizer,
         })
         .collect();
 
@@ -76,7 +75,8 @@ pub(crate) fn logits_slice_to_distribution(
         };
     }
 
-    let tail_mass = indices[k..].iter().map(|&idx| log_probs[idx].exp()).sum();
+    let top_mass: f32 = top_k_entries.iter().map(|entry| entry.log_prob.exp()).sum();
+    let tail_mass = (1.0 - top_mass).clamp(0.0, 1.0);
     let total_samples = tail_samples.min(vocab_size - k);
     let near_miss_count = total_samples.div_ceil(2);
     let bottom_count = total_samples / 2;
@@ -86,7 +86,7 @@ pub(crate) fn logits_slice_to_distribution(
         .choose_multiple(&mut rng, near_miss_count.min(near_end - k))
         .map(|&idx| LogitEntry {
             token_id: idx as u32,
-            log_prob: log_probs[idx],
+            log_prob: logits[idx] - log_normalizer,
         })
         .collect();
     tail.extend(
@@ -97,7 +97,7 @@ pub(crate) fn logits_slice_to_distribution(
             )
             .map(|&idx| LogitEntry {
                 token_id: idx as u32,
-                log_prob: log_probs[idx],
+                log_prob: logits[idx] - log_normalizer,
             }),
     );
 

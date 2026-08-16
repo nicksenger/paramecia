@@ -118,3 +118,36 @@ fn dense_indexed_moe_decode_swiglu_matches_cpu() -> Result<()> {
     assert!(max_abs_diff(&cpu_output, &cuda_output)? < 5e-3);
     Ok(())
 }
+
+#[test]
+fn dense_batched_swiglu_matches_single_expert_indexing() -> Result<()> {
+    if !utils::cuda_is_available() {
+        return Ok(());
+    }
+
+    let cuda = Device::new_cuda(0)?;
+    let (batch, n, k) = (32, 256, 256);
+    let gate = (0..n * k)
+        .map(|i| ((i as f32 + 1.0) * 0.007).sin() * 0.05)
+        .collect::<Vec<_>>();
+    let up = (0..n * k)
+        .map(|i| ((i as f32 + 3.0) * 0.009).cos() * 0.05)
+        .collect::<Vec<_>>();
+    let input = (0..batch * k)
+        .map(|i| ((i as f32 + 2.0) * 0.011).cos() * 0.1)
+        .collect::<Vec<_>>();
+
+    let gate = QTensor::quantize(
+        &Tensor::from_slice(&gate, (1, n, k), &cuda)?,
+        GgmlDType::Q4K,
+    )?;
+    let up = QTensor::quantize(&Tensor::from_slice(&up, (1, n, k), &cuda)?, GgmlDType::Q4K)?;
+    let input = Tensor::from_slice(&input, (batch, 1, k), &cuda)?;
+    let ids = Tensor::zeros((batch, 1), paramecia_core::DType::U32, &cuda)?;
+
+    let indexed = QTensor::indexed_moe_gate_up_swiglu(&gate, &up, &input, &ids)?;
+    let dense = QTensor::gate_up_swiglu(&gate.squeeze(0)?, &up.squeeze(0)?, &input)?;
+
+    assert!(max_abs_diff(&indexed, &dense)? < 5e-3);
+    Ok(())
+}
