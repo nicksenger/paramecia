@@ -800,43 +800,37 @@ extern "C" __global__ void delta_net_autoregressive_step_f32(
     float g = expf(gate[gate_offset]);       // exp(gate) for decay
     float beta_sig = 1.0f / (1.0f + expf(-beta[gate_offset]));  // sigmoid(beta)
     
-    // Step 1: Decay state FIRST (matching llama.cpp reference).
-    // Walk the matrix linearly so adjacent threads access adjacent elements.
-    // The old row-per-thread traversal made every warp issue strided 512-byte
-    // accesses for the common head_dim=128 case.
-    const size_t state_size = head_dim * head_dim;
-    for (size_t idx = tid; idx < state_size; idx += blockDim.x) {
-        new_state[state_offset + idx] = state[state_offset + idx] * g;
-    }
-    __syncthreads();
-    
-    // Step 2: Compute kv_mem from DECAYED state (no extra g!)
+    // Step 1: Compute kv_mem from the decayed state. Apply the scalar decay
+    // while loading the old state instead of materializing a full decayed
+    // state first. The old path wrote every state element, read it here, then
+    // read it again for the update below.
     // kv_mem[i] = sum_j(decayed_state[i, j] * k[j])
     // Assign one warp per row so state reads are coalesced and the dot product
     // is reduced with warp shuffles instead of running serially in one thread.
     for (size_t i = warp_id; i < head_dim; i += num_warps) {
         float acc = 0.0f;
         for (size_t j = lane; j < head_dim; j += WARP_SIZE) {
-            acc += new_state[state_offset + i * head_dim + j] * s_k[j];
+            const float decayed_val = state[state_offset + i * head_dim + j] * g;
+            acc += decayed_val * s_k[j];
         }
         acc = warp_reduce_sum(acc);
         if (lane == 0) s_kv_mem[i] = acc;
     }
     __syncthreads();
     
-    // Step 3: Compute delta = (v - kv_mem) * beta
+    // Step 2: Compute delta = (v - kv_mem) * beta
     for (size_t i = tid; i < head_dim; i += blockDim.x) {
         s_delta[i] = (s_v[i] - s_kv_mem[i]) * beta_sig;
     }
     __syncthreads();
     
-    // Step 4: Update decayed state and compute output
+    // Step 3: Update decayed state and compute output
     // new_state[i, j] = decayed_state[i, j] + k[j] * delta[i]  (no extra g!)
     // output[i] = sum_j(new_state[i, j] * q[j])
     for (size_t i = warp_id; i < head_dim; i += num_warps) {
         float out_acc = 0.0f;
         for (size_t j = lane; j < head_dim; j += WARP_SIZE) {
-            float decayed_val = new_state[state_offset + i * head_dim + j];
+            const float decayed_val = state[state_offset + i * head_dim + j] * g;
             float updated_val = decayed_val + s_k[j] * s_delta[i];
             new_state[state_offset + i * head_dim + j] = updated_val;
             out_acc += updated_val * s_q[j];
