@@ -657,6 +657,26 @@ struct DecomposedZO {
     pending_state: Option<DecomposedZOState>,
 }
 
+#[derive(Clone, Copy)]
+enum ModelLifecycleEvent {
+    /// Clears inference state only; an in-progress optimization cycle survives.
+    InferenceReset,
+    /// Unloading the model aborts any in-progress optimization cycle.
+    ModelUnload,
+}
+
+impl DecomposedZO {
+    fn handle_lifecycle(&mut self, event: ModelLifecycleEvent) {
+        match event {
+            ModelLifecycleEvent::InferenceReset => {}
+            ModelLifecycleEvent::ModelUnload => {
+                self.optimizer.clear_decomposed_perturbation();
+                self.pending_state = None;
+            }
+        }
+    }
+}
+
 /// Process a single command from the actor's command channel.
 #[allow(clippy::too_many_arguments)]
 async fn process_command(
@@ -735,8 +755,7 @@ async fn process_command(
         }
         ModelCommand::ResetState { respond } => {
             if let Some(dzo) = decomposed_zo.as_mut() {
-                dzo.optimizer.clear_decomposed_perturbation();
-                dzo.pending_state = None;
+                dzo.handle_lifecycle(ModelLifecycleEvent::InferenceReset);
             }
             executor.reset_state();
             let _ = respond.send(Ok(()));
@@ -882,8 +901,7 @@ async fn process_command(
         }
         ModelCommand::UnloadModel { respond } => {
             if let Some(dzo) = decomposed_zo.as_mut() {
-                dzo.optimizer.clear_decomposed_perturbation();
-                dzo.pending_state = None;
+                dzo.handle_lifecycle(ModelLifecycleEvent::ModelUnload);
             }
             executor.unload_model();
             let _ = respond.send(Ok(()));
@@ -986,7 +1004,9 @@ pub(crate) fn spawn_model_actor(
 
 #[cfg(test)]
 mod tests {
-    use super::should_use_lazy_perturbations;
+    use super::{
+        should_use_lazy_perturbations, DecomposedZO, ModelLifecycleEvent, ParamsQuZO, QuZO,
+    };
 
     #[test]
     fn perturbation_memory_policy_honors_force_and_budget() {
@@ -994,5 +1014,59 @@ mod tests {
         assert!(!should_use_lazy_perturbations(false, 1024, 1024));
         assert!(should_use_lazy_perturbations(false, 1025, 1024));
         assert!(should_use_lazy_perturbations(false, 1, 0));
+    }
+
+    #[test]
+    fn inference_resets_preserve_decomposed_zo_cycle_until_update() {
+        // An empty tensor list is sufficient to exercise the actor's cycle state
+        // without constructing a full model. Inference itself does not own or
+        // mutate this state; only its lifecycle event matters here.
+        let optimizer = QuZO::new_with_seed(
+            Vec::new(),
+            ParamsQuZO {
+                use_fused: false,
+                ..ParamsQuZO::default()
+            },
+            42,
+        )
+        .expect("create optimizer");
+        let mut decomposed_zo = DecomposedZO {
+            optimizer,
+            pending_state: None,
+        };
+
+        decomposed_zo.pending_state = Some(
+            decomposed_zo
+                .optimizer
+                .perturb_up(Some(7))
+                .expect("perturb up"),
+        );
+
+        // perturb_up -> inference -> reset_state -> perturb_down
+        decomposed_zo.handle_lifecycle(ModelLifecycleEvent::InferenceReset);
+        let state = decomposed_zo
+            .pending_state
+            .as_ref()
+            .expect("first inference reset must preserve the cycle");
+        decomposed_zo
+            .optimizer
+            .perturb_down(state)
+            .expect("perturb down");
+
+        // perturb_down -> inference -> reset_state -> update
+        decomposed_zo.handle_lifecycle(ModelLifecycleEvent::InferenceReset);
+        let state = decomposed_zo
+            .pending_state
+            .take()
+            .expect("second inference reset must preserve the cycle");
+        decomposed_zo
+            .optimizer
+            .update(state, 1.0, 0.5)
+            .expect("update");
+
+        assert!(
+            decomposed_zo.pending_state.is_none(),
+            "update must consume the pending cycle"
+        );
     }
 }
