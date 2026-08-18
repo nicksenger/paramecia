@@ -36,6 +36,7 @@ pub fn run(args: &ControlArgs) -> Result<()> {
         minibatch_size: args.minibatch_size,
         training_lr: args.training_lr,
         training_epsilon: args.training_epsilon,
+        training_perturbation_mode: args.training_perturbation_mode.clone(),
         checkpoint_dir,
         n_grad_steps: args.n_grad_steps,
         optimize_tensors: args.optimize_tensors.clone(),

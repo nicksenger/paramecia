@@ -11,10 +11,10 @@ pub use host::HostState;
 pub use paramecia_bridge::{ControllerBridge, ControllerHostEndpoint, create_bridge};
 pub use runtime::run_host;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use host::ModelBuilderConfig;
 use paramecia_engine::{
-    DeviceOffloadMode, KvCacheQuantization, TrainingConfig, select_best_device,
+    select_best_device, DeviceOffloadMode, KvCacheQuantization, PerturbationMode, TrainingConfig,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -116,6 +116,9 @@ pub struct HostOptions {
     /// QuZO perturbation epsilon.
     pub training_epsilon: f64,
 
+    /// QuZO direction space: "weight" or "activation".
+    pub training_perturbation_mode: String,
+
     /// Directory for training checkpoints.
     pub checkpoint_dir: String,
 
@@ -169,6 +172,7 @@ impl Default for HostOptions {
             minibatch_size: 2,
             training_lr: 0.0001,
             training_epsilon: 0.001,
+            training_perturbation_mode: "weight".to_string(),
             checkpoint_dir: "/tmp/paramecia-checkpoints".to_string(),
             n_grad_steps: 2,
             optimize_tensors: "all".to_string(),
@@ -188,6 +192,11 @@ impl Default for HostOptions {
 /// compiles the WASM controller, and runs it to completion.
 pub fn run_host_cli(options: HostOptions) -> Result<()> {
     let quiet = options.quiet;
+    let training_perturbation_mode = match options.training_perturbation_mode.as_str() {
+        "weight" => PerturbationMode::Weight,
+        "activation" => PerturbationMode::Activation,
+        mode => bail!("unsupported training perturbation mode '{mode}'"),
+    };
     macro_rules! log {
         ($($arg:tt)*) => { if !quiet { println!($($arg)*); } }
     }
@@ -266,6 +275,7 @@ pub fn run_host_cli(options: HostOptions) -> Result<()> {
             n_grad_steps: options.n_grad_steps,
             lr: options.training_lr,
             epsilon: options.training_epsilon,
+            perturbation_mode: training_perturbation_mode,
             optimize_tensors: options.optimize_tensors.clone(),
             lazy_perturbations: false,
             perturbation_memory_budget_bytes: TrainingConfig::default()

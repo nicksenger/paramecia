@@ -71,6 +71,7 @@
 
 pub mod moe;
 
+pub use paramecia_core::quantized::PerturbationMode;
 use paramecia_core::{Result, Tensor, Var};
 use rand::prelude::*;
 use rand::rngs::StdRng;
@@ -691,6 +692,25 @@ fn supports_gpu_perturb(qt: &QTensor) -> bool {
     false
 }
 
+/// Whether the on-the-fly forward path implements this direction mode.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
+fn supports_fused_forward(qt: &QTensor, mode: PerturbationMode) -> bool {
+    if !supports_gpu_perturb(qt) {
+        return false;
+    }
+    if mode == PerturbationMode::Weight {
+        return true;
+    }
+    // The activation kernel currently targets 2D CUDA linear weights. Other
+    // backends/shapes use the materialized factored direction, preserving
+    // correctness until their specialized output kernels are available.
+    #[cfg(feature = "cuda")]
+    if qt.device().is_cuda() {
+        return qt.shape().rank() == 2;
+    }
+    false
+}
+
 /// Check if a QTensor supports GPU-accelerated restore_and_update (CUDA, Metal, or Vulkan).
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 fn supports_gpu_restore_update(qt: &QTensor) -> bool {
@@ -725,10 +745,48 @@ fn supports_gpu_restore_update(qt: &QTensor) -> bool {
 /// Generate a perturbation tensor deterministically from a seed and shape.
 ///
 /// Always generates on CPU. The same seed + shape always produces the same tensor.
-fn generate_perturbation(seed: u64, shape: &paramecia_core::Shape) -> Result<Tensor> {
-    let mut rng = StdRng::seed_from_u64(seed);
+fn generate_perturbation(
+    seed: u64,
+    shape: &paramecia_core::Shape,
+    mode: PerturbationMode,
+) -> Result<Tensor> {
+    const INPUT_STREAM: u64 = 0xA076_1D64_78BD_642F;
+    const OUTPUT_STREAM: u64 = 0xE703_7ED1_A0B4_28DB;
+
+    let data: Vec<f32> = match (mode, shape.dims().last().copied()) {
+        (PerturbationMode::Activation, Some(in_dim)) if in_dim > 0 => {
+            let rows = shape.elem_count() / in_dim;
+            let z_in: Vec<f32> = (0..in_dim)
+                .map(|col| philox_rademacher(seed ^ INPUT_STREAM, col as u64))
+                .collect();
+            let z_out: Vec<f32> = (0..rows)
+                .map(|row| philox_rademacher(seed ^ OUTPUT_STREAM, row as u64))
+                .collect();
+            (0..shape.elem_count())
+                .map(|index| z_out[index / in_dim] * z_in[index % in_dim])
+                .collect()
+        }
+        _ => {
+            let mut rng = StdRng::seed_from_u64(seed);
+            (0..shape.elem_count())
+                .map(|_| rng.sample::<f32, _>(rand_distr::StandardNormal))
+                .collect()
+        }
+    };
+    Tensor::from_vec(data, shape.clone(), &paramecia_core::Device::Cpu)
+}
+
+/// Regenerate the exact Philox direction used by fused backend kernels.
+fn generate_fused_perturbation(
+    seed: u64,
+    shape: &paramecia_core::Shape,
+    mode: PerturbationMode,
+) -> Result<Tensor> {
+    if mode == PerturbationMode::Activation {
+        return generate_perturbation(seed, shape, mode);
+    }
     let data: Vec<f32> = (0..shape.elem_count())
-        .map(|_| rng.sample::<f32, _>(rand_distr::StandardNormal))
+        .map(|index| philox_gaussian(seed, index as u64))
         .collect();
     Tensor::from_vec(data, shape.clone(), &paramecia_core::Device::Cpu)
 }
@@ -841,6 +899,16 @@ pub fn philox_gaussian(seed: u64, index: u64) -> f32 {
     (radius * theta.cos()) as f32
 }
 
+/// Generate a fixed-norm Rademacher sample from the Philox stream.
+#[inline]
+fn philox_rademacher(seed: u64, index: u64) -> f32 {
+    if philox4x32(seed, index)[0] & 1 == 0 {
+        -1.0
+    } else {
+        1.0
+    }
+}
+
 /// Error feedback mode for accumulated error in quantized updates (QES-style).
 ///
 /// When update magnitudes are smaller than the quantization grid spacing,
@@ -906,6 +974,13 @@ pub struct ParamsQuZO {
     ///
     /// For unsupported configurations, falls back to regular perturbation.
     pub use_fused: bool,
+    /// Parameterization of the random search direction.
+    ///
+    /// Activation mode uses a rank-one factored Rademacher direction at every
+    /// optimized linear boundary. It avoids sampling independent noise for
+    /// every weight while retaining an exact direction that can be replayed
+    /// during the update.
+    pub perturbation_mode: PerturbationMode,
     /// Optional per-tensor epsilon multipliers.
     ///
     /// When set, tensor i uses epsilon * epsilon_multipliers[i] for perturbation.
@@ -952,6 +1027,7 @@ impl Default for ParamsQuZO {
             num_samples: 1,
             clip_threshold: 1.0,
             use_fused: true,
+            perturbation_mode: PerturbationMode::Weight,
             epsilon_multipliers: None,
             lazy_perturbations: false,
             error_feedback: None,
@@ -1177,7 +1253,9 @@ impl QuZO {
                 Some(
                     specs
                         .into_par_iter()
-                        .map(|(seed, shape)| generate_perturbation(seed, &shape))
+                        .map(|(seed, shape)| {
+                            generate_perturbation(seed, &shape, self.params.perturbation_mode)
+                        })
                         .collect::<Result<Vec<_>>>()?,
                 )
             } else {
@@ -1191,7 +1269,7 @@ impl QuZO {
                     if let Some(ref tensors) = prealloc {
                         tensors[$i].clone()
                     } else {
-                        generate_perturbation(seeds[$i].0, $shape)?
+                        generate_perturbation(seeds[$i].0, $shape, self.params.perturbation_mode)?
                     }
                 };
             }
@@ -1398,7 +1476,10 @@ impl QuZO {
         let fused_tensors: Vec<bool> = self
             .qtensors
             .iter()
-            .map(|qt| self.params.use_fused && supports_gpu_perturb(&qt.read().unwrap()))
+            .map(|qt| {
+                self.params.use_fused
+                    && supports_fused_forward(&qt.read().unwrap(), self.params.perturbation_mode)
+            })
             .collect();
         #[cfg(not(any(feature = "cuda", feature = "metal", feature = "vulkan")))]
         let fused_tensors = vec![false; self.qtensors.len()];
@@ -1408,7 +1489,7 @@ impl QuZO {
             .any(|&fused| fused)
             .then(|| self.rng.random::<u64>());
 
-        // Materialized tensors use independent seeded Gaussian streams. Fused
+        // Materialized tensors use independent seeded direction streams. Fused
         // tensors use the model seed above and keep only an update-rounding seed.
         let seeds: Vec<(u64, u64)> = fused_tensors
             .iter()
@@ -1436,7 +1517,9 @@ impl QuZO {
             Some(
                 specs
                     .into_par_iter()
-                    .map(|(seed, shape)| generate_perturbation(seed, &shape))
+                    .map(|(seed, shape)| {
+                        generate_perturbation(seed, &shape, self.params.perturbation_mode)
+                    })
                     .collect::<Result<Vec<_>>>()?,
             )
         } else {
@@ -1453,7 +1536,7 @@ impl QuZO {
             let continuous = if let Some(ref tensors) = prealloc {
                 tensors[i].clone()
             } else {
-                generate_perturbation(seeds[i].0, qt_read.shape())?
+                generate_perturbation(seeds[i].0, qt_read.shape(), self.params.perturbation_mode)?
             };
             #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
             let perturbed = if supports_gpu_perturb(&qt_read) {
@@ -1478,10 +1561,11 @@ impl QuZO {
                     fused.then(|| (qt.read().unwrap().fused_tensor_id(), ordinal as u64))
                 })
                 .collect();
-            paramecia_core::quantized::set_scoped_perturbation_state(
+            paramecia_core::quantized::set_scoped_perturbation_state_with_mode(
                 seed,
                 epsilon,
                 &tensor_ordinals,
+                self.params.perturbation_mode,
             );
         }
 
@@ -1511,7 +1595,11 @@ impl QuZO {
                 let continuous = if let Some(ref tensors) = state.prealloc {
                     tensors[i].clone()
                 } else {
-                    generate_perturbation(state.seeds[i].0, qt_read.shape())?
+                    generate_perturbation(
+                        state.seeds[i].0,
+                        qt_read.shape(),
+                        self.params.perturbation_mode,
+                    )?
                 };
                 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
                 let perturbed = if supports_gpu_perturb(&qt_read) {
@@ -1545,10 +1633,11 @@ impl QuZO {
                     fused.then(|| (qt.read().unwrap().fused_tensor_id(), ordinal as u64))
                 })
                 .collect();
-            paramecia_core::quantized::set_scoped_perturbation_state(
+            paramecia_core::quantized::set_scoped_perturbation_state_with_mode(
                 seed,
                 -epsilon,
                 &tensor_ordinals,
+                self.params.perturbation_mode,
             );
         }
 
@@ -1616,13 +1705,10 @@ impl QuZO {
                 {
                     let tensor_seed =
                         state.fused_seed.expect("fused tensor missing model seed") ^ i as u64;
-                    let perturb_data: Vec<f32> = (0..qt_read.shape().elem_count())
-                        .map(|index| philox_gaussian(tensor_seed, index as u64))
-                        .collect();
-                    Tensor::from_vec(
-                        perturb_data,
-                        qt_read.shape().clone(),
-                        &paramecia_core::Device::Cpu,
+                    generate_fused_perturbation(
+                        tensor_seed,
+                        qt_read.shape(),
+                        self.params.perturbation_mode,
                     )?
                 }
                 #[cfg(not(any(feature = "cuda", feature = "metal", feature = "vulkan")))]
@@ -1630,7 +1716,11 @@ impl QuZO {
             } else if let Some(ref tensors) = state.prealloc {
                 tensors[i].clone()
             } else {
-                generate_perturbation(state.seeds[i].0, qt_read.shape())?
+                generate_perturbation(
+                    state.seeds[i].0,
+                    qt_read.shape(),
+                    self.params.perturbation_mode,
+                )?
             };
 
             if state.fused_tensors[i] {
@@ -1750,6 +1840,10 @@ impl QuZO {
             Vec::with_capacity(self.qtensors.len());
         for qt in &self.qtensors {
             let qt_read = qt.read().unwrap();
+            if !supports_fused_forward(&qt_read, self.params.perturbation_mode) {
+                drop(qt_read);
+                return self.step_two_sided(loss_fn);
+            }
             let dtype_ok = matches!(
                 qt_read.dtype(),
                 GgmlDType::Q8_0
@@ -1816,10 +1910,11 @@ impl QuZO {
 
             // Step 2: Forward pass with +ε perturbation (using fused kernel)
             let t1 = Instant::now();
-            paramecia_core::quantized::set_scoped_perturbation_state(
+            paramecia_core::quantized::set_scoped_perturbation_state_with_mode(
                 seed_forward,
                 epsilon,
                 &tensor_ordinals,
+                self.params.perturbation_mode,
             );
             let loss_plus = loss_fn().and_then(|loss| loss.to_vec0::<f32>());
             clear_perturbation_state();
@@ -1830,10 +1925,11 @@ impl QuZO {
 
             // Step 3: Forward pass with -ε perturbation (using fused kernel)
             let t2 = Instant::now();
-            paramecia_core::quantized::set_scoped_perturbation_state(
+            paramecia_core::quantized::set_scoped_perturbation_state_with_mode(
                 seed_forward,
                 -epsilon,
                 &tensor_ordinals,
+                self.params.perturbation_mode,
             );
             let loss_minus = loss_fn().and_then(|loss| loss.to_vec0::<f32>());
             clear_perturbation_state();
@@ -1862,12 +1958,11 @@ impl QuZO {
                 let effective_seed = seed_forward ^ ordinal as u64;
 
                 // Generate perturbation using Philox RNG (matches fused kernel)
-                let elem_count = shape.elem_count();
-                let perturb_data: Vec<f32> = (0..elem_count)
-                    .map(|i| philox_gaussian(effective_seed, i as u64))
-                    .collect();
-                let perturb_tensor =
-                    Tensor::from_vec(perturb_data, shape.clone(), &paramecia_core::Device::Cpu)?;
+                let perturb_tensor = generate_fused_perturbation(
+                    effective_seed,
+                    shape,
+                    self.params.perturbation_mode,
+                )?;
 
                 // Apply update: w̄ ← w̄ - Q(update_scale · u)
                 // (no restoration needed since weights were never modified)
@@ -1921,7 +2016,11 @@ impl QuZO {
                 }
                 let (_, seed_update) = entry.seeds[i];
                 let update_scale_i = (entry.update_scale * self.epsilon_multipliers[i]) as f32;
-                let perturbation = generate_perturbation(entry.seeds[i].0, qt_read.shape())?;
+                let perturbation = generate_perturbation(
+                    entry.seeds[i].0,
+                    qt_read.shape(),
+                    self.params.perturbation_mode,
+                )?;
                 let perturb_data = perturbation.flatten_all()?.to_vec1::<f32>()?;
                 qt_read.simulate_update_with_residual(
                     &perturb_data,
@@ -1961,6 +2060,59 @@ impl QuZO {
 mod tests {
     use super::*;
     use paramecia_core::Device;
+
+    #[test]
+    fn activation_direction_is_deterministic_and_rank_one() -> Result<()> {
+        let shape = paramecia_core::Shape::from((3, 4));
+        let first = generate_fused_perturbation(17, &shape, PerturbationMode::Activation)?
+            .to_vec2::<f32>()?;
+        let second = generate_fused_perturbation(17, &shape, PerturbationMode::Activation)?
+            .to_vec2::<f32>()?;
+        assert_eq!(first, second);
+        assert!(first.iter().flatten().all(|value| value.abs() == 1.0));
+
+        // Every 2x2 minor of an outer product is zero.
+        for row in 1..3 {
+            for col in 1..4 {
+                let minor = first[0][0] * first[row][col] - first[0][col] * first[row][0];
+                assert!(minor.abs() < 1e-5, "non-rank-one minor: {minor}");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn activation_mode_completes_fused_cuda_step() -> Result<()> {
+        use paramecia_core::quantized::{GgmlDType, QMatMul, QTensor, SharedQTensor};
+        use paramecia_core::Module;
+
+        let device = Device::new_cuda(0)?;
+        let weights: Vec<f32> = (0..32 * 32).map(|i| ((i as f32) * 0.03125).sin()).collect();
+        let input: Vec<f32> = (0..2 * 32).map(|i| ((i as f32) * 0.0625).cos()).collect();
+        let weights = Tensor::from_vec(weights, (32, 32), &device)?;
+        let shared = SharedQTensor::new(QTensor::quantize(&weights, GgmlDType::Q8_0)?);
+        let matmul = QMatMul::from_shared(shared.clone())?;
+        let input = Tensor::from_vec(input, (2, 32), &device)?;
+        let initial_generation = shared.generation();
+        let mut optimizer = QuZO::new_with_seed(
+            vec![shared.clone()],
+            ParamsQuZO {
+                lr: 1e-3,
+                epsilon: 1e-2,
+                clip_threshold: 10.0,
+                perturbation_mode: PerturbationMode::Activation,
+                ..ParamsQuZO::default()
+            },
+            42,
+        )?;
+
+        let loss = optimizer.step(|| matmul.forward(&input)?.sqr()?.mean_all())?;
+        assert!(loss.is_finite());
+        assert!(shared.generation() > initial_generation);
+        assert!(paramecia_core::quantized::get_perturbation_state().is_none());
+        Ok(())
+    }
 
     #[test]
     fn test_qzo_basic() -> Result<()> {

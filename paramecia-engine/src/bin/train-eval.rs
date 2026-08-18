@@ -2,8 +2,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use paramecia_engine::{
     Device, DeviceOffloadMode, ErrorFeedbackMode, ErrorFeedbackParams, HyperParameterUpdate,
-    KvCacheQuantization, ModelEngineBuilder, ModelInput, ReplayParams, TokenOutputStream,
-    TrainingConfig,
+    KvCacheQuantization, ModelEngineBuilder, ModelInput, PerturbationMode, ReplayParams,
+    TokenOutputStream, TrainingConfig,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -39,6 +39,30 @@ enum ErrorFeedbackArg {
     None,
     Persistent,
     Replay,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PerturbationModeArg {
+    Weight,
+    Activation,
+}
+
+impl From<PerturbationModeArg> for PerturbationMode {
+    fn from(value: PerturbationModeArg) -> Self {
+        match value {
+            PerturbationModeArg::Weight => Self::Weight,
+            PerturbationModeArg::Activation => Self::Activation,
+        }
+    }
+}
+
+impl PerturbationModeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Weight => "weight",
+            Self::Activation => "activation",
+        }
+    }
 }
 
 impl ErrorFeedbackArg {
@@ -151,6 +175,10 @@ struct Args {
     #[arg(long, default_value_t = 0.001)]
     epsilon: f64,
 
+    /// QuZO direction space (weight or activation-factored).
+    #[arg(long, value_enum, default_value_t = PerturbationModeArg::Weight)]
+    perturbation_mode: PerturbationModeArg,
+
     /// Tensors to optimize (all, attention, or qk).
     #[arg(long, default_value = "all")]
     optimize_tensors: String,
@@ -183,6 +211,7 @@ struct Args {
 #[derive(Debug, Serialize)]
 struct TrainEvalOutput {
     batch_size: usize,
+    perturbation_mode: &'static str,
     error_feedback: &'static str,
     perturb_up_seconds: Option<f64>,
     perturb_down_seconds: Option<f64>,
@@ -230,6 +259,7 @@ async fn run(args: Args) -> Result<()> {
         .training_config(TrainingConfig {
             lr: args.learning_rate,
             epsilon: args.epsilon,
+            perturbation_mode: args.perturbation_mode.into(),
             optimize_tensors: args.optimize_tensors.clone(),
             lazy_perturbations: args.lazy_perturbations,
             perturbation_memory_budget_bytes: args
@@ -342,6 +372,7 @@ async fn run(args: Args) -> Result<()> {
         .elapsed();
     let output = TrainEvalOutput {
         batch_size: args.batch_size,
+        perturbation_mode: args.perturbation_mode.as_str(),
         error_feedback: args.error_feedback.as_str(),
         perturb_up_seconds,
         perturb_down_seconds,
@@ -521,6 +552,8 @@ mod tests {
             "0.0002",
             "--epsilon",
             "0.002",
+            "--perturbation-mode",
+            "activation",
             "--optimize-tensors",
             "qk",
             "--loss-up",
@@ -541,6 +574,10 @@ mod tests {
         assert_eq!(args.perturbation_memory_budget_mib, 4096);
         assert_eq!(args.learning_rate, 0.0002);
         assert_eq!(args.epsilon, 0.002);
+        assert!(matches!(
+            args.perturbation_mode,
+            PerturbationModeArg::Activation
+        ));
         assert_eq!(args.optimize_tensors, "qk");
         assert_eq!(args.loss_up, 1.5);
         assert_eq!(args.loss_down, 0.5);

@@ -52,6 +52,20 @@ pub use k_quants::GgmlType;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+/// Space in which a QuZO direction is sampled.
+///
+/// `Activation` uses a factored Rademacher direction for every linear weight
+/// matrix, `u = z_out z_in^T`.  The corresponding forward perturbation is applied at
+/// the linear output as `epsilon * z_out * (x . z_in)`.  This samples only the
+/// input/output activation axes while still defining an exact, reproducible
+/// weight direction for the eventual quantized update.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PerturbationMode {
+    #[default]
+    Weight,
+    Activation,
+}
+
 /// Perturbation state for fused forward passes.
 #[derive(Debug, Clone, Copy)]
 pub struct PerturbationState {
@@ -59,6 +73,8 @@ pub struct PerturbationState {
     pub seed: u64,
     /// Perturbation magnitude (can be positive or negative)
     pub epsilon: f32,
+    /// Direction parameterization used by this pass.
+    pub mode: PerturbationMode,
 }
 
 thread_local! {
@@ -71,8 +87,17 @@ thread_local! {
 /// Set the perturbation state for the current thread.
 /// When set, QMatMul::forward will use fused perturbation.
 pub fn set_perturbation_state(seed: u64, epsilon: f32) {
+    set_perturbation_state_with_mode(seed, epsilon, PerturbationMode::Weight);
+}
+
+/// Set unscoped perturbation state with an explicit direction mode.
+pub fn set_perturbation_state_with_mode(seed: u64, epsilon: f32, mode: PerturbationMode) {
     PERTURBATION_STATE.with(|state| {
-        *state.borrow_mut() = Some(PerturbationState { seed, epsilon });
+        *state.borrow_mut() = Some(PerturbationState {
+            seed,
+            epsilon,
+            mode,
+        });
     });
     PERTURBATION_TENSOR_ORDINALS.with(|ordinals| *ordinals.borrow_mut() = None);
 }
@@ -83,8 +108,27 @@ pub fn set_perturbation_state(seed: u64, epsilon: f32) {
 /// derived from the stable ordinal, so perturbations remain deterministic when
 /// device allocations change across model reloads.
 pub fn set_scoped_perturbation_state(seed: u64, epsilon: f32, tensor_ordinals: &[(u64, u64)]) {
+    set_scoped_perturbation_state_with_mode(
+        seed,
+        epsilon,
+        tensor_ordinals,
+        PerturbationMode::Weight,
+    );
+}
+
+/// Set model-scoped perturbation state with an explicit direction mode.
+pub fn set_scoped_perturbation_state_with_mode(
+    seed: u64,
+    epsilon: f32,
+    tensor_ordinals: &[(u64, u64)],
+    mode: PerturbationMode,
+) {
     PERTURBATION_STATE.with(|state| {
-        *state.borrow_mut() = Some(PerturbationState { seed, epsilon });
+        *state.borrow_mut() = Some(PerturbationState {
+            seed,
+            epsilon,
+            mode,
+        });
     });
     PERTURBATION_TENSOR_ORDINALS.with(|ordinals| {
         *ordinals.borrow_mut() = Some(tensor_ordinals.iter().copied().collect());
@@ -117,6 +161,7 @@ pub fn get_perturbation_state_for_tensor(tensor_id: u64) -> Option<PerturbationS
         Some(ordinals) => ordinals.get(&tensor_id).map(|ordinal| PerturbationState {
             seed: state.seed ^ ordinal ^ tensor_id,
             epsilon: state.epsilon,
+            mode: state.mode,
         }),
     })
 }
@@ -151,10 +196,20 @@ mod perturbation_state_tests {
         let state = get_perturbation_state_for_tensor(100).expect("registered tensor state");
         assert_eq!(state.seed, 7 ^ 3 ^ 100);
         assert_eq!(state.epsilon, 0.25);
+        assert_eq!(state.mode, PerturbationMode::Weight);
         assert!(get_perturbation_state_for_tensor(101).is_none());
 
         clear_perturbation_state();
         assert!(get_perturbation_state().is_none());
+    }
+
+    #[test]
+    fn scoped_state_preserves_activation_mode() {
+        set_scoped_perturbation_state_with_mode(11, -0.5, &[(22, 4)], PerturbationMode::Activation);
+        let state = get_perturbation_state_for_tensor(22).expect("registered tensor state");
+        assert_eq!(state.seed, 11 ^ 4 ^ 22);
+        assert_eq!(state.mode, PerturbationMode::Activation);
+        clear_perturbation_state();
     }
 }
 
@@ -2404,6 +2459,28 @@ impl QTensor {
         crate::bail!("fused_fwd requires CUDA, Metal, or Vulkan storage")
     }
 
+    /// CUDA activation-space fused forward for a factored QuZO direction.
+    #[cfg(feature = "cuda")]
+    pub fn fused_activation_fwd(&self, x: &Tensor, seed: u64, epsilon: f32) -> Result<Tensor> {
+        let cuda_storage = match self.storage.as_ref() {
+            QStorage::Cuda(storage) => storage,
+            _ => crate::bail!("fused_activation_fwd requires CUDA storage"),
+        };
+        let x_contiguous = x.to_device(&self.device())?.contiguous()?;
+        let x_storage_guard = x_contiguous.storage_and_layout();
+        let (x_storage, x_layout) = (&*x_storage_guard.0, x_storage_guard.1);
+        let x_cuda = match x_storage {
+            Storage::Cuda(storage) => storage,
+            _ => crate::bail!("Failed to move activation input to CUDA"),
+        };
+        let (out_storage, out_shape) =
+            cuda_storage.fused_activation_fwd(self.shape(), x_cuda, x_layout, seed, epsilon)?;
+        Ok(crate::tensor::from_storage(
+            Storage::Cuda(out_storage),
+            out_shape,
+        ))
+    }
+
     /// CPU fused dequantize + perturb + matmul operation.
     ///
     /// This dequantizes the weights with on-the-fly perturbation, then performs
@@ -2487,6 +2564,91 @@ impl QTensor {
 
         // Convert back to original dtype and device
         result.to_dtype(in_dtype)?.to_device(&original_device)
+    }
+
+    /// CPU activation-space counterpart of [`Self::fused_cpu_forward`].
+    ///
+    /// For a weight matrix `W[out, in]`, the sampled direction is the outer
+    /// product `z_out z_in^T`.  Rather than perturbing every dequantized weight,
+    /// this computes the regular matmul and adds the algebraically equivalent
+    /// output perturbation `epsilon * z_out * (x . z_in)`.
+    pub fn fused_activation_cpu_forward(
+        &self,
+        x: &Tensor,
+        seed: u64,
+        epsilon: f32,
+    ) -> Result<Tensor> {
+        use k_quants::stochastic::philox4x32;
+
+        const INPUT_STREAM: u64 = 0xA076_1D64_78BD_642F;
+        const OUTPUT_STREAM: u64 = 0xE703_7ED1_A0B4_28DB;
+
+        let cpu_storage = match self.storage.as_ref() {
+            QStorage::Cpu(s) => s,
+            _ => crate::bail!("fused_activation_cpu_forward requires CPU storage"),
+        };
+        let tensor_ptr = cpu_storage.as_ptr() as u64;
+        let effective_seed = seed ^ tensor_ptr;
+        let (out_dim, in_dim) = self.shape().dims2()?;
+
+        let x_dims = x.dims();
+        let x_cpu = x.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        let original_device = x.device().clone();
+        let original_dtype = x.dtype();
+        let batch_size = if x_dims.len() == 1 {
+            1
+        } else {
+            x_dims[..x_dims.len() - 1].iter().product()
+        };
+        let x_2d = x_cpu.reshape((batch_size, in_dim))?.contiguous()?;
+        let x_guard = x_2d.storage_and_layout().0;
+        let lhs = match &*x_guard {
+            Storage::Cpu(cpu) => cpu.as_slice::<f32>()?,
+            _ => crate::bail!("expected CPU activation input"),
+        };
+
+        let mut dst = vec![0f32; batch_size * out_dim];
+        cpu_storage.matmul_t((batch_size, in_dim, out_dim), lhs, &mut dst)?;
+
+        let z_in: Vec<f32> = (0..in_dim)
+            .map(|i| {
+                if philox4x32(effective_seed ^ INPUT_STREAM, i as u64)[0] & 1 == 0 {
+                    -1.0
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        let z_out: Vec<f32> = (0..out_dim)
+            .map(|i| {
+                if philox4x32(effective_seed ^ OUTPUT_STREAM, i as u64)[0] & 1 == 0 {
+                    -1.0
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        for batch in 0..batch_size {
+            let input = &lhs[batch * in_dim..(batch + 1) * in_dim];
+            let projection = input
+                .iter()
+                .zip(&z_in)
+                .map(|(&value, &direction)| value * direction)
+                .sum::<f32>();
+            for (out, &direction) in z_out.iter().enumerate() {
+                dst[batch * out_dim + out] += epsilon * projection * direction;
+            }
+        }
+
+        let result = Tensor::from_vec(dst, (batch_size, out_dim), &Device::Cpu)?;
+        let result = if x_dims.len() == 1 {
+            result.reshape(out_dim)?
+        } else {
+            let mut shape = x_dims[..x_dims.len() - 1].to_vec();
+            shape.push(out_dim);
+            result.reshape(shape)?
+        };
+        result.to_dtype(original_dtype)?.to_device(&original_device)
     }
 
     /// Slice the first dimension of the quantized tensor, keeping it quantized.
@@ -3525,6 +3687,23 @@ impl QMatMul {
             }
         }
     }
+
+    /// Fused activation-boundary forward for a factored QuZO direction.
+    #[cfg(feature = "cuda")]
+    pub fn fused_activation_forward(&self, x: &Tensor, seed: u64, epsilon: f32) -> Result<Tensor> {
+        match self {
+            Self::QTensor(t) => t.fused_activation_fwd(x, seed, epsilon),
+            Self::Shared(t) => {
+                let qt = t.read().map_err(|e| {
+                    crate::Error::Msg(format!("QMatMul::Shared read lock failed: {e}"))
+                })?;
+                qt.fused_activation_fwd(x, seed, epsilon)
+            }
+            Self::Tensor(_) | Self::TensorF16(_) => crate::bail!(
+                "fused_activation_forward only supports quantized weights (QTensor/Shared)"
+            ),
+        }
+    }
 }
 
 impl crate::CustomOp1 for QTensor {
@@ -3654,6 +3833,9 @@ impl crate::Module for QMatMul {
                                     | GgmlDType::BF16
                             )
                         {
+                            if perturb.mode == PerturbationMode::Activation {
+                                return t.fused_activation_fwd(xs, perturb.seed, perturb.epsilon);
+                            }
                             return t.fused_fwd(xs, perturb.seed, perturb.epsilon);
                         }
                         // Metal fused path
@@ -3690,6 +3872,13 @@ impl crate::Module for QMatMul {
                         }
                         // CPU fused path - dequantize with perturbation then matmul
                         if t.device().is_cpu() {
+                            if perturb.mode == PerturbationMode::Activation {
+                                return t.fused_activation_cpu_forward(
+                                    xs,
+                                    perturb.seed,
+                                    perturb.epsilon,
+                                );
+                            }
                             return t.fused_cpu_forward(xs, perturb.seed, perturb.epsilon);
                         }
                     }
@@ -3717,6 +3906,9 @@ impl crate::Module for QMatMul {
                                     | GgmlDType::BF16
                             )
                         {
+                            if perturb.mode == PerturbationMode::Activation {
+                                return qt.fused_activation_fwd(xs, perturb.seed, perturb.epsilon);
+                            }
                             return qt.fused_fwd(xs, perturb.seed, perturb.epsilon);
                         }
                         // Metal fused path
@@ -3753,6 +3945,13 @@ impl crate::Module for QMatMul {
                         }
                         // CPU fused path
                         if qt.device().is_cpu() {
+                            if perturb.mode == PerturbationMode::Activation {
+                                return qt.fused_activation_cpu_forward(
+                                    xs,
+                                    perturb.seed,
+                                    perturb.epsilon,
+                                );
+                            }
                             return qt.fused_cpu_forward(xs, perturb.seed, perturb.epsilon);
                         }
                     }

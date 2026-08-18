@@ -13,7 +13,7 @@ use paramecia_model::gguf_file;
 use paramecia_model::GgmlDType;
 use paramecia_opt::{
     run_training_step_with_grad_accum, save_trained_model, DecomposedZOState, DistillationLoss,
-    EpsilonConfig, MtpLossConfig, OptimizeTensors, ParamsQuZO, QuZO,
+    EpsilonConfig, MtpLossConfig, OptimizeTensors, ParamsQuZO, PerturbationMode, QuZO,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -130,6 +130,8 @@ pub struct TrainingConfig {
     pub n_grad_steps: usize,
     pub lr: f64,
     pub epsilon: f64,
+    /// Direction parameterization used by QuZO training.
+    pub perturbation_mode: PerturbationMode,
     pub optimize_tensors: String,
     /// Always regenerate perturbations one tensor at a time.
     pub lazy_perturbations: bool,
@@ -154,6 +156,7 @@ impl Default for TrainingConfig {
             n_grad_steps: 2,
             lr: 0.0001,
             epsilon: 0.001,
+            perturbation_mode: PerturbationMode::Weight,
             optimize_tensors: "all".to_string(),
             lazy_perturbations: false,
             perturbation_memory_budget_bytes: 4 * 1024 * 1024 * 1024,
@@ -292,6 +295,7 @@ struct TrainingSubsystem {
     n_grad_steps: usize,
     lr: f64,
     epsilon: f64,
+    perturbation_mode: PerturbationMode,
     clip_threshold: f64,
     error_feedback: Option<ErrorFeedbackMode>,
     error_decay: f64,
@@ -333,6 +337,7 @@ fn ensure_training_subsystem<'a>(
             n_grad_steps: config.n_grad_steps,
             lr: config.lr,
             epsilon: config.epsilon,
+            perturbation_mode: config.perturbation_mode,
             clip_threshold: config.clip_threshold,
             error_feedback: None,
             error_decay: 0.9,
@@ -489,6 +494,7 @@ fn setup_optimizer(
         filtered.len(),
         ts.optimize_tensors
     );
+    info!("QuZO perturbation mode: {:?}", ts.perturbation_mode);
 
     let epsilon_multipliers: Vec<f64> = filtered
         .iter()
@@ -520,6 +526,7 @@ fn setup_optimizer(
         clip_threshold: ts.clip_threshold,
         // Scoped fused state limits on-the-fly perturbation to this optimizer set.
         use_fused: true,
+        perturbation_mode: ts.perturbation_mode,
         epsilon_multipliers: Some(epsilon_multipliers),
         lazy_perturbations,
         error_feedback: ts.error_feedback.as_ref().and_then(|ef| match ef {

@@ -117,6 +117,67 @@ __device__ __forceinline__ float philox_gaussian(uint64_t seed, uint64_t index) 
     return radius * cosf(theta);
 }
 
+// Fixed-norm Rademacher directions have lower fourth moment than Gaussian
+// directions and avoid the Box-Muller transcendental operations.
+__device__ __forceinline__ float philox_rademacher(uint64_t seed, uint64_t index) {
+    uint32_t r0, r1, r2, r3;
+    philox4x32(seed, index, r0, r1, r2, r3);
+    return (r0 & 1U) ? 1.0f : -1.0f;
+}
+
+// ============================================================================
+// Activation-space factored perturbation
+// ============================================================================
+// A rank-one weight direction z_out z_in^T is exactly equivalent to adding
+// z_out * (x dot z_in) at a linear layer's output.  This kernel applies that
+// correction after the regular quantized matmul, avoiding per-weight RNG and
+// keeping the random search dimension at the activation boundaries.
+
+#define ACTIVATION_INPUT_STREAM  0xA0761D6478BD642FULL
+#define ACTIVATION_OUTPUT_STREAM 0xE7037ED1A0B428DBULL
+
+extern "C" __global__ void activation_perturb_f32(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    const int ncols,
+    const int nrows,
+    const uint64_t seed,
+    const float epsilon,
+    const uint64_t weight_ptr
+) {
+    const int batch = blockIdx.x;
+    const int tid = threadIdx.x;
+    const uint64_t effective_seed = seed ^ weight_ptr;
+    const float* x = input + (size_t)batch * ncols;
+    float* y = output + (size_t)batch * nrows;
+
+    float projection = 0.0f;
+    for (int col = tid; col < ncols; col += blockDim.x) {
+        const float z_in = philox_rademacher(
+            effective_seed ^ ACTIVATION_INPUT_STREAM,
+            (uint64_t)col
+        );
+        projection += x[col] * z_in;
+    }
+
+    extern __shared__ float reduction[];
+    reduction[tid] = projection;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) reduction[tid] += reduction[tid + stride];
+        __syncthreads();
+    }
+    projection = reduction[0];
+
+    for (int row = tid; row < nrows; row += blockDim.x) {
+        const float z_out = philox_rademacher(
+            effective_seed ^ ACTIVATION_OUTPUT_STREAM,
+            (uint64_t)row
+        );
+        y[row] += epsilon * projection * z_out;
+    }
+}
+
 // ============================================================================
 // Q8_0 Block Structure
 // ============================================================================

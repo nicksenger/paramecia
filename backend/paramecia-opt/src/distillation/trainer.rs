@@ -403,6 +403,7 @@ impl DistillationTrainer {
             // Always use two-sided (central) differences for large MoE models
             // This provides stability for router/gate layers and DeltaNet states
             use_fused: true,
+            perturbation_mode: crate::PerturbationMode::Weight,
             epsilon_multipliers: Some(epsilon_multipliers),
             lazy_perturbations: self.config.lazy_perturbations,
             error_feedback: None,

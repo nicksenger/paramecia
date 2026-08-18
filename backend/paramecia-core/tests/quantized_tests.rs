@@ -88,6 +88,72 @@ fn test_matmul_mm() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
+#[test]
+fn test_cuda_activation_perturbation_matches_factored_direction() -> Result<()> {
+    use quantized::k_quants::stochastic::philox4x32;
+
+    const INPUT_STREAM: u64 = 0xA076_1D64_78BD_642F;
+    const OUTPUT_STREAM: u64 = 0xE703_7ED1_A0B4_28DB;
+
+    let device = Device::new_cuda(0)?;
+    let (batch, out_dim, in_dim) = (2, 32, 32);
+    let weights: Vec<f32> = (0..out_dim * in_dim)
+        .map(|i| ((i as f32) * 0.03125).sin())
+        .collect();
+    let input: Vec<f32> = (0..batch * in_dim)
+        .map(|i| ((i as f32) * 0.0625).cos())
+        .collect();
+    let weight_tensor = Tensor::from_vec(weights, (out_dim, in_dim), &device)?;
+    let qtensor = quantized::QTensor::quantize(&weight_tensor, GgmlDType::Q8_0)?;
+    let tensor_id = qtensor.fused_tensor_id();
+    let matmul = quantized::QMatMul::from_qtensor(qtensor)?;
+    let input_tensor = Tensor::from_vec(input.clone(), (batch, in_dim), &device)?;
+
+    let seed = 1234;
+    let epsilon = 0.01;
+    let base = matmul.forward(&input_tensor)?.to_vec2::<f32>()?;
+    let perturbed = matmul
+        .fused_activation_forward(&input_tensor, seed, epsilon)?
+        .to_vec2::<f32>()?;
+
+    let effective_seed = seed ^ tensor_id;
+    let z_in: Vec<f32> = (0..in_dim)
+        .map(|i| {
+            if philox4x32(effective_seed ^ INPUT_STREAM, i as u64)[0] & 1 == 0 {
+                -1.0
+            } else {
+                1.0
+            }
+        })
+        .collect();
+    let z_out: Vec<f32> = (0..out_dim)
+        .map(|i| {
+            if philox4x32(effective_seed ^ OUTPUT_STREAM, i as u64)[0] & 1 == 0 {
+                -1.0
+            } else {
+                1.0
+            }
+        })
+        .collect();
+    for b in 0..batch {
+        let projection = input[b * in_dim..(b + 1) * in_dim]
+            .iter()
+            .zip(&z_in)
+            .map(|(&x, &z)| x * z)
+            .sum::<f32>();
+        for out in 0..out_dim {
+            let expected = base[b][out] + epsilon * projection * z_out[out];
+            assert!(
+                (perturbed[b][out] - expected).abs() < 2e-3,
+                "activation perturbation mismatch at [{b}, {out}]: {} vs {expected}",
+                perturbed[b][out]
+            );
+        }
+    }
+    Ok(())
+}
+
 fn quantized_matmul(device: &Device) -> Result<()> {
     let (m, k, n) = (3, 64, 4);
     let lhs_s = (0..(m * k)).map(|v| v as f32).collect::<Vec<_>>();

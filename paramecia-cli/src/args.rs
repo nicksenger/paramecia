@@ -202,6 +202,10 @@ pub struct ControlArgs {
     #[arg(long, default_value = "0.001")]
     pub training_epsilon: f64,
 
+    /// QuZO direction space: "weight" or "activation"
+    #[arg(long, default_value = "weight", value_parser = ["weight", "activation"])]
+    pub training_perturbation_mode: String,
+
     /// Directory for training checkpoints
     #[arg(long)]
     pub checkpoint_dir: Option<String>,

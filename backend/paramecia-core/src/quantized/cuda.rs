@@ -1784,6 +1784,79 @@ impl QCudaStorage {
         self.fused_matmul_vec(self_shape, storage, layout, seed, epsilon)
     }
 
+    /// Apply a factored QuZO direction at the activation boundary.
+    ///
+    /// This first runs the normal quantized matmul, then a CUDA kernel adds
+    /// `epsilon * z_out * (x . z_in)`.  It is algebraically identical to a
+    /// rank-one weight direction `z_out z_in^T`, which the optimizer can
+    /// regenerate later without retaining the activations or a dense random
+    /// tensor.
+    pub fn fused_activation_fwd(
+        &self,
+        self_shape: &crate::Shape,
+        storage: &CudaStorage,
+        layout: &crate::Layout,
+        seed: u64,
+        epsilon: f32,
+    ) -> Result<(CudaStorage, crate::Shape)> {
+        use crate::backend::BackendStorage;
+
+        let (nrows, ncols) = self_shape.dims2()?;
+        let input_dtype = storage.dtype();
+        let input_owned;
+        let input_layout;
+        let input_f32 = if input_dtype != crate::DType::F32 {
+            input_owned = storage.to_dtype(layout, crate::DType::F32)?;
+            input_layout = crate::Layout::contiguous(layout.shape());
+            &input_owned
+        } else {
+            input_layout = layout.clone();
+            storage
+        };
+
+        let (mut output, output_shape) = self.fwd(self_shape, input_f32, &input_layout)?;
+        let input_slice = input_f32.as_cuda_slice::<f32>()?;
+        let input_slice = match input_layout.contiguous_offsets() {
+            Some((start, end)) => input_slice.slice(start..end),
+            None => {
+                return Err(crate::Error::RequiresContiguous {
+                    op: "activation_perturb_f32",
+                }
+                .bt())
+            }
+        };
+        let output_slice = output.as_cuda_slice_mut::<f32>()?;
+        let batch_size = input_layout.shape().elem_count() / ncols;
+
+        let func = self
+            .device
+            .get_or_load_func("activation_perturb_f32", &paramecia_cuda::QUZO_FUSED)?;
+        let block_size = 256u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (batch_size as u32, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: block_size * std::mem::size_of::<f32>() as u32,
+        };
+        let ncols = ncols as i32;
+        let nrows = nrows as i32;
+        let weight_ptr = self.device_ptr_u64();
+        let mut builder = func.builder();
+        builder.arg(&input_slice);
+        builder.arg(output_slice);
+        builder.arg(&ncols);
+        builder.arg(&nrows);
+        builder.arg(&seed);
+        builder.arg(&epsilon);
+        builder.arg(&weight_ptr);
+        unsafe { builder.launch(cfg) }.w()?;
+
+        if input_dtype != crate::DType::F32 {
+            let output_layout = crate::Layout::contiguous(&output_shape);
+            output = output.to_dtype(&output_layout, input_dtype)?;
+        }
+        Ok((output, output_shape))
+    }
+
     fn fused_matmul_vec(
         &self,
         self_shape: &crate::Shape,

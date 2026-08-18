@@ -31,4 +31,4 @@ pub use distillation::{
 };
 pub use fuse::{fuse_models, parse_model_spec, FuseOptions, QuantConflictStrategy};
 pub use prune::{prune_experts, prune_layers, PruneExpertsOptions, PruneLayersOptions};
-pub use qzo::{DecomposedZOState, ErrorFeedbackMode, ParamsQuZO, QuZO};
+pub use qzo::{DecomposedZOState, ErrorFeedbackMode, ParamsQuZO, PerturbationMode, QuZO};

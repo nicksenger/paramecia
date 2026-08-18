@@ -24,10 +24,10 @@ pub use types::*;
 pub use paramecia_model::gguf_file;
 pub use paramecia_model::vis;
 pub use paramecia_model::{
-    select_best_device, Device, DeviceOffloadMode, DType, GgmlDType, KvCacheQuantization,
+    select_best_device, DType, Device, DeviceOffloadMode, GgmlDType, KvCacheQuantization,
     LayerDeviceMap, Tensor, TokenOutputStream, YarnConfig,
 };
-pub use paramecia_opt::parse_model_spec;
+pub use paramecia_opt::{parse_model_spec, PerturbationMode};
 
 /// Build the model computation graph used by the visualizer.
 pub fn model_visualization_graph() -> vis::Graph {
