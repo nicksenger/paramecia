@@ -13,11 +13,7 @@
 
 # Paramecia
 
-Paramecia is a single-process artificial intelligence agent based on the Qwen3-Next/Qwen3.5 architectures, including TUI, inference engine with Metal/Vulkan/CUDA backends, zeroth-order tuning utilities for quantized weights, WASM extensions, type-level tensors shapes, etc.
+Paramecia is an LLM engine based on the Qwen3-Next/Qwen3.5 architectures with Metal/Vulkan/CUDA backends, zeroth-order tuning utilities for quantized weights, type-level tensors shapes, etc.
 
 It's largely vibe-coded, with a few sections written by hand for steering purposes.
-
-I've learned what I needed from this project. If you have questions about it, contact me directly.
-
-https://github.com/user-attachments/assets/66e98046-298b-4341-8d8d-be3089d82962
 
