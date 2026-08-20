@@ -26,7 +26,6 @@ paramecia-arrow = { path = "paramecia-arrow" }
 paramecia-core = { path = "paramecia-core" }
 paramecia-model = { path = "paramecia-model" }
 paramecia-nn = { path = "paramecia-nn" }
-paramecia-opt = { path = "paramecia-opt" }
 paramecia-tensor = { path = "paramecia-tensor" }
 
 # Shared deps used by backend crates
