@@ -1784,23 +1784,28 @@ impl QCudaStorage {
         self.fused_matmul_vec(self_shape, storage, layout, seed, epsilon)
     }
 
-    /// Apply a factored QuZO direction at the activation boundary.
+    /// Apply a low-rank factored QuZO direction at the activation boundary.
     ///
     /// This first runs the normal quantized matmul, then a CUDA kernel adds
-    /// `epsilon * z_out * (x . z_in)`.  It is algebraically identical to a
-    /// rank-one weight direction `z_out z_in^T`, which the optimizer can
-    /// regenerate later without retaining the activations or a dense random
-    /// tensor.
-    pub fn fused_activation_fwd(
+    /// `epsilon * sum_k(z_out,k * (x . z_in,k)) / sqrt(rank)`. It is
+    /// algebraically identical to the normalized low-rank weight direction the
+    /// optimizer regenerates later.
+    pub fn fused_low_rank_fwd(
         &self,
         self_shape: &crate::Shape,
         storage: &CudaStorage,
         layout: &crate::Layout,
         seed: u64,
         epsilon: f32,
+        rank: usize,
     ) -> Result<(CudaStorage, crate::Shape)> {
         use crate::backend::BackendStorage;
 
+        if rank == 0 {
+            crate::bail!("low-rank perturbation rank must be greater than zero");
+        }
+        let rank = i32::try_from(rank)
+            .map_err(|_| crate::Error::Msg("low-rank perturbation rank exceeds i32".into()))?;
         let (nrows, ncols) = self_shape.dims2()?;
         let input_dtype = storage.dtype();
         let input_owned;
@@ -1820,7 +1825,7 @@ impl QCudaStorage {
             Some((start, end)) => input_slice.slice(start..end),
             None => {
                 return Err(crate::Error::RequiresContiguous {
-                    op: "activation_perturb_f32",
+                    op: "low_rank_perturb_f32",
                 }
                 .bt())
             }
@@ -1830,7 +1835,7 @@ impl QCudaStorage {
 
         let func = self
             .device
-            .get_or_load_func("activation_perturb_f32", &paramecia_cuda::QUZO_FUSED)?;
+            .get_or_load_func("low_rank_perturb_f32", &paramecia_cuda::QUZO_FUSED)?;
         let block_size = 256u32;
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: (batch_size as u32, 1, 1),
@@ -1848,6 +1853,7 @@ impl QCudaStorage {
         builder.arg(&seed);
         builder.arg(&epsilon);
         builder.arg(&weight_ptr);
+        builder.arg(&rank);
         unsafe { builder.launch(cfg) }.w()?;
 
         if input_dtype != crate::DType::F32 {

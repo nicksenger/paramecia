@@ -90,7 +90,7 @@ fn test_matmul_mm() -> Result<()> {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn test_cuda_activation_perturbation_matches_factored_direction() -> Result<()> {
+fn test_cuda_low_rank_perturbation_matches_factored_direction() -> Result<()> {
     use quantized::k_quants::stochastic::philox4x32;
 
     const INPUT_STREAM: u64 = 0xA076_1D64_78BD_642F;
@@ -112,13 +112,14 @@ fn test_cuda_activation_perturbation_matches_factored_direction() -> Result<()> 
 
     let seed = 1234;
     let epsilon = 0.01;
+    let rank = 4;
     let base = matmul.forward(&input_tensor)?.to_vec2::<f32>()?;
     let perturbed = matmul
-        .fused_activation_forward(&input_tensor, seed, epsilon)?
+        .fused_low_rank_forward(&input_tensor, seed, epsilon, rank)?
         .to_vec2::<f32>()?;
 
     let effective_seed = seed ^ tensor_id;
-    let z_in: Vec<f32> = (0..in_dim)
+    let z_in: Vec<f32> = (0..rank * in_dim)
         .map(|i| {
             if philox4x32(effective_seed ^ INPUT_STREAM, i as u64)[0] & 1 == 0 {
                 -1.0
@@ -127,7 +128,7 @@ fn test_cuda_activation_perturbation_matches_factored_direction() -> Result<()> 
             }
         })
         .collect();
-    let z_out: Vec<f32> = (0..out_dim)
+    let z_out: Vec<f32> = (0..rank * out_dim)
         .map(|i| {
             if philox4x32(effective_seed ^ OUTPUT_STREAM, i as u64)[0] & 1 == 0 {
                 -1.0
@@ -136,17 +137,24 @@ fn test_cuda_activation_perturbation_matches_factored_direction() -> Result<()> 
             }
         })
         .collect();
+    let scale = epsilon / (rank as f32).sqrt();
     for b in 0..batch {
-        let projection = input[b * in_dim..(b + 1) * in_dim]
-            .iter()
-            .zip(&z_in)
-            .map(|(&x, &z)| x * z)
-            .sum::<f32>();
+        let input = &input[b * in_dim..(b + 1) * in_dim];
         for out in 0..out_dim {
-            let expected = base[b][out] + epsilon * projection * z_out[out];
+            let correction = (0..rank)
+                .map(|factor| {
+                    let projection = input
+                        .iter()
+                        .zip(&z_in[factor * in_dim..(factor + 1) * in_dim])
+                        .map(|(&x, &z)| x * z)
+                        .sum::<f32>();
+                    projection * z_out[factor * out_dim + out]
+                })
+                .sum::<f32>();
+            let expected = base[b][out] + scale * correction;
             assert!(
                 (perturbed[b][out] - expected).abs() < 2e-3,
-                "activation perturbation mismatch at [{b}, {out}]: {} vs {expected}",
+                "low-rank perturbation mismatch at [{b}, {out}]: {} vs {expected}",
                 perturbed[b][out]
             );
         }

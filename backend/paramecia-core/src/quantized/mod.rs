@@ -54,16 +54,36 @@ use std::collections::HashMap;
 
 /// Space in which a QuZO direction is sampled.
 ///
-/// `Activation` uses a factored Rademacher direction for every linear weight
-/// matrix, `u = z_out z_in^T`.  The corresponding forward perturbation is applied at
-/// the linear output as `epsilon * z_out * (x . z_in)`.  This samples only the
-/// input/output activation axes while still defining an exact, reproducible
-/// weight direction for the eventual quantized update.
+/// `LowRank(r)` uses a normalized sum of `r` factored Rademacher directions for
+/// every linear weight matrix,
+/// `u = sum_k(z_out,k z_in,k^T) / sqrt(r)`. The corresponding forward
+/// perturbation is applied at the linear output without materializing the dense
+/// direction. This samples only the input/output activation axes while still
+/// defining an exact, reproducible weight direction for the eventual quantized
+/// update.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum PerturbationMode {
     #[default]
     Weight,
-    Activation,
+    LowRank(usize),
+}
+
+impl PerturbationMode {
+    /// Validate parameters carried by the perturbation mode.
+    pub fn validate(self) -> Result<()> {
+        if matches!(self, Self::LowRank(0)) {
+            crate::bail!("low-rank perturbation rank must be greater than zero");
+        }
+        Ok(())
+    }
+
+    /// Return the configured low rank, if this is a factored direction.
+    pub const fn low_rank(self) -> Option<usize> {
+        match self {
+            Self::Weight => None,
+            Self::LowRank(rank) => Some(rank),
+        }
+    }
 }
 
 /// Perturbation state for fused forward passes.
@@ -204,12 +224,18 @@ mod perturbation_state_tests {
     }
 
     #[test]
-    fn scoped_state_preserves_activation_mode() {
-        set_scoped_perturbation_state_with_mode(11, -0.5, &[(22, 4)], PerturbationMode::Activation);
+    fn scoped_state_preserves_low_rank_mode() {
+        set_scoped_perturbation_state_with_mode(11, -0.5, &[(22, 4)], PerturbationMode::LowRank(4));
         let state = get_perturbation_state_for_tensor(22).expect("registered tensor state");
         assert_eq!(state.seed, 11 ^ 4 ^ 22);
-        assert_eq!(state.mode, PerturbationMode::Activation);
+        assert_eq!(state.mode, PerturbationMode::LowRank(4));
         clear_perturbation_state();
+    }
+
+    #[test]
+    fn low_rank_mode_rejects_zero_rank() {
+        assert!(PerturbationMode::LowRank(0).validate().is_err());
+        assert!(PerturbationMode::LowRank(1).validate().is_ok());
     }
 }
 
@@ -2459,22 +2485,31 @@ impl QTensor {
         crate::bail!("fused_fwd requires CUDA, Metal, or Vulkan storage")
     }
 
-    /// CUDA activation-space fused forward for a factored QuZO direction.
+    /// CUDA fused forward for a low-rank factored QuZO direction.
     #[cfg(feature = "cuda")]
-    pub fn fused_activation_fwd(&self, x: &Tensor, seed: u64, epsilon: f32) -> Result<Tensor> {
+    pub fn fused_low_rank_fwd(
+        &self,
+        x: &Tensor,
+        seed: u64,
+        epsilon: f32,
+        rank: usize,
+    ) -> Result<Tensor> {
+        if rank == 0 {
+            crate::bail!("low-rank perturbation rank must be greater than zero");
+        }
         let cuda_storage = match self.storage.as_ref() {
             QStorage::Cuda(storage) => storage,
-            _ => crate::bail!("fused_activation_fwd requires CUDA storage"),
+            _ => crate::bail!("fused_low_rank_fwd requires CUDA storage"),
         };
         let x_contiguous = x.to_device(&self.device())?.contiguous()?;
         let x_storage_guard = x_contiguous.storage_and_layout();
         let (x_storage, x_layout) = (&*x_storage_guard.0, x_storage_guard.1);
         let x_cuda = match x_storage {
             Storage::Cuda(storage) => storage,
-            _ => crate::bail!("Failed to move activation input to CUDA"),
+            _ => crate::bail!("failed to move low-rank perturbation input to CUDA"),
         };
         let (out_storage, out_shape) =
-            cuda_storage.fused_activation_fwd(self.shape(), x_cuda, x_layout, seed, epsilon)?;
+            cuda_storage.fused_low_rank_fwd(self.shape(), x_cuda, x_layout, seed, epsilon, rank)?;
         Ok(crate::tensor::from_storage(
             Storage::Cuda(out_storage),
             out_shape,
@@ -2566,26 +2601,30 @@ impl QTensor {
         result.to_dtype(in_dtype)?.to_device(&original_device)
     }
 
-    /// CPU activation-space counterpart of [`Self::fused_cpu_forward`].
+    /// CPU low-rank counterpart of [`Self::fused_cpu_forward`].
     ///
     /// For a weight matrix `W[out, in]`, the sampled direction is the outer
-    /// product `z_out z_in^T`.  Rather than perturbing every dequantized weight,
-    /// this computes the regular matmul and adds the algebraically equivalent
-    /// output perturbation `epsilon * z_out * (x . z_in)`.
-    pub fn fused_activation_cpu_forward(
+    /// product sum `sum_k(z_out,k z_in,k^T) / sqrt(rank)`. Rather than
+    /// perturbing every dequantized weight, this computes the regular matmul and
+    /// adds the algebraically equivalent low-rank output perturbation.
+    pub fn fused_low_rank_cpu_forward(
         &self,
         x: &Tensor,
         seed: u64,
         epsilon: f32,
+        rank: usize,
     ) -> Result<Tensor> {
         use k_quants::stochastic::philox4x32;
 
         const INPUT_STREAM: u64 = 0xA076_1D64_78BD_642F;
         const OUTPUT_STREAM: u64 = 0xE703_7ED1_A0B4_28DB;
 
+        if rank == 0 {
+            crate::bail!("low-rank perturbation rank must be greater than zero");
+        }
         let cpu_storage = match self.storage.as_ref() {
             QStorage::Cpu(s) => s,
-            _ => crate::bail!("fused_activation_cpu_forward requires CPU storage"),
+            _ => crate::bail!("fused_low_rank_cpu_forward requires CPU storage"),
         };
         let tensor_ptr = cpu_storage.as_ptr() as u64;
         let effective_seed = seed ^ tensor_ptr;
@@ -2604,39 +2643,43 @@ impl QTensor {
         let x_guard = x_2d.storage_and_layout().0;
         let lhs = match &*x_guard {
             Storage::Cpu(cpu) => cpu.as_slice::<f32>()?,
-            _ => crate::bail!("expected CPU activation input"),
+            _ => crate::bail!("expected CPU low-rank perturbation input"),
         };
 
         let mut dst = vec![0f32; batch_size * out_dim];
         cpu_storage.matmul_t((batch_size, in_dim, out_dim), lhs, &mut dst)?;
 
-        let z_in: Vec<f32> = (0..in_dim)
-            .map(|i| {
-                if philox4x32(effective_seed ^ INPUT_STREAM, i as u64)[0] & 1 == 0 {
-                    -1.0
-                } else {
-                    1.0
-                }
-            })
-            .collect();
-        let z_out: Vec<f32> = (0..out_dim)
-            .map(|i| {
-                if philox4x32(effective_seed ^ OUTPUT_STREAM, i as u64)[0] & 1 == 0 {
-                    -1.0
-                } else {
-                    1.0
-                }
-            })
-            .collect();
+        let scale = epsilon / (rank as f32).sqrt();
         for batch in 0..batch_size {
             let input = &lhs[batch * in_dim..(batch + 1) * in_dim];
-            let projection = input
-                .iter()
-                .zip(&z_in)
-                .map(|(&value, &direction)| value * direction)
-                .sum::<f32>();
-            for (out, &direction) in z_out.iter().enumerate() {
-                dst[batch * out_dim + out] += epsilon * projection * direction;
+            for factor in 0..rank {
+                let projection = input
+                    .iter()
+                    .enumerate()
+                    .map(|(col, &value)| {
+                        let index = factor * in_dim + col;
+                        let direction = if philox4x32(effective_seed ^ INPUT_STREAM, index as u64)
+                            [0]
+                            & 1
+                            == 0
+                        {
+                            -1.0
+                        } else {
+                            1.0
+                        };
+                        value * direction
+                    })
+                    .sum::<f32>();
+                for out in 0..out_dim {
+                    let index = factor * out_dim + out;
+                    let direction =
+                        if philox4x32(effective_seed ^ OUTPUT_STREAM, index as u64)[0] & 1 == 0 {
+                            -1.0
+                        } else {
+                            1.0
+                        };
+                    dst[batch * out_dim + out] += scale * projection * direction;
+                }
             }
         }
 
@@ -3688,19 +3731,25 @@ impl QMatMul {
         }
     }
 
-    /// Fused activation-boundary forward for a factored QuZO direction.
+    /// Fused activation-boundary forward for a low-rank QuZO direction.
     #[cfg(feature = "cuda")]
-    pub fn fused_activation_forward(&self, x: &Tensor, seed: u64, epsilon: f32) -> Result<Tensor> {
+    pub fn fused_low_rank_forward(
+        &self,
+        x: &Tensor,
+        seed: u64,
+        epsilon: f32,
+        rank: usize,
+    ) -> Result<Tensor> {
         match self {
-            Self::QTensor(t) => t.fused_activation_fwd(x, seed, epsilon),
+            Self::QTensor(t) => t.fused_low_rank_fwd(x, seed, epsilon, rank),
             Self::Shared(t) => {
                 let qt = t.read().map_err(|e| {
                     crate::Error::Msg(format!("QMatMul::Shared read lock failed: {e}"))
                 })?;
-                qt.fused_activation_fwd(x, seed, epsilon)
+                qt.fused_low_rank_fwd(x, seed, epsilon, rank)
             }
             Self::Tensor(_) | Self::TensorF16(_) => crate::bail!(
-                "fused_activation_forward only supports quantized weights (QTensor/Shared)"
+                "fused_low_rank_forward only supports quantized weights (QTensor/Shared)"
             ),
         }
     }
@@ -3833,8 +3882,13 @@ impl crate::Module for QMatMul {
                                     | GgmlDType::BF16
                             )
                         {
-                            if perturb.mode == PerturbationMode::Activation {
-                                return t.fused_activation_fwd(xs, perturb.seed, perturb.epsilon);
+                            if let PerturbationMode::LowRank(rank) = perturb.mode {
+                                return t.fused_low_rank_fwd(
+                                    xs,
+                                    perturb.seed,
+                                    perturb.epsilon,
+                                    rank,
+                                );
                             }
                             return t.fused_fwd(xs, perturb.seed, perturb.epsilon);
                         }
@@ -3872,11 +3926,12 @@ impl crate::Module for QMatMul {
                         }
                         // CPU fused path - dequantize with perturbation then matmul
                         if t.device().is_cpu() {
-                            if perturb.mode == PerturbationMode::Activation {
-                                return t.fused_activation_cpu_forward(
+                            if let PerturbationMode::LowRank(rank) = perturb.mode {
+                                return t.fused_low_rank_cpu_forward(
                                     xs,
                                     perturb.seed,
                                     perturb.epsilon,
+                                    rank,
                                 );
                             }
                             return t.fused_cpu_forward(xs, perturb.seed, perturb.epsilon);
@@ -3906,8 +3961,13 @@ impl crate::Module for QMatMul {
                                     | GgmlDType::BF16
                             )
                         {
-                            if perturb.mode == PerturbationMode::Activation {
-                                return qt.fused_activation_fwd(xs, perturb.seed, perturb.epsilon);
+                            if let PerturbationMode::LowRank(rank) = perturb.mode {
+                                return qt.fused_low_rank_fwd(
+                                    xs,
+                                    perturb.seed,
+                                    perturb.epsilon,
+                                    rank,
+                                );
                             }
                             return qt.fused_fwd(xs, perturb.seed, perturb.epsilon);
                         }
@@ -3945,11 +4005,12 @@ impl crate::Module for QMatMul {
                         }
                         // CPU fused path
                         if qt.device().is_cpu() {
-                            if perturb.mode == PerturbationMode::Activation {
-                                return qt.fused_activation_cpu_forward(
+                            if let PerturbationMode::LowRank(rank) = perturb.mode {
+                                return qt.fused_low_rank_cpu_forward(
                                     xs,
                                     perturb.seed,
                                     perturb.epsilon,
+                                    rank,
                                 );
                             }
                             return qt.fused_cpu_forward(xs, perturb.seed, perturb.epsilon);

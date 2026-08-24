@@ -44,23 +44,21 @@ enum ErrorFeedbackArg {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum PerturbationModeArg {
     Weight,
-    Activation,
-}
-
-impl From<PerturbationModeArg> for PerturbationMode {
-    fn from(value: PerturbationModeArg) -> Self {
-        match value {
-            PerturbationModeArg::Weight => Self::Weight,
-            PerturbationModeArg::Activation => Self::Activation,
-        }
-    }
+    LowRank,
 }
 
 impl PerturbationModeArg {
+    fn to_mode(self, rank: usize) -> PerturbationMode {
+        match self {
+            PerturbationModeArg::Weight => PerturbationMode::Weight,
+            PerturbationModeArg::LowRank => PerturbationMode::LowRank(rank),
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Weight => "weight",
-            Self::Activation => "activation",
+            Self::LowRank => "low-rank",
         }
     }
 }
@@ -175,9 +173,13 @@ struct Args {
     #[arg(long, default_value_t = 0.001)]
     epsilon: f64,
 
-    /// QuZO direction space (weight or activation-factored).
+    /// QuZO direction space (weight or low-rank factored).
     #[arg(long, value_enum, default_value_t = PerturbationModeArg::Weight)]
     perturbation_mode: PerturbationModeArg,
+
+    /// Number of factors used by low-rank perturbations.
+    #[arg(long, default_value_t = 1)]
+    perturbation_rank: usize,
 
     /// Tensors to optimize (all, attention, or qk).
     #[arg(long, default_value = "all")]
@@ -212,6 +214,7 @@ struct Args {
 struct TrainEvalOutput {
     batch_size: usize,
     perturbation_mode: &'static str,
+    perturbation_rank: Option<usize>,
     error_feedback: &'static str,
     perturb_up_seconds: Option<f64>,
     perturb_down_seconds: Option<f64>,
@@ -239,6 +242,10 @@ async fn run(args: Args) -> Result<()> {
     if args.batch_size == 0 {
         bail!("--batch-size must be greater than 0");
     }
+    if matches!(args.perturbation_mode, PerturbationModeArg::LowRank) && args.perturbation_rank == 0
+    {
+        bail!("--perturbation-rank must be greater than 0 in low-rank mode");
+    }
     if !(0.0..=1.0).contains(&args.error_decay) {
         bail!("--error-decay must be between 0 and 1");
     }
@@ -259,7 +266,7 @@ async fn run(args: Args) -> Result<()> {
         .training_config(TrainingConfig {
             lr: args.learning_rate,
             epsilon: args.epsilon,
-            perturbation_mode: args.perturbation_mode.into(),
+            perturbation_mode: args.perturbation_mode.to_mode(args.perturbation_rank),
             optimize_tensors: args.optimize_tensors.clone(),
             lazy_perturbations: args.lazy_perturbations,
             perturbation_memory_budget_bytes: args
@@ -373,6 +380,8 @@ async fn run(args: Args) -> Result<()> {
     let output = TrainEvalOutput {
         batch_size: args.batch_size,
         perturbation_mode: args.perturbation_mode.as_str(),
+        perturbation_rank: matches!(args.perturbation_mode, PerturbationModeArg::LowRank)
+            .then_some(args.perturbation_rank),
         error_feedback: args.error_feedback.as_str(),
         perturb_up_seconds,
         perturb_down_seconds,
@@ -553,7 +562,9 @@ mod tests {
             "--epsilon",
             "0.002",
             "--perturbation-mode",
-            "activation",
+            "low-rank",
+            "--perturbation-rank",
+            "4",
             "--optimize-tensors",
             "qk",
             "--loss-up",
@@ -576,8 +587,9 @@ mod tests {
         assert_eq!(args.epsilon, 0.002);
         assert!(matches!(
             args.perturbation_mode,
-            PerturbationModeArg::Activation
+            PerturbationModeArg::LowRank
         ));
+        assert_eq!(args.perturbation_rank, 4);
         assert_eq!(args.optimize_tensors, "qk");
         assert_eq!(args.loss_up, 1.5);
         assert_eq!(args.loss_down, 0.5);

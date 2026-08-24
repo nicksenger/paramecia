@@ -698,10 +698,12 @@ fn supports_fused_forward(qt: &QTensor, mode: PerturbationMode) -> bool {
     if !supports_gpu_perturb(qt) {
         return false;
     }
-    if mode == PerturbationMode::Weight {
-        return true;
+    match mode {
+        PerturbationMode::Weight => return true,
+        PerturbationMode::LowRank(0) => return false,
+        PerturbationMode::LowRank(_) => {}
     }
-    // The activation kernel currently targets 2D CUDA linear weights. Other
+    // The low-rank kernel currently targets 2D CUDA linear weights. Other
     // backends/shapes use the materialized factored direction, preserving
     // correctness until their specialized output kernels are available.
     #[cfg(feature = "cuda")]
@@ -753,20 +755,41 @@ fn generate_perturbation(
     const INPUT_STREAM: u64 = 0xA076_1D64_78BD_642F;
     const OUTPUT_STREAM: u64 = 0xE703_7ED1_A0B4_28DB;
 
-    let data: Vec<f32> = match (mode, shape.dims().last().copied()) {
-        (PerturbationMode::Activation, Some(in_dim)) if in_dim > 0 => {
+    mode.validate()?;
+    let data: Vec<f32> = match mode {
+        PerturbationMode::LowRank(rank) => {
+            let Some(in_dim) = shape.dims().last().copied() else {
+                paramecia_core::bail!("low-rank perturbations require a non-scalar tensor");
+            };
+            if in_dim == 0 {
+                paramecia_core::bail!("low-rank perturbations require a non-empty last dimension");
+            }
             let rows = shape.elem_count() / in_dim;
-            let z_in: Vec<f32> = (0..in_dim)
-                .map(|col| philox_rademacher(seed ^ INPUT_STREAM, col as u64))
+            let input_factor_count = rank.checked_mul(in_dim).ok_or_else(|| {
+                paramecia_core::Error::Msg("low-rank input factor count overflow".into())
+            })?;
+            let output_factor_count = rank.checked_mul(rows).ok_or_else(|| {
+                paramecia_core::Error::Msg("low-rank output factor count overflow".into())
+            })?;
+            let z_in: Vec<f32> = (0..input_factor_count)
+                .map(|index| philox_rademacher(seed ^ INPUT_STREAM, index as u64))
                 .collect();
-            let z_out: Vec<f32> = (0..rows)
-                .map(|row| philox_rademacher(seed ^ OUTPUT_STREAM, row as u64))
+            let z_out: Vec<f32> = (0..output_factor_count)
+                .map(|index| philox_rademacher(seed ^ OUTPUT_STREAM, index as u64))
                 .collect();
+            let scale = 1.0 / (rank as f32).sqrt();
             (0..shape.elem_count())
-                .map(|index| z_out[index / in_dim] * z_in[index % in_dim])
+                .map(|index| {
+                    let row = index / in_dim;
+                    let col = index % in_dim;
+                    let value = (0..rank)
+                        .map(|factor| z_out[factor * rows + row] * z_in[factor * in_dim + col])
+                        .sum::<f32>();
+                    value * scale
+                })
                 .collect()
         }
-        _ => {
+        PerturbationMode::Weight => {
             let mut rng = StdRng::seed_from_u64(seed);
             (0..shape.elem_count())
                 .map(|_| rng.sample::<f32, _>(rand_distr::StandardNormal))
@@ -782,7 +805,7 @@ fn generate_fused_perturbation(
     shape: &paramecia_core::Shape,
     mode: PerturbationMode,
 ) -> Result<Tensor> {
-    if mode == PerturbationMode::Activation {
+    if mode.low_rank().is_some() {
         return generate_perturbation(seed, shape, mode);
     }
     let data: Vec<f32> = (0..shape.elem_count())
@@ -976,9 +999,9 @@ pub struct ParamsQuZO {
     pub use_fused: bool,
     /// Parameterization of the random search direction.
     ///
-    /// Activation mode uses a rank-one factored Rademacher direction at every
-    /// optimized linear boundary. It avoids sampling independent noise for
-    /// every weight while retaining an exact direction that can be replayed
+    /// Low-rank mode uses a normalized sum of factored Rademacher directions at
+    /// every optimized linear boundary. It avoids sampling independent noise
+    /// for every weight while retaining an exact direction that can be replayed
     /// during the update.
     pub perturbation_mode: PerturbationMode,
     /// Optional per-tensor epsilon multipliers.
@@ -1104,6 +1127,7 @@ impl QuZO {
         params: ParamsQuZO,
         seed: u64,
     ) -> Result<Self> {
+        params.perturbation_mode.validate()?;
         let epsilon_multipliers = params
             .epsilon_multipliers
             .clone()
@@ -2059,31 +2083,108 @@ impl QuZO {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paramecia_core::quantized::{GgmlDType, QTensor, SharedQTensor};
     use paramecia_core::Device;
 
-    #[test]
-    fn activation_direction_is_deterministic_and_rank_one() -> Result<()> {
-        let shape = paramecia_core::Shape::from((3, 4));
-        let first = generate_fused_perturbation(17, &shape, PerturbationMode::Activation)?
-            .to_vec2::<f32>()?;
-        let second = generate_fused_perturbation(17, &shape, PerturbationMode::Activation)?
-            .to_vec2::<f32>()?;
-        assert_eq!(first, second);
-        assert!(first.iter().flatten().all(|value| value.abs() == 1.0));
+    fn quantized_mse(weights: &SharedQTensor, target: &Tensor) -> Result<Tensor> {
+        let dequantized = weights.read().unwrap().dequantize(&Device::Cpu)?;
+        (dequantized - target)?.sqr()?.mean_all()
+    }
 
-        // Every 2x2 minor of an outer product is zero.
-        for row in 1..3 {
-            for col in 1..4 {
-                let minor = first[0][0] * first[row][col] - first[0][col] * first[row][0];
-                assert!(minor.abs() < 1e-5, "non-rank-one minor: {minor}");
+    fn train_quantized_quadratic(
+        error_feedback: Option<ErrorFeedbackMode>,
+        perturbation_mode: PerturbationMode,
+        shape: paramecia_core::Shape,
+        lr: f64,
+        seed: u64,
+        steps: usize,
+    ) -> Result<(f32, f32, Option<f32>)> {
+        let elem_count = shape.elem_count();
+        let initial = Tensor::from_vec(vec![1.0f32; elem_count], shape.clone(), &Device::Cpu)?;
+        let target = Tensor::from_vec(vec![0.0f32; elem_count], shape, &Device::Cpu)?;
+        let weights = SharedQTensor::new(QTensor::quantize(&initial, GgmlDType::Q8_0)?);
+        let initial_loss = quantized_mse(&weights, &target)?.to_vec0::<f32>()?;
+        let mut optimizer = QuZO::new_with_seed(
+            vec![weights.clone()],
+            ParamsQuZO {
+                lr,
+                epsilon: 1.0,
+                num_samples: 8,
+                clip_threshold: 10.0,
+                use_fused: false,
+                perturbation_mode,
+                error_feedback,
+                error_decay: 1.0,
+                ..ParamsQuZO::default()
+            },
+            seed,
+        )?;
+
+        for _ in 0..steps {
+            optimizer.step(|| quantized_mse(&weights, &target))?;
+        }
+
+        let final_loss = quantized_mse(&weights, &target)?.to_vec0::<f32>()?;
+        let residual_l1 = optimizer.residuals.as_ref().map(|tensor_residuals| {
+            tensor_residuals
+                .iter()
+                .flatten()
+                .map(|residual| residual.to_f32().abs())
+                .sum()
+        });
+        Ok((initial_loss, final_loss, residual_l1))
+    }
+
+    fn matrix_rank(mut matrix: Vec<Vec<f32>>) -> usize {
+        let rows = matrix.len();
+        let cols = matrix.first().map_or(0, Vec::len);
+        let mut rank = 0;
+        for col in 0..cols {
+            let Some(pivot) = (rank..rows).find(|&row| matrix[row][col].abs() > 1e-5) else {
+                continue;
+            };
+            matrix.swap(rank, pivot);
+            let pivot_value = matrix[rank][col];
+            for value in &mut matrix[rank][col..] {
+                *value /= pivot_value;
             }
+            for row in 0..rows {
+                if row == rank {
+                    continue;
+                }
+                let factor = matrix[row][col];
+                for inner_col in col..cols {
+                    matrix[row][inner_col] -= factor * matrix[rank][inner_col];
+                }
+            }
+            rank += 1;
+            if rank == rows {
+                break;
+            }
+        }
+        rank
+    }
+
+    #[test]
+    fn low_rank_directions_are_deterministic_and_have_requested_rank() -> Result<()> {
+        let shape = paramecia_core::Shape::from((6, 8));
+        for rank in [1, 2, 4] {
+            let mode = PerturbationMode::LowRank(rank);
+            let first = generate_fused_perturbation(17, &shape, mode)?.to_vec2::<f32>()?;
+            let second = generate_fused_perturbation(17, &shape, mode)?.to_vec2::<f32>()?;
+            assert_eq!(first, second);
+            assert_eq!(
+                matrix_rank(first),
+                rank,
+                "direction did not have requested rank {rank}"
+            );
         }
         Ok(())
     }
 
     #[cfg(feature = "cuda")]
     #[test]
-    fn activation_mode_completes_fused_cuda_step() -> Result<()> {
+    fn low_rank_mode_completes_fused_cuda_step() -> Result<()> {
         use paramecia_core::quantized::{GgmlDType, QMatMul, QTensor, SharedQTensor};
         use paramecia_core::Module;
 
@@ -2101,7 +2202,7 @@ mod tests {
                 lr: 1e-3,
                 epsilon: 1e-2,
                 clip_threshold: 10.0,
-                perturbation_mode: PerturbationMode::Activation,
+                perturbation_mode: PerturbationMode::LowRank(4),
                 ..ParamsQuZO::default()
             },
             42,
@@ -2115,7 +2216,7 @@ mod tests {
     }
 
     #[test]
-    fn test_qzo_basic() -> Result<()> {
+    fn forward_gradient_descent_converges_on_quadratic() -> Result<()> {
         // Test basic QZO optimization
         let device = Device::Cpu;
 
@@ -2152,6 +2253,65 @@ mod tests {
             final_val
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn quzo_converges_on_quantized_quadratic() -> Result<()> {
+        let (initial_loss, final_loss, residual_l1) = train_quantized_quadratic(
+            None,
+            PerturbationMode::Weight,
+            paramecia_core::Shape::from(32),
+            500.0,
+            42,
+            1_000,
+        )?;
+        assert!(residual_l1.is_none());
+        assert!(
+            final_loss < initial_loss * 0.1,
+            "QuZO did not converge: initial loss {initial_loss}, final loss {final_loss}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn low_rank_perturbations_converge_on_quantized_matrix() -> Result<()> {
+        for rank in [1, 2, 4] {
+            let (initial_loss, final_loss, residual_l1) = train_quantized_quadratic(
+                None,
+                PerturbationMode::LowRank(rank),
+                paramecia_core::Shape::from((4, 32)),
+                2_000.0,
+                42,
+                1_000,
+            )?;
+            assert!(residual_l1.is_none());
+            assert!(
+                final_loss < initial_loss * 0.1,
+                "rank-{rank} QuZO did not converge: initial loss {initial_loss}, final loss {final_loss}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn qes_error_feedback_converges_on_quantized_quadratic() -> Result<()> {
+        let (initial_loss, final_loss, residual_l1) = train_quantized_quadratic(
+            Some(ErrorFeedbackMode::Persistent),
+            PerturbationMode::Weight,
+            paramecia_core::Shape::from(32),
+            500.0,
+            42,
+            1_000,
+        )?;
+        assert!(
+            residual_l1.is_some_and(|sum| sum > 0.0),
+            "persistent error feedback did not accumulate quantization residuals"
+        );
+        assert!(
+            final_loss < initial_loss * 0.1,
+            "QuZO with error feedback did not converge: initial loss {initial_loss}, final loss {final_loss}"
+        );
         Ok(())
     }
 
