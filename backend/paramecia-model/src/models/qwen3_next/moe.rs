@@ -2108,7 +2108,7 @@ impl MoeExperts {
             return gg.shared_expert_tensor(&exps_name);
         }
         let dense_name = format!("{}.{}", prefix, dense_suffix);
-        gg.shared_expert_tensor(&dense_name)?.unsqueeze(0)
+        gg.shared_dense_expert_tensor(&dense_name)
     }
 
     pub(super) fn new<R: Read + Seek>(

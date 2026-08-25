@@ -237,6 +237,26 @@ mod perturbation_state_tests {
         assert!(PerturbationMode::LowRank(0).validate().is_err());
         assert!(PerturbationMode::LowRank(1).validate().is_ok());
     }
+
+    #[test]
+    fn in_place_shared_view_preserves_optimizer_identity() -> Result<()> {
+        let initial = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2), &Device::Cpu)?;
+        let shared = SharedQTensor::new(QTensor::quantize(&initial, GgmlDType::F32)?);
+        let optimizer_view = shared.clone();
+
+        shared.unsqueeze_in_place(0)?;
+        assert_eq!(shared.dims(), vec![1, 2, 2]);
+        assert_eq!(optimizer_view.dims(), vec![1, 2, 2]);
+
+        let updated = Tensor::from_vec(vec![5.0f32, 6.0, 7.0, 8.0], (1, 2, 2), &Device::Cpu)?;
+        optimizer_view.replace(QTensor::quantize(&updated, GgmlDType::F32)?);
+
+        assert_eq!(
+            shared.dequant()?.flatten_all()?.to_vec1::<f32>()?,
+            vec![5.0, 6.0, 7.0, 8.0]
+        );
+        Ok(())
+    }
 }
 
 /// Converts a byte slice to a typed slice.
@@ -3313,6 +3333,23 @@ impl SharedQTensor {
     pub fn unsqueeze(&self, dim: usize) -> Result<Self> {
         let qt = self.inner.qtensor.read().unwrap();
         Ok(Self::new(qt.unsqueeze(dim)?))
+    }
+
+    /// Install an unsqueezed view on this shared tensor without changing its
+    /// mutable identity.
+    ///
+    /// Unlike [`Self::unsqueeze`], clones of this `SharedQTensor` continue to
+    /// observe subsequent replacements. This is useful when an optimizer and a
+    /// model component need different-rank metadata for the same weights.
+    pub fn unsqueeze_in_place(&self, dim: usize) -> Result<()> {
+        let viewed = {
+            let qt = self.inner.qtensor.read().map_err(|error| {
+                crate::Error::Msg(format!("SharedQTensor read lock failed: {error}"))
+            })?;
+            qt.unsqueeze(dim)?
+        };
+        self.replace(viewed);
+        Ok(())
     }
 
     pub fn transpose(&self, d1: usize, d2: usize) -> Result<Self> {

@@ -693,9 +693,21 @@ fn supports_gpu_perturb(qt: &QTensor) -> bool {
 }
 
 /// Whether the on-the-fly forward path implements this direction mode.
+#[inline]
+fn supports_fused_qmatmul_shape(rank: usize) -> bool {
+    rank == 2
+}
+
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 fn supports_fused_forward(qt: &QTensor, mode: PerturbationMode) -> bool {
     if !supports_gpu_perturb(qt) {
+        return false;
+    }
+    // Scoped fused perturbations are consumed by QMatMul, whose trainable
+    // weights are 2-D. Higher-rank tensors include MoE/dense-expert weights
+    // consumed by specialized kernels that do not inspect QMatMul's scoped
+    // perturbation state, so they must use the materialized replacement path.
+    if !supports_fused_qmatmul_shape(qt.shape().rank()) {
         return false;
     }
     match mode {
@@ -703,12 +715,12 @@ fn supports_fused_forward(qt: &QTensor, mode: PerturbationMode) -> bool {
         PerturbationMode::LowRank(0) => return false,
         PerturbationMode::LowRank(_) => {}
     }
-    // The low-rank kernel currently targets 2D CUDA linear weights. Other
-    // backends/shapes use the materialized factored direction, preserving
-    // correctness until their specialized output kernels are available.
+    // The low-rank kernel currently targets CUDA linear weights. Other
+    // backends use the materialized factored direction, preserving correctness
+    // until their specialized output kernels are available.
     #[cfg(feature = "cuda")]
     if qt.device().is_cuda() {
-        return qt.shape().rank() == 2;
+        return true;
     }
     false
 }
@@ -2085,6 +2097,13 @@ mod tests {
     use super::*;
     use paramecia_core::quantized::{GgmlDType, QTensor, SharedQTensor};
     use paramecia_core::Device;
+
+    #[test]
+    fn specialized_higher_rank_weights_use_materialized_perturbations() {
+        assert!(supports_fused_qmatmul_shape(2));
+        assert!(!supports_fused_qmatmul_shape(1));
+        assert!(!supports_fused_qmatmul_shape(3));
+    }
 
     fn quantized_mse(weights: &SharedQTensor, target: &Tensor) -> Result<Tensor> {
         let dequantized = weights.read().unwrap().dequantize(&Device::Cpu)?;

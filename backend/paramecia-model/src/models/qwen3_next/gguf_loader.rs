@@ -101,6 +101,18 @@ impl<R: Read + Seek> Gguf<R> {
         Ok(shared)
     }
 
+    /// Load a dense expert tensor and expose it as a one-expert 3-D tensor.
+    ///
+    /// The view is installed on the existing shared wrapper so the optimizer
+    /// and the dense forward path retain the same mutable identity. Creating a
+    /// second `SharedQTensor` from `unsqueeze()` would share only the initial
+    /// storage; a later optimizer `replace()` would not reach the forward view.
+    pub(super) fn shared_dense_expert_tensor(&mut self, name: &str) -> Result<SharedQTensor> {
+        let shared = self.shared_expert_tensor(name)?;
+        shared.unsqueeze_in_place(0)?;
+        Ok(shared)
+    }
+
     /// Load RmsNorm with shared (mutable) weight for training
     pub(super) fn shared_rms_norm(
         &mut self,

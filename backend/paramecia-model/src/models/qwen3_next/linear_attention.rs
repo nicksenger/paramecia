@@ -379,6 +379,11 @@ impl std::fmt::Debug for LinearAttention {
     }
 }
 
+#[inline]
+fn should_use_live_shared_ssm_weights(force_live: bool, generations: &[u64]) -> bool {
+    force_live || generations.iter().any(|&generation| generation > 0)
+}
+
 impl LinearAttention {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new<R: Read + Seek>(
@@ -570,10 +575,30 @@ impl LinearAttention {
     }
 
     #[inline]
-    pub(super) fn use_live_shared_ssm_weights() -> bool {
+    pub(super) fn use_live_shared_ssm_weights(&self) -> bool {
         use std::sync::OnceLock;
         static LIVE: OnceLock<bool> = OnceLock::new();
-        *LIVE.get_or_init(|| std::env::var("PARAMECIA_LIVE_SSM_WEIGHTS").is_ok())
+        let force_live = *LIVE.get_or_init(|| std::env::var("PARAMECIA_LIVE_SSM_WEIGHTS").is_ok());
+
+        // Inference can use the resident copies until QuZO first replaces a
+        // shared tensor. From that point onward, both perturbation phases and
+        // committed updates must be read from shared storage. Generation is an
+        // inexpensive way to detect that transition without imposing the
+        // training-time dequantization cost on inference-only models.
+        should_use_live_shared_ssm_weights(
+            force_live,
+            &[
+                self.shared_ssm_a
+                    .as_ref()
+                    .map_or(0, |tensor| tensor.inner().generation()),
+                self.shared_ssm_conv1d
+                    .as_ref()
+                    .map_or(0, |tensor| tensor.inner().generation()),
+                self.shared_ssm_dt
+                    .as_ref()
+                    .map_or(0, |tensor| tensor.inner().generation()),
+            ],
+        )
     }
 
     #[inline]
@@ -713,7 +738,7 @@ impl LinearAttention {
         log_shape("linear_attn.alpha", &alpha);
 
         // ssm_dt and ssm_a have shape [num_v_heads]
-        let (ssm_dt, ssm_a) = if Self::use_live_shared_ssm_weights() {
+        let (ssm_dt, ssm_a) = if self.use_live_shared_ssm_weights() {
             let ssm_dt = if let Some(ref sq) = self.shared_ssm_dt {
                 sq.dequant_to(alpha.dtype(), alpha.device())?.into_inner()
             } else {
@@ -1024,9 +1049,11 @@ impl LinearAttention {
         let input = input.inner();
         // input: [b, channels, input_len]
         // ssm_conv1d: [channels, kernel_size] (GGUF stores it this way)
-        // Default inference path uses resident weights.
-        // Set PARAMECIA_LIVE_SSM_WEIGHTS=1 to re-read shared tensors every forward.
-        let conv_weight = if Self::use_live_shared_ssm_weights() {
+        // Default inference uses resident weights. QuZO replacement switches
+        // this path to shared storage automatically; the environment override
+        // remains available for callers that always require live reads.
+        let live_shared_weights = self.use_live_shared_ssm_weights();
+        let conv_weight = if live_shared_weights {
             if let Some(ref sq) = self.shared_ssm_conv1d {
                 sq.dequant_to(input.dtype(), input.device())?.into_inner()
             } else {
@@ -1042,7 +1069,7 @@ impl LinearAttention {
         } else {
             input.clone()
         };
-        let weight_f32 = if Self::use_live_shared_ssm_weights() {
+        let weight_f32 = if live_shared_weights {
             conv_weight.to_dtype(DType::F32)?
         } else if self
             .ssm_conv1d_f32
@@ -1913,5 +1940,17 @@ impl LinearAttention {
 
         // Transpose output back to [b, l, num_heads, head_v_dim]
         output.transpose(1, 2)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_use_live_shared_ssm_weights;
+
+    #[test]
+    fn shared_ssm_weights_become_live_after_first_replacement() {
+        assert!(!should_use_live_shared_ssm_weights(false, &[0, 0, 0]));
+        assert!(should_use_live_shared_ssm_weights(false, &[0, 1, 0]));
+        assert!(should_use_live_shared_ssm_weights(true, &[0, 0, 0]));
     }
 }
