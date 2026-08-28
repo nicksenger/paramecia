@@ -73,6 +73,10 @@ impl CudaDevice {
         src: &Src,
         dst: &mut Dst,
     ) -> Result<()> {
+        // cudarc's stream memcpy helpers do not rebind the context on the
+        // calling thread; make it current so calls from threads that never
+        // ran a kernel (e.g. checkpoint saves right after load) succeed.
+        self.context.bind_to_thread().w()?;
         self.stream.memcpy_htod(src, dst).w()
     }
 
@@ -92,6 +96,7 @@ impl CudaDevice {
         src: &Src,
         dst: &mut Dst,
     ) -> Result<()> {
+        self.context.bind_to_thread().w()?;
         self.stream.memcpy_htod(src, dst).w()?;
         self.stream.record_event(None).w()?.synchronize().w()
     }
@@ -112,6 +117,7 @@ impl CudaDevice {
         src: &Src,
         dst: &mut Dst,
     ) -> Result<()> {
+        self.context.bind_to_thread().w()?;
         self.stream.memcpy_dtod(src, dst).w()
     }
 
@@ -124,6 +130,7 @@ impl CudaDevice {
         src: &Src,
         dst: &mut Dst,
     ) -> Result<()> {
+        self.context.bind_to_thread().w()?;
         self.stream.memcpy_dtoh(src, dst).w()
     }
 
